@@ -1,0 +1,143 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Professional typography and global styles */
+@layer base {
+  body {
+    font-family:
+      -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI',
+      sans-serif;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    letter-spacing: -0.02em;
+  }
+
+  /* Smooth transitions globally */
+  * {
+    transition:
+      background-color 0.15s ease,
+      border-color 0.15s ease,
+      color 0.15s ease,
+      opacity 0.15s ease;
+  }
+
+  /* Remove focus rings, add custom focus states */
+  *:focus {
+    outline: none;
+  }
+
+  button:focus-visible,
+  input:focus-visible {
+    box-shadow: 0 0 0 2px rgb(var(--color-text) / 0.2);
+  }
+}
+
+@layer components {
+  /* Custom range slider styling - progress bar style */
+  input[type='range'] {
+    -webkit-appearance: none;
+    background: transparent;
+    cursor: pointer;
+    height: 6px;
+    border-radius: 3px;
+    outline: none;
+  }
+
+  /* Track styling */
+  input[type='range']::-webkit-slider-track {
+    height: 6px;
+    background: #2a2a2a;
+    border-radius: 3px;
+    border: none;
+  }
+
+  .light input[type='range']::-webkit-slider-track {
+    background: #e5e7eb;
+  }
+
+  /* Remove the thumb completely */
+  input[type='range']::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 0;
+    height: 0;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+  }
+
+  /* Create progress effect with background gradient */
+  input[type='range'] {
+    background: linear-gradient(
+      to right,
+      #ffffff 0%,
+      #ffffff var(--value, 0%),
+      #2a2a2a var(--value, 0%),
+      #2a2a2a 100%
+    );
+    border-radius: 3px;
+  }
+
+  .light input[type='range'] {
+    background: linear-gradient(
+      to right,
+      #333333 0%,
+      #333333 var(--value, 0%),
+      #e5e7eb var(--value, 0%),
+      #e5e7eb 100%
+    );
+  }
+
+  input[type='range']:hover {
+    opacity: 0.8;
+  }
+
+  /* Firefox support */
+  input[type='range']::-moz-range-track {
+    height: 6px;
+    background: #2a2a2a;
+    border-radius: 3px;
+    border: none;
+  }
+
+  .light input[type='range']::-moz-range-track {
+    background: #e5e7eb;
+  }
+
+  input[type='range']::-moz-range-thumb {
+    width: 0;
+    height: 0;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    border-radius: 0;
+  }
+
+  input[type='range']::-moz-range-progress {
+    height: 6px;
+    background: #ffffff;
+    border-radius: 3px;
+  }
+
+  .light input[type='range']::-moz-range-progress {
+    background: #333333;
+  }
+
+  /* Audio element styling */
+  audio {
+    opacity: 0.8;
+    filter: invert(var(--invert-audio, 0));
+  }
+
+  .dark audio {
+    --invert-audio: 1;
+  }
+}

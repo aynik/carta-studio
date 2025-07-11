@@ -1,0 +1,55 @@
+{
+  "name": "carta-studio",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint src/",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "@heroicons/vue": "^2.2.0",
+    "vue": "^3.5.13"
+  },
+  "description": "Web-based audio codec playground and studio",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aynik/carta-studio.git"
+  },
+  "keywords": [
+    "audio",
+    "codec",
+    "playground",
+    "studio",
+    "web"
+  ],
+  "author": "aynik",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/aynik/carta-studio/issues"
+  },
+  "homepage": "https://github.com/aynik/carta-studio#readme",
+  "devDependencies": {
+    "@tailwindcss/forms": "^0.5.10",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@vitest/browser": "^3.2.4",
+    "@vitest/ui": "^3.2.4",
+    "@vue/test-utils": "^2.4.6",
+    "autoprefixer": "^10.4.21",
+    "eslint": "^9.30.0",
+    "eslint-config-prettier": "^10.1.5",
+    "eslint-plugin-prettier": "^5.5.1",
+    "playwright": "^1.53.1",
+    "postcss": "^8.5.6",
+    "prettier": "^3.6.2",
+    "tailwindcss": "^3.4.13",
+    "tw-colors": "^3.3.2",
+    "vite": "^6.0.7",
+    "vite-plugin-pwa": "^0.21.1",
+    "vite-plugin-static-copy": "^3.1.0",
+    "vitest": "^3.2.4",
+    "workbox-window": "^7.1.0"
+  }
+}
