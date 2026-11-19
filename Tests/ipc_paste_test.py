@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory() as directory:
             raise AssertionError('Editor did not start')
         # Queue separately so row order does not depend on parallel import completion.
         for index, path in enumerate(paths):
-            call('import', path)
+            call('import', '--new-layer', path)
             wait_for(lambda state: state['pending_imports'] == 0 and state['track_count'] == index + 1)
         call('marker', 'add', 600, 'Boundary')
         baseline_tracks, baseline_markers = call('tracks'), call('markers')

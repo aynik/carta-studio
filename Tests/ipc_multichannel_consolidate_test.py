@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix='carta multichannel ') as directory:
                 audio.setsampwidth(2)
                 audio.setframerate(44100)
                 audio.writeframes(struct.pack('<%dh' % len(data), *data))
-            call('import', path)
+            call('import', '--new-layer', path)
             wait_for(lambda: call('status'), lambda state: state['pending_imports'] == 0 and state['track_count'] == 1)
             assert call('tracks')[0]['clips'][0]['source_channels'] == channels
             routes = ['0.01', '0.02'] * channels
@@ -195,7 +195,7 @@ with tempfile.TemporaryDirectory(prefix='carta multichannel ') as directory:
             pcm = struct.pack('<%df' % len(values), *values)
             with open(source, 'wb') as audio:
                 audio.write(struct.pack('<4sI4s4sIHHIIHH4sI', b'RIFF', 36 + len(pcm), b'WAVE', b'fmt ', 16, 3, 1, 44100, 176400, 4, 32, b'data', len(pcm)) + pcm)
-            call('import', source)
+            call('import', '--new-layer', source)
             expected_tracks = 1 if name == 'preceding.wav' else 2
             wait_for(lambda: call('status'), lambda state: state['pending_imports'] == 0 and state['track_count'] == expected_tracks)
         call('seek', 1); call('edit', 'split-tracks', 'all')
@@ -223,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix='carta multichannel ') as directory:
             with wave.open(path, 'wb') as audio:
                 audio.setnchannels(channels); audio.setsampwidth(2); audio.setframerate(44100)
                 audio.writeframes(struct.pack('<%dh' % len(data), *data))
-            call('import', path)
+            call('import', '--new-layer', path)
             wait_for(lambda: call('status'), lambda state: state['pending_imports'] == 0 and state['track_count'] == channels)
         call('select', 'clips', 1, 0); call('edit', 'clips', 'copy')
         call('select', 'point', 0, 50); call('edit', 'paste-point', 'mix')

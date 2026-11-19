@@ -69,10 +69,11 @@ with tempfile.TemporaryDirectory(prefix='carta paths ') as directory:
                 return None
             return json.loads(result.stdout)['result']
 
-        wait_for(startup, lambda state: state is not None and state['pending_imports'] == 0 and state['track_count'] == 2,
+        wait_for(startup, lambda state: state is not None and state['pending_imports'] == 0 and state['track_count'] == 1 and state['md_disc']['track_count'] == 2,
                  'command-line imports did not complete')
         tracks = call('tracks')
-        assert all(os.path.samefile(track['clips'][0]['source'], path) for track, path in zip(tracks, paths)), tracks
+        assert len(tracks) == 1 and len(tracks[0]['clips']) == 2, tracks
+        assert all(os.path.samefile(clip['source'], path) for clip, path in zip(tracks[0]['clips'], paths)), tracks
         call('edit', 'rename-clip', '0', '0', '夜の音 🎵')
         call('marker', 'add', '500', '次の曲')
         call('project', 'save-as', project)
@@ -82,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix='carta paths ') as directory:
         opened = wait_for(lambda: call('project', 'status'), lambda state: state['state'] != 'running', 'open timed out')
         assert opened['state'] == 'complete', opened
         tracks = call('tracks')
-        assert len(tracks) == 2 and all(audio_data(track['clips'][0]['source']) == audio_data(path) for track, path in zip(tracks, paths)), tracks
+        assert len(tracks) == 1 and len(tracks[0]['clips']) == 2 and all(audio_data(clip['source']) == audio_data(path) for clip, path in zip(tracks[0]['clips'], paths)), tracks
         assert tracks[0]['clips'][0]['custom_name'] == '夜の音 🎵' and call('markers')[0]['name'] == '次の曲'
         assert call('marker', 'focus-adjacent', 'next') == 0 and call('status')['selected_marker'] == 0
         assert 'Marker sample 500' in call('status')['message']
@@ -90,10 +91,11 @@ with tempfile.TemporaryDirectory(prefix='carta paths ') as directory:
         exported = wait_for(lambda: call('status')['export'], lambda state: state['state'] != 'running', 'export timed out')
         assert exported['state'] == 'complete', exported
         data = audio_data(output)
-        assert len(data) == 1000 * 2 * 4
-        for sample in range(1000):
+        assert len(data) == 2000 * 2 * 4
+        for sample in range(2000):
             left, right = struct.unpack_from('<ff', data, sample * 8)
-            assert abs(left - 0.375) < 1e-6 and abs(right - 0.375) < 1e-6, (sample, left, right)
+            expected = 0.125 if sample < 1000 else 0.25
+            assert abs(left - expected) < 1e-6 and abs(right - expected) < 1e-6, (sample, left, right, expected)
     finally:
         process.terminate()
         try:

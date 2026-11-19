@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory(prefix='carta source scope ') as directory:
 
         wait_for(startup, lambda state: state is not None)
         for index, path in enumerate([paths[0], paths[1], paths[0]]):
-            call('import', path)
+            call('import', '--new-layer', path)
             wait_for(lambda: call('status'), lambda state: state['pending_imports'] == 0 and state['track_count'] == index + 1)
         call('marker', 'add', 500, 'Track two')
         call('select', 'clips', 1, 0, 2, 0)
@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory(prefix='carta source scope ') as directory:
         call('select', 'source-clips', 'range')
         selected = call('status')
         assert selected['selected_tracks'] == [0, 2] and selected['selection'] == before['selection'], selected
-        assert selected['selected_clips'] == [{'track': 0, 'clip': 0}, {'track': 1, 'clip': 0}, {'track': 2, 'clip': 0}], selected
+        assert selected['selected_clips'] == [{'layer': 0, 'track': 0, 'clip': 0}, {'layer': 1, 'track': 1, 'clip': 0}, {'layer': 2, 'track': 2, 'clip': 0}], selected
         assert selected['selected_track'] == 2 and selected['selected_clip'] == 0, selected
         call('clip', 'envelope-selected', '0.5', 'keep', 'keep')
         assert [track['clips'][0]['gain'] for track in call('tracks')] == [0.5, 0.5, 0.5]

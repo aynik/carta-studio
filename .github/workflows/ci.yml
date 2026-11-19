@@ -105,7 +105,8 @@ jobs:
           python3 Tests/ipc_project_relink_test.py "$binary"
           python3 Tests/ipc_source_scope_test.py "$binary"
           python3 Tests/ipc_multichannel_consolidate_test.py "$binary"
-          python3 Tests/ipc_auto_bank_test.py "$binary"
+          python3 Tests/ipc_long_marker_test.py "$binary"
+          python3 Tests/ipc_marker_title_import_test.py "$binary"
           python3 Tests/path_smoke.py "$binary"
           python3 Tests/ffmpeg_wav_check.py "$binary"
 

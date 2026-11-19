@@ -5,7 +5,19 @@
 #endif
 #include <windows.h>
 #include <io.h>
+#include <setjmp.h>
+#include <stdio.h>
 #include <time.h>
+
+#ifndef _longjmp
+#define _longjmp longjmp
+#endif
+#ifndef fseeko
+#define fseeko _fseeki64
+#endif
+#ifndef ftello
+#define ftello _ftelli64
+#endif
 
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0

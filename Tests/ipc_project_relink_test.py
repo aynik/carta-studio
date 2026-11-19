@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory() as directory:
                 break
             assert process.poll() is None, 'Editor exited during startup'
             time.sleep(0.1)
-        call('import', *originals)
+        call('import', '--new-layer', *originals)
         for _ in range(200):
             state = call('status')
             if state['pending_imports'] == 0:
