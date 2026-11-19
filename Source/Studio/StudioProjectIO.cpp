@@ -882,7 +882,7 @@ bool Studio::commitReadyImport(const std::shared_ptr<ImportTask>& task, juce::St
             juce::int64 maxMdEnd = 0;
             for (const auto& tr : candidate.mdDisc.tracks) {
                 for (const auto& pt : tr.parts) {
-                    maxMdEnd = std::max(maxMdEnd, pt.endSample);
+                    maxMdEnd = std::max(maxMdEnd, static_cast<juce::int64>(pt.endSample));
                 }
             }
             if (task->autoMdTrack && candidate.mdDisc.autoTrackOnImport &&
@@ -2270,7 +2270,7 @@ void Studio::saveProject(std::function<void(bool)> completion, bool saveAs, bool
                     ok ? (safe->pendingDurability ? "Project written, but directory "
                                                     "synchronization failed. Save again; "
                                                     "recovery is retained."
-                          : clean                 ? "Saved " + task->file.getFileName() +
+                          : clean ? "Saved " + task->file.getFileName() +
                                         (task->nativePackage
                                              ? "."
                                              : ". Keep source audio files with the project.")

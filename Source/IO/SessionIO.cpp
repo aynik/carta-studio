@@ -2559,7 +2559,7 @@ bool readVerifiedProjectJson(const juce::File& file, juce::var& root, juce::Stri
     }
 
     juce::MemoryBlock bytes;
-    input->readIntoMemoryBlock(bytes, static_cast<ssize_t>(maxProjectBytes + 1));
+    input->readIntoMemoryBlock(bytes, static_cast<std::ptrdiff_t>(maxProjectBytes + 1));
     if (!keepGoing(0)) {
         return false;
     }
