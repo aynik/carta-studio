@@ -1822,7 +1822,7 @@ bool readMarkerBytes(const juce::File& file, bool allowEmpty, juce::MemoryBlock&
         error = "Could not read marker file.";
         return false;
     }
-    input->readIntoMemoryBlock(bytes, static_cast<ssize_t>(maxMarkerFileBytes + 1));
+    input->readIntoMemoryBlock(bytes, static_cast<std::ptrdiff_t>(maxMarkerFileBytes + 1));
     if (!continueMarkerExchange(keepGoing, error)) {
         return false;
     }

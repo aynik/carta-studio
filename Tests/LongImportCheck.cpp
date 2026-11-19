@@ -127,7 +127,7 @@ int runLongMultitrackCheck() {
     const auto pcmDir = root.getChildFile("pcm");
     if (pcmDir.createDirectory().failed())
         return 1;
-    const auto sample = [](int source, int channel, juce::int64 frame) -> int {
+    const auto sample = [rate, stripeFrames](int source, int channel, juce::int64 frame) -> int {
         const int sourceRate = source == 0 ? rate : 48000;
         if (frame < 0 || frame >= 80LL * 60 * sourceRate ||
             frame % (60LL * sourceRate) >= stripeFrames)
@@ -316,7 +316,7 @@ int runLongMultitrackCheck() {
               << "). Sparse fixtures, no audio device, GUI activity or controlled cold-cache "
                  "conditions.\n";
 #if JUCE_MAC || JUCE_LINUX
-    struct rusage usage {};
+    struct rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage) == 0) {
 #if JUCE_MAC
         const double peakMiB = static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);

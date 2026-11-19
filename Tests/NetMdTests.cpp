@@ -104,10 +104,10 @@ bool fetchMockSnapshot(TestMockSnapshot& out, std::string& error) {
             TestMockUploadedTrack tr;
             tr.trackIndex = static_cast<int>(trObj->getProperty("index"));
             tr.mode = trObj->getProperty("mode").toString().toStdString();
-            tr.startAddr = carta::UtocAddress::fromLinearGroup(
-                static_cast<std::int64_t>(trObj->getProperty("start_linear")));
-            tr.endAddr = carta::UtocAddress::fromLinearGroup(
-                static_cast<std::int64_t>(trObj->getProperty("end_linear")));
+            tr.startAddr = carta::UtocAddress::fromLinearGroup(static_cast<std::int64_t>(
+                static_cast<juce::int64>(trObj->getProperty("start_linear"))));
+            tr.endAddr = carta::UtocAddress::fromLinearGroup(static_cast<std::int64_t>(
+                static_cast<juce::int64>(trObj->getProperty("end_linear"))));
             juce::MemoryBlock trackData;
             if (!tmpDir.getChildFile("track_" + juce::String(i) + ".bin")
                      .loadFileAsData(trackData)) {

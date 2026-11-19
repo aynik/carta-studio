@@ -279,8 +279,10 @@ void applyHelperProgressEvent(const juce::DynamicObject& obj, const HelperProgre
     }
     const double evProg = std::clamp(static_cast<double>(obj.getProperty("progress")), 0.0, 1.0);
     const std::string evPhase = obj.getProperty("phase").toString().toStdString();
-    const auto evDone = static_cast<std::int64_t>(obj.getProperty("bytes_done"));
-    const auto evTotal = static_cast<std::int64_t>(obj.getProperty("bytes_total"));
+    const auto evDone =
+        static_cast<std::int64_t>(static_cast<juce::int64>(obj.getProperty("bytes_done")));
+    const auto evTotal =
+        static_cast<std::int64_t>(static_cast<juce::int64>(obj.getProperty("bytes_total")));
 
     const std::string phase =
         (win.preferFallbackPhase || evPhase.empty()) ? win.fallbackPhase : evPhase;

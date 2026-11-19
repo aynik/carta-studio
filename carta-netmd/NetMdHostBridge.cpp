@@ -26,7 +26,6 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
-#define CARTA_NETMD_HOST_EXPORT
 #else
 #include <iconv.h>
 #if defined(__APPLE__)
@@ -34,7 +33,6 @@
 #else
 #include <sys/random.h>
 #endif
-#define CARTA_NETMD_HOST_EXPORT __attribute__((visibility("default")))
 #endif
 
 #if __has_include(<libusb-1.0/libusb.h>)

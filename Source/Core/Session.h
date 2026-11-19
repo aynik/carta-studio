@@ -77,8 +77,9 @@ bool validTimelineGeometry(double start, double offset, double duration) noexcep
 struct MappedPcm {
     explicit MappedPcm(const juce::File& directory = {})
         : temporary(directory == juce::File{}
-                        ? juce::TemporaryFile(".carta-pcm")
-                        : juce::TemporaryFile(directory.getChildFile("audio.carta-pcm"))) {}
+                        ? juce::File::getSpecialLocation(juce::File::tempDirectory)
+                              .getChildFile("audio.carta-pcm")
+                        : directory.getChildFile("audio.carta-pcm")) {}
 
     juce::TemporaryFile temporary;
     std::unique_ptr<juce::MemoryMappedFile> mapping;

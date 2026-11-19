@@ -172,49 +172,51 @@ bool isNetMdMockDeviceId(const std::string& deviceId) noexcept;
 // Porffor NetMD Host C ABI
 // ============================================================================
 
+#if defined(_WIN32)
+#define CARTA_NETMD_HOST_EXPORT
+#else
+#define CARTA_NETMD_HOST_EXPORT __attribute__((visibility("default")))
+#endif
+
 extern "C" {
 
-__attribute__((visibility("default"))) int
-carta_netmd_host_des_crypt(int is_triple_des, int is_encrypt, int is_cbc,
-                           const std::uint8_t* key_ptr, int key_len, const std::uint8_t* iv_ptr,
-                           const std::uint8_t* in_ptr, int in_len, std::uint8_t* out_ptr);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_des_crypt(int is_triple_des, int is_encrypt,
+                                                       int is_cbc, const std::uint8_t* key_ptr,
+                                                       int key_len, const std::uint8_t* iv_ptr,
+                                                       const std::uint8_t* in_ptr, int in_len,
+                                                       std::uint8_t* out_ptr);
 
-__attribute__((visibility("default"))) int carta_netmd_host_random_bytes(std::uint8_t* out_ptr,
-                                                                         int len);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_random_bytes(std::uint8_t* out_ptr, int len);
 
-__attribute__((visibility("default"))) int carta_netmd_host_cp932(int to_utf8,
-                                                                  const std::uint8_t* in_ptr,
-                                                                  int in_len, std::uint8_t* out_ptr,
-                                                                  int out_cap);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_cp932(int to_utf8, const std::uint8_t* in_ptr,
+                                                   int in_len, std::uint8_t* out_ptr, int out_cap);
 
-__attribute__((visibility("default"))) void carta_netmd_host_sleep_ms(int ms);
+CARTA_NETMD_HOST_EXPORT void carta_netmd_host_sleep_ms(int ms);
 
-__attribute__((visibility("default"))) void carta_netmd_host_report_step(int done, int total);
+CARTA_NETMD_HOST_EXPORT void carta_netmd_host_report_step(int done, int total);
 
-__attribute__((visibility("default"))) int carta_netmd_host_usb_list(std::uint8_t* json_out,
-                                                                     int json_cap);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_list(std::uint8_t* json_out, int json_cap);
 
-__attribute__((visibility("default"))) int carta_netmd_host_usb_open(const char* device_id);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_open(const char* device_id);
 
-__attribute__((visibility("default"))) int carta_netmd_host_usb_close(int handle);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_close(int handle);
 
-__attribute__((visibility("default"))) int carta_netmd_host_usb_reset(int handle);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_reset(int handle);
 
-__attribute__((visibility("default"))) int
-carta_netmd_host_usb_control_out(int handle, int request, int value, int index,
-                                 const std::uint8_t* data, int len);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_control_out(int handle, int request, int value,
+                                                             int index, const std::uint8_t* data,
+                                                             int len);
 
-__attribute__((visibility("default"))) int carta_netmd_host_usb_control_in(int handle, int request,
-                                                                           int value, int index,
-                                                                           std::uint8_t* out,
-                                                                           int max_len);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_control_in(int handle, int request, int value,
+                                                            int index, std::uint8_t* out,
+                                                            int max_len);
 
-__attribute__((visibility("default"))) int
-carta_netmd_host_usb_bulk_out(int handle, int endpoint, const std::uint8_t* data, int len);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_out(int handle, int endpoint,
+                                                          const std::uint8_t* data, int len);
 
-__attribute__((visibility("default"))) int
-carta_netmd_host_usb_bulk_in(int handle, int endpoint, std::uint8_t* out, int max_len);
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_in(int handle, int endpoint,
+                                                         std::uint8_t* out, int max_len);
 
-__attribute__((visibility("default"))) const char* carta_netmd_host_last_error(void);
+CARTA_NETMD_HOST_EXPORT const char* carta_netmd_host_last_error(void);
 
 } // extern "C"
