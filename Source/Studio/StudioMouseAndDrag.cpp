@@ -312,8 +312,10 @@ void Studio::updateDraggedMdRibbon(const juce::ModifierKeys& mods) {
             return;
         }
         const juce::int64 lo = leftParts[static_cast<size_t>(mdDragPart0)].startSample + 1;
-        const juce::int64 hi = std::min(
-            mdDragMaxSample, rightParts[static_cast<size_t>(mdDragRightPart0)].endSample - 1);
+        const juce::int64 hi = std::min<juce::int64>(
+            mdDragMaxSample,
+            static_cast<juce::int64>(rightParts[static_cast<size_t>(mdDragRightPart0)].endSample) -
+                1);
         if (hi < lo) {
             return;
         }
@@ -497,16 +499,16 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
                 juce::int64 gapEnd = carta::projectEndSample(session);
                 for (const auto& tr : session.mdDisc.tracks) {
                     for (const auto& pt : tr.parts) {
-                        gapEnd = std::max(gapEnd, pt.endSample);
+                        gapEnd = std::max<juce::int64>(gapEnd, pt.endSample);
                     }
                 }
                 for (const auto& tr : session.mdDisc.tracks) {
                     for (const auto& pt : tr.parts) {
                         if (pt.endSample <= clickSample) {
-                            gapStart = std::max(gapStart, pt.endSample);
+                            gapStart = std::max<juce::int64>(gapStart, pt.endSample);
                         }
                         if (pt.startSample >= clickSample) {
-                            gapEnd = std::min(gapEnd, pt.startSample);
+                            gapEnd = std::min<juce::int64>(gapEnd, pt.startSample);
                         }
                     }
                 }
@@ -571,7 +573,7 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
                 juce::int64 maxEnd = carta::projectEndSample(session);
                 for (const auto& tr : session.mdDisc.tracks) {
                     for (const auto& pt : tr.parts) {
-                        maxEnd = std::max(maxEnd, pt.endSample);
+                        maxEnd = std::max<juce::int64>(maxEnd, pt.endSample);
                     }
                 }
                 position = static_cast<double>(std::clamp<juce::int64>(
@@ -616,7 +618,7 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
         juce::int64 maxEnd = carta::projectEndSample(session);
         for (const auto& tr : session.mdDisc.tracks) {
             for (const auto& pt : tr.parts) {
-                maxEnd = std::max(maxEnd, pt.endSample);
+                maxEnd = std::max<juce::int64>(maxEnd, pt.endSample);
             }
         }
         mdDragMaxSample = std::max<juce::int64>(1, maxEnd);

@@ -4,11 +4,15 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <direct.h>
 #include <io.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <time.h>
 
+#ifndef getcwd
+#define getcwd _getcwd
+#endif
 #ifndef _longjmp
 #define _longjmp longjmp
 #endif
