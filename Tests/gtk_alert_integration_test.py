@@ -67,11 +67,11 @@ with tempfile.TemporaryDirectory(prefix='carta-gtk-alert-') as directory:
         wait_for(lambda: len(call('tracks')[0]['clips']) == 2 and not call('status')['pending_imports'])
         original = call('tracks')[0]['clips']
         keys('windowactivate', '--sync', main)
-        keys('mousemove', '--window', main, '190', '100')
+        keys('mousemove', '--window', main, '190', '121')
         keys('keydown', 'ctrl')
         keys('mousedown', '1')
         time.sleep(0.15)
-        keys('mousemove', '--sync', '--window', main, '235', '100')
+        keys('mousemove', '--sync', '--window', main, '235', '121')
         time.sleep(0.15)
         keys('mouseup', '1')
         keys('keyup', 'ctrl')
