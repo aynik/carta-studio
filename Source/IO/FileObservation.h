@@ -16,6 +16,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#ifdef near
+#undef near
+#endif
+#ifdef far
+#undef far
+#endif
 #endif
 
 namespace carta {

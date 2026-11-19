@@ -132,8 +132,8 @@ with tempfile.TemporaryDirectory(prefix='carta-gtk-alert-') as directory:
         while offset + 8 <= len(data):
             tag, size = struct.unpack_from('<4sI', data, offset); offset += 8
             chunks[tag] = data[offset:offset + size]; offset += size + (size & 1)
-        assert len(chunks[b'data']) == 88200 * 2 * 4
-        assert chunks[b'data'][:44100 * 2 * 4] == chunks[b'data'][44100 * 2 * 4:], 'review export must repeat the authored audio'
+        assert len(chunks[b'data']) == 132300 * 2 * 4
+        assert chunks[b'data'][:44100 * 2 * 4] == chunks[b'data'][44100 * 2 * 4:88200 * 2 * 4], 'review export must repeat the authored audio'
         call('select', 'clip', '0', '0')
         time.sleep(0.2)
         keys('key', 'ctrl+shift+p')
