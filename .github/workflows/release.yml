@@ -1,0 +1,150 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  porffor-codegen:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch pinned Porffor alpha-19
+        run: node Tools/fetch_porffor.mjs
+      - name: Emit Porffor C sources (codecs + NetMD)
+        run: |
+          node Tools/build_porffor_codecs.mjs --emit-c-only
+          node Tools/build_porffor_netmd.mjs --emit-c-only
+      - name: Upload generated C sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: porffor-generated-c
+          path: build/porffor/generated/*.c
+          retention-days: 1
+
+  package:
+    needs: porffor-codegen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: macos-arm64
+          - os: ubuntu-24.04
+            label: linux-x64
+          - os: windows-2022
+            label: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Download Porffor generated C sources
+        uses: actions/download-artifact@v4
+        with:
+          name: porffor-generated-c
+          path: build/porffor/generated
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libusb-1.0-0-dev libasound2-dev libfreetype6-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libgl1-mesa-dev libgtk-3-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install libusb
+
+      - name: Install Windows libusb-1.0
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/libusb-win64 | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.7z" -OutFile "build/libusb-1.0.27.7z"
+          7z x "build/libusb-1.0.27.7z" -o"build/libusb-win64" -y | Out-Null
+
+      - name: Compile Porffor native libraries
+        run: |
+          node Tools/build_porffor_codecs.mjs --compile-only
+          node Tools/build_porffor_netmd.mjs --compile-only
+
+      - name: Configure & Build (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --config Release --target CartaStudio carta-netmd --parallel 4
+
+      - name: Configure & Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $libusbRoot = (Resolve-Path "build/libusb-win64").Path
+          cmake -S . -B build `
+            -DBUILD_TESTING=OFF `
+            -DCARTA_LIBUSB_INCLUDE_DIR="$libusbRoot/include" `
+            -DCARTA_LIBUSB_LIBRARY="$libusbRoot/VS2022/MS64/dll/libusb-1.0.lib" `
+            -DCARTA_LIBUSB_DLL="$libusbRoot/VS2022/MS64/dll/libusb-1.0.dll"
+          cmake --build build --config Release --target CartaStudio carta-netmd --parallel 4
+
+      - name: Package macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          app="build/CartaStudio_artefacts/Carta Studio.app"
+          if [ ! -d "$app" ]; then app="build/CartaStudio_artefacts/Release/Carta Studio.app"; fi
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/Carta-Studio-${{ github.ref_name }}-${{ matrix.label }}.zip"
+
+      - name: Package Linux tarball
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "dist/carta-studio-${{ github.ref_name }}"
+          art="build/CartaStudio_artefacts/Release"
+          if [ ! -d "$art" ]; then art="build/CartaStudio_artefacts"; fi
+          cp -a "$art/Carta Studio" "$art/carta-netmd" "$art"/*.so "$art/THIRD_PARTY_NOTICES.md" "$art/LICENSE-carta-netmd-GPL-2.0.txt" "dist/carta-studio-${{ github.ref_name }}/"
+          tar -czf "dist/Carta-Studio-${{ github.ref_name }}-${{ matrix.label }}.tar.gz" -C dist "carta-studio-${{ github.ref_name }}"
+          rm -rf "dist/carta-studio-${{ github.ref_name }}"
+
+      - name: Package Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $art = "build/CartaStudio_artefacts/Release"
+          Compress-Archive -Path "$art/Carta Studio.exe", "$art/carta-netmd.exe", "$art/carta*_porffor.dll", "$art/libusb-1.0.dll", "$art/THIRD_PARTY_NOTICES.md", "$art/LICENSE-carta-netmd-GPL-2.0.txt" -DestinationPath "dist/Carta-Studio-${{ github.ref_name }}-${{ matrix.label }}.zip"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.label }}
+          path: dist/*
+
+  publish:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

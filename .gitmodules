@@ -1,0 +1,9 @@
+[submodule "third_party/carta1"]
+	path = third_party/carta1
+	url = https://github.com/aynik/carta1.git
+[submodule "third_party/carta3"]
+	path = third_party/carta3
+	url = https://github.com/aynik/carta3.git
+[submodule "third_party/carta5"]
+	path = third_party/carta5
+	url = https://github.com/aynik/carta5.git

@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Clean matte charcoal squircle background -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#24262b"/>
+      <stop offset="100%" stop-color="#191a1e"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="50%" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.32"/>
+    </linearGradient>
+
+    <!-- Main silver-white C arc gradient -->
+    <linearGradient id="cMono" x1="0.15" y1="0.05" x2="0.85" y2="0.95">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="60%" stop-color="#e3e7ed"/>
+      <stop offset="100%" stop-color="#c4cbd5"/>
+    </linearGradient>
+
+    <!-- Optical-disc rainbow diffraction band sweeping smoothly across the lower-left curve -->
+    <linearGradient id="opticalPrism" x1="318" y1="535" x2="522" y2="725" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#a78bfa" stop-opacity="0"/>
+      <stop offset="16%"  stop-color="#818cf8" stop-opacity="0.88"/>
+      <stop offset="32%"  stop-color="#38bdf8" stop-opacity="0.95"/>
+      <stop offset="50%"  stop-color="#34d399" stop-opacity="0.95"/>
+      <stop offset="68%"  stop-color="#fde047" stop-opacity="0.95"/>
+      <stop offset="84%"  stop-color="#fb7185" stop-opacity="0.88"/>
+      <stop offset="100%" stop-color="#c084fc" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Soft specular optical sheen across the rainbow section -->
+    <linearGradient id="prismSheen" x1="334" y1="560" x2="499" y2="710" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="50%"  stop-color="#ffffff" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Mask strictly to the exact C stroke -->
+    <mask id="cArcMask" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#000000"/>
+      <path d="M 690.03 368.81 A 214 214 0 1 0 690.03 655.19"
+            fill="none"
+            stroke="#ffffff"
+            stroke-width="96"
+            stroke-linecap="round"/>
+    </mask>
+
+    <filter id="drop" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000000" flood-opacity="0.38"/>
+    </filter>
+    <filter id="elemShadow" x="-15%" y="-15%" width="130%" height="135%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+
+  <!-- macOS squircle base -->
+  <rect x="100" y="100" width="824" height="824" rx="186" ry="186" fill="url(#bg)" filter="url(#drop)"/>
+  <rect x="102" y="102" width="820" height="820" rx="184" ry="184" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <!-- Bold Monolith C arc (optically centered at cx=531, cy=512; r=214, stroke=96, ±42° opening) -->
+  <g filter="url(#elemShadow)">
+    <path d="M 690.03 368.81 A 214 214 0 1 0 690.03 655.19"
+          fill="none"
+          stroke="url(#cMono)"
+          stroke-width="96"
+          stroke-linecap="round"/>
+  </g>
+
+  <!-- Optical-media rainbow diffraction band clipped cleanly to the lower-left arc of the C -->
+  <!-- Circle center (531,512), r=214: angle 200°=(329.9,438.8) -> 70°=(604.2,713.1), sweep=0 -->
+  <g mask="url(#cArcMask)">
+    <path d="M 329.91 438.81 A 214 214 0 0 0 604.19 713.09"
+          fill="none"
+          stroke="url(#opticalPrism)"
+          stroke-width="102"
+          stroke-linecap="butt"/>
+    <path d="M 329.91 438.81 A 214 214 0 0 0 604.19 713.09"
+          fill="none"
+          stroke="url(#prismSheen)"
+          stroke-width="102"
+          stroke-linecap="butt"/>
+  </g>
+</svg>

@@ -1,0 +1,346 @@
+/**
+ * @file MdAuthoring.h
+ * MiniDisc authoring domain model, physical span planner, and timeline edits.
+ *
+ * Units & Coordinates:
+ * - Timeline references (`MdPart`) use half-open `[startSample, endSample)`
+ *   ranges at `kMdSampleRate` (44,100 Hz).
+ * - Codec quanta align outward to 512 samples for ATRAC1 SP Stereo/Mono (2/1
+ *   sound groups per frame) or 1024 samples for ATRAC3 LP2/LP4 (2/1 sound
+ *   groups per frame).
+ * - Physical MiniDisc coordinates (`MdPhysAddr`) address `(cluster, sector,
+ *   group)` with 32 sectors/cluster and 11 sound groups/sector (352 sound
+ *   groups/cluster). Logical planning starts audio at `kMdFirstAudioCluster`
+ *   (cluster 1); NetMD hardware later relocates audio to physical cluster
+ *   `50.0.0` while preserving relative sound-group offsets.
+ *
+ * Invariants & Threading:
+ * - Pure synchronous value transformations; all mutating functions validate on
+ *   a candidate copy and leave caller `MdDisc` unchanged on failure.
+ */
+
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace carta {
+
+struct Session;
+
+// ============================================================================
+// Rainbow Book Physical Constants & Enums
+// ============================================================================
+
+inline constexpr std::int64_t kMdSampleRate = 44100;
+inline constexpr int kMdMaxTracks = 255;
+inline constexpr int kMdMaxGroups = 255;
+inline constexpr int kMdSectorsPerCluster = 32;
+inline constexpr int kMdUnitsPerSector = 11;
+inline constexpr int kMdUnitsPerCluster = kMdSectorsPerCluster * kMdUnitsPerSector; // 352
+inline constexpr std::uint16_t kMdFirstAudioCluster = 1;
+
+/** Standard MiniDisc physical medium capacities (MD60/MD74/MD80). */
+enum class MdMedium { md60, md74, md80 };
+
+/** Standard MiniDisc and MDLP recording modes supported by UTOC Sector 0. */
+enum class MdCodecMode { spStereo, spMono, lp2, lp4 };
+
+// ============================================================================
+// Authoring Data Structures
+// ============================================================================
+
+/** Physical cluster/sector/sound-group address on a standard MiniDisc. */
+struct MdPhysAddr {
+    std::uint16_t cluster = 0;
+    std::uint8_t sector = 0;
+    std::uint8_t group = 0;
+
+    std::int64_t toLinearUnits() const noexcept {
+        return (static_cast<std::int64_t>(cluster) * kMdSectorsPerCluster + sector) *
+                   kMdUnitsPerSector +
+               group;
+    }
+
+    static MdPhysAddr fromLinearUnits(std::int64_t units) noexcept {
+        if (units <= 0) {
+            return {};
+        }
+        const auto sectorIdx = units / kMdUnitsPerSector;
+        return {
+            static_cast<std::uint16_t>(sectorIdx / kMdSectorsPerCluster),
+            static_cast<std::uint8_t>(sectorIdx % kMdSectorsPerCluster),
+            static_cast<std::uint8_t>(units % kMdUnitsPerSector),
+        };
+    }
+
+    bool operator==(const MdPhysAddr& o) const noexcept {
+        return cluster == o.cluster && sector == o.sector && group == o.group;
+    }
+    bool operator!=(const MdPhysAddr& o) const noexcept { return !(*this == o); }
+};
+
+/** Half-open timeline audio reference `[startSample, endSample)` at 44.1 kHz. */
+struct MdPart {
+    std::int64_t startSample = 0;
+    std::int64_t endSample = 0;
+
+    std::int64_t durationSamples() const noexcept {
+        return endSample > startSample ? endSample - startSample : 0;
+    }
+
+    bool operator==(const MdPart& o) const noexcept {
+        return startSample == o.startSample && endSample == o.endSample;
+    }
+    bool operator!=(const MdPart& o) const noexcept { return !(*this == o); }
+};
+
+/** Logical UTOC track entry composed of one or more timeline parts and MD metadata. */
+struct MdTrack {
+    std::string id;
+    std::string halfWidthTitle;
+    std::string fullWidthTitle;
+    std::optional<MdCodecMode> codecOverride;
+    bool writeProtected = false;
+    bool scmsCopyProtected = false;
+    bool emphasis = false;
+    std::string timestamp; // "YYYY-MM-DD HH:MM:SS" or empty
+    std::vector<MdPart> parts;
+
+    std::int64_t totalSamples() const noexcept {
+        std::int64_t total = 0;
+        for (const auto& part : parts) {
+            total += part.durationSamples();
+        }
+        return total;
+    }
+
+    std::string displayTitle() const {
+        if (!halfWidthTitle.empty()) {
+            return halfWidthTitle;
+        }
+        if (!fullWidthTitle.empty()) {
+            return fullWidthTitle;
+        }
+        return {};
+    }
+
+    bool operator==(const MdTrack& o) const noexcept {
+        return id == o.id && halfWidthTitle == o.halfWidthTitle &&
+               fullWidthTitle == o.fullWidthTitle && codecOverride == o.codecOverride &&
+               writeProtected == o.writeProtected && scmsCopyProtected == o.scmsCopyProtected &&
+               emphasis == o.emphasis && timestamp == o.timestamp && parts == o.parts;
+    }
+    bool operator!=(const MdTrack& o) const noexcept { return !(*this == o); }
+};
+
+/** Disjoint inclusive 1-based MD track group range. */
+struct MdGroup {
+    int startTrack = 1;
+    int endTrack = 1;
+    std::string halfWidthTitle;
+    std::string fullWidthTitle;
+
+    bool operator==(const MdGroup& o) const noexcept {
+        return startTrack == o.startTrack && endTrack == o.endTrack &&
+               halfWidthTitle == o.halfWidthTitle && fullWidthTitle == o.fullWidthTitle;
+    }
+    bool operator!=(const MdGroup& o) const noexcept { return !(*this == o); }
+};
+
+/** Authoring document defining UTOC tracks, groups, and physical recording preferences. */
+struct MdDisc {
+    MdMedium medium = MdMedium::md80;
+    MdCodecMode defaultCodec = MdCodecMode::spStereo;
+    std::string halfWidthTitle;
+    std::string fullWidthTitle;
+    std::string discTimestamp;
+    bool autoTrackOnImport = true;
+    std::vector<MdTrack> tracks;
+    std::vector<MdGroup> groups;
+    /** Optional raw UTOC Sectors 0, 1, 2, 4 imported from a physical disc or bundle. */
+    std::array<std::vector<std::uint8_t>, 4> importedUtocSectors;
+
+    bool operator==(const MdDisc& o) const noexcept {
+        return medium == o.medium && defaultCodec == o.defaultCodec &&
+               halfWidthTitle == o.halfWidthTitle && fullWidthTitle == o.fullWidthTitle &&
+               discTimestamp == o.discTimestamp && autoTrackOnImport == o.autoTrackOnImport &&
+               tracks == o.tracks && groups == o.groups &&
+               importedUtocSectors == o.importedUtocSectors;
+    }
+    bool operator!=(const MdDisc& o) const noexcept { return !(*this == o); }
+};
+
+/** One contiguous codec-aligned physical audio upload on disc. */
+struct MdPhysicalSpan {
+    MdCodecMode codec = MdCodecMode::spStereo;
+    std::int64_t startSample = 0; // aligned to mdFrameQuantumSamples(codec)
+    std::int64_t endSample = 0;   // aligned to mdFrameQuantumSamples(codec)
+    int unitCount = 0;
+    std::uint16_t startCluster = kMdFirstAudioCluster;
+    int clusterCount = 0;
+};
+
+/** Physical placement of a single MdPart inside a coalesced MdPhysicalSpan. */
+struct MdPartPlacement {
+    int trackIndex = 0; // 0-based
+    int partIndex = 0;  // 0-based
+    int spanIndex = 0;  // 0-based into MdPhysicalPlan::spans
+    int unitOffsetInSpan = 0;
+    int unitCount = 0;
+    MdPhysAddr startAddr{};
+    MdPhysAddr endAddr{}; // inclusive last unit
+};
+
+/** Complete physical allocation and UTOC fragment plan derived from an MdDisc. */
+struct MdPhysicalPlan {
+    std::vector<MdPhysicalSpan> spans;
+    std::vector<MdPartPlacement> placements;
+    std::int64_t maxEndSample = 0;
+    std::int64_t logicalPlaySamples = 0;
+    std::int64_t uniquePhysicalSamples = 0;
+    int totalClusters = 0;
+    int usedClusters = 0;
+    int uncoalescedClusters = 0;
+    int savedClusters = 0;
+};
+
+// ============================================================================
+// Medium & Codec Metadata Helpers
+// ============================================================================
+
+/** Returns canonical string tag ("md60", "md74", or "md80"). */
+std::string mdMediumToString(MdMedium medium);
+
+/** Parses medium text or minute count; leaves `out` unchanged on failure. */
+bool parseMdMedium(const std::string& text, MdMedium& out) noexcept;
+
+/** Returns standard writable user cluster capacity for `medium`. */
+int mdTotalClusters(MdMedium medium) noexcept;
+
+/** Returns canonical codec mode tag ("sp-stereo", "sp-mono", "lp2", "lp4"). */
+std::string mdCodecModeToString(MdCodecMode mode);
+
+/** Parses codec mode alias; leaves `out` unchanged on failure. */
+bool parseMdCodecMode(const std::string& text, MdCodecMode& out) noexcept;
+
+/** Returns 44.1 kHz PCM samples per codec frame quantum (512 SP, 1024 LP2/LP4). */
+std::int64_t mdFrameQuantumSamples(MdCodecMode mode) noexcept;
+
+/** Returns UTOC sound groups consumed per codec quantum (2 SP-Stereo/LP2, 1 SP-Mono/LP4). */
+int mdUnitsPerQuantum(MdCodecMode mode) noexcept;
+
+/** Returns encoded audio channel count (1 for SP Mono, 2 otherwise). */
+int mdChannelsForCodec(MdCodecMode mode) noexcept;
+
+/** Resolves track codec override or falls back to `disc.defaultCodec`. */
+MdCodecMode effectiveTrackCodec(const MdDisc& disc, const MdTrack& track) noexcept;
+
+// ============================================================================
+// Validation & Physical Span Planning
+// ============================================================================
+
+/** Returns true when `disc` matches a freshly initialized empty authoring state. */
+bool isDefaultMdDisc(const MdDisc& disc) noexcept;
+
+/** Generates a globally unique stable track ID ("md-<uuid8>-<seq>"). */
+std::string makeMdTrackId();
+
+/** Validates timestamps, unique IDs, part ranges, and disjoint groups; populates `error` on
+ * failure. */
+bool validateMdDisc(const MdDisc& disc, std::string& error);
+
+/**
+ * Coalesces overlapping/abutting same-codec parts into physical spans and UTOC
+ * placements. On failure, resets `out` to empty with `totalClusters` set and
+ * populates `error`.
+ */
+bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& error);
+
+// ============================================================================
+// Track, Part, & Group Mutations
+// ============================================================================
+
+/** Resolves a stable track ID or 1-based numeric index string to a 0-based track index, or -1. */
+int findMdTrackIndex(const MdDisc& disc, const std::string& idOrOneBasedIndex) noexcept;
+
+/** Appends an auto-generated track for an imported clip when `autoTrackOnImport` is enabled. */
+bool appendAutoTrackForClip(MdDisc& disc, const std::string& title, std::int64_t startSample,
+                            std::int64_t endSample);
+
+/**
+ * Appends or splits-tail auto-track for a clip placed at `[startSample, endSample)`.
+ * Leaves `disc` unchanged if disabled, invalid, or track limit is reached.
+ */
+bool applyAutoTrackForPlacedClip(MdDisc& disc, const std::string& title, std::int64_t startSample,
+                                 std::int64_t endSample);
+
+/** Inserts `track` at 1-based position (`1..count+1`) and shifts groups; leaves `disc` unchanged on
+ * error. */
+bool insertMdTrack(MdDisc& disc, int oneBasedPosition, MdTrack track, std::string& error);
+
+/** Splits `trackIndex0` at `timelineSample` if strictly inside one part; leaves `disc` unchanged on
+ * error. */
+bool splitMdTrackAtSample(MdDisc& disc, int trackIndex0, std::int64_t timelineSample,
+                          std::string& error);
+
+/** Merges adjacent tracks `trackIndex0` and `trackIndex0 + 1`; leaves `disc` unchanged on error. */
+bool mergeMdTrackWithNext(MdDisc& disc, int trackIndex0, std::string& error);
+
+/** Duplicates `trackIndex0` directly after itself with a fresh ID; leaves `disc` unchanged on
+ * error. */
+bool duplicateMdTrack(MdDisc& disc, int trackIndex0, std::string& error);
+
+/** Reorders `fromIndex0` to `toIndex0` while maintaining valid disjoint groups; leaves `disc`
+ * unchanged on error. */
+bool moveMdTrack(MdDisc& disc, int fromIndex0, int toIndex0, std::string& error);
+
+/** Removes `trackIndex0` and shifts group indices; leaves `disc` unchanged on error. */
+bool removeMdTrack(MdDisc& disc, int trackIndex0, std::string& error);
+
+/** Moves a shared split boundary `newSample` between two distinct parts; leaves `disc` unchanged on
+ * error. */
+bool moveMdSharedBoundary(MdDisc& disc, int leftTrack0, int leftPart0, int rightTrack0,
+                          int rightPart0, std::int64_t newSample, std::int64_t maxSample,
+                          std::string& error);
+
+/** Trims a part's start or end edge clamped within `[0, maxSample]`; leaves `disc` unchanged on
+ * error. */
+bool trimMdPartEdge(MdDisc& disc, int trackIndex0, int partIndex0, bool rightEdge,
+                    std::int64_t newSample, std::int64_t maxSample, std::string& error);
+
+/** Slides a part preserving duration within `[0, maxSample]`; leaves `disc` unchanged on error. */
+bool slideMdPartRange(MdDisc& disc, int trackIndex0, int partIndex0, std::int64_t newStartSample,
+                      std::int64_t maxSample, std::string& error);
+
+/** Assigns a named group over inclusive 1-based `[startTrack1, endTrack1]`, trimming overlaps;
+ * leaves `disc` unchanged on error. */
+bool setMdGroup(MdDisc& disc, int startTrack1, int endTrack1, const std::string& halfWidthTitle,
+                const std::string& fullWidthTitle, std::string& error);
+
+/** Clears or trims any groups overlapping inclusive `[startTrack1, endTrack1]`; leaves `disc`
+ * unchanged on error. */
+bool ungroupMdRange(MdDisc& disc, int startTrack1, int endTrack1, std::string& error);
+
+// ============================================================================
+// Timeline Synchronization
+// ============================================================================
+
+/** Rebuilds tracks from explicit `(layer, clip)` pairs or active unmuted timeline clips; leaves
+ * `disc` unchanged on error. */
+bool syncTracksFromClips(const Session& session, MdDisc& disc, std::string& error,
+                         const std::vector<std::pair<int, int>>& explicitClips = {});
+
+/** Rebuilds tracks directly from Layer 1 clips sorted chronologically; leaves `disc` unchanged on
+ * error. */
+bool syncTracksFromLayerClips(const Session& session, MdDisc& disc, std::string& error);
+
+/** Rebuilds contiguous tracks bounded by session timeline markers; leaves `disc` unchanged on
+ * error. */
+bool syncTracksFromMarkers(const Session& session, MdDisc& disc, std::string& error);
+
+} // namespace carta

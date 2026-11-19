@@ -1,0 +1,9 @@
+{
+  "name": "carta-studio-netmd-deps",
+  "private": true,
+  "dependencies": {
+    "netmd-exploits": "^0.5.12",
+    "netmd-js": "^4.4.1",
+    "netmd-tocmanip": "^0.2.1"
+  }
+}
