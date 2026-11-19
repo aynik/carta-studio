@@ -890,6 +890,8 @@ class Studio final : public juce::AudioAppComponent,
     std::vector<CommandSearchEntry> commandSearchEntries();
     void showCommandSearch();
     void showKeyboardHelp();
+    void exportDiagnosticLog();
+    void revealDiagnosticLogFolder();
     void recordImportIssue(const juce::File& file, const juce::String& reason);
     void clearImportIssues();
     juce::String importIssueText() const;

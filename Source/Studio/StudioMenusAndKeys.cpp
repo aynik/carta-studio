@@ -24,6 +24,8 @@
 
 #include "Studio/Studio.h"
 
+#include "IO/DiagnosticLog.h"
+
 namespace {
 
 constexpr int kTimelineRulerHeight = 32;
@@ -470,6 +472,8 @@ constexpr int helpKeyboardShortcuts = 124;
 constexpr int helpAnnounceTimeline = 149;
 constexpr int helpFocusTimeline = 367;
 constexpr int helpSearchCommands = 371;
+constexpr int helpExportDiagnosticLog = 1090;
+constexpr int helpRevealLogFolder = 1091;
 constexpr int historyBase = 1000000;
 } // namespace MenuId
 
@@ -2424,6 +2428,9 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                 ")");
         m.addItem(MenuId::helpAnnounceTimeline, "Announce timeline status (F4)");
         m.addItem(MenuId::helpKeyboardShortcuts, "Keyboard shortcuts...");
+        m.addSeparator();
+        m.addItem(MenuId::helpExportDiagnosticLog, "Export Diagnostic Log...");
+        m.addItem(MenuId::helpRevealLogFolder, "Reveal Log Folder");
     }
     return m;
 }
@@ -3002,6 +3009,12 @@ void Studio::menuItemSelected(int id, int) {
         break;
     case MenuId::helpKeyboardShortcuts:
         showKeyboardHelp();
+        break;
+    case MenuId::helpExportDiagnosticLog:
+        exportDiagnosticLog();
+        break;
+    case MenuId::helpRevealLogFolder:
+        revealDiagnosticLogFolder();
         break;
     case MenuId::helpAnnounceTimeline:
         announceTimeline();
@@ -4620,4 +4633,60 @@ void Studio::showKeyboardHelp() {
             safe->focusText();
         }
     });
+}
+
+void Studio::exportDiagnosticLog() {
+    std::ostringstream ctx;
+    {
+        const juce::ScopedLock sl(lock);
+        ctx << "MD Medium: " << carta::mdMediumToString(session.mdDisc.medium)
+            << " | Default Codec: " << carta::mdCodecModeToString(session.mdDisc.defaultCodec)
+            << " | MD Tracks: " << session.mdDisc.tracks.size()
+            << " | Timeline Layers: " << session.tracks.size() << "\n";
+    }
+    if (cachedNetMdPreflight.has_value()) {
+        ctx << "Last NetMD Preflight:\n" << cachedNetMdPreflight->summary << "\n";
+    } else if (!cachedNetMdDevices.empty()) {
+        ctx << "Detected NetMD Devices: " << cachedNetMdDevices.size() << "\n";
+    }
+    const std::string contextText = ctx.str();
+
+    const juce::String defaultName =
+        "carta-studio-diagnostic-" +
+        juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S") + ".log";
+    const juce::File initial =
+        juce::File::getSpecialLocation(juce::File::userDesktopDirectory).getChildFile(defaultName);
+    chooser = std::make_unique<juce::FileChooser>("Export Diagnostic Log", initial, "*.log;*.txt");
+    const auto flags =
+        juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles |
+        juce::FileBrowserComponent::warnAboutOverwriting;
+    chooser->launchAsync(
+        flags, [safe = juce::Component::SafePointer<Studio>(this), contextText](
+                   const juce::FileChooser& fc) {
+            if (safe == nullptr) {
+                return;
+            }
+            const juce::File target = fc.getResult();
+            if (target == juce::File()) {
+                return;
+            }
+            std::string err;
+            if (!carta::exportDiagnosticLogToFile(target, contextText, err)) {
+                safe->status.setText(juce::String::fromUTF8(err.c_str()),
+                                     juce::dontSendNotification);
+                return;
+            }
+            safe->status.setText("Saved diagnostic log: " + target.getFileName(),
+                                 juce::dontSendNotification);
+        });
+}
+
+void Studio::revealDiagnosticLogFolder() {
+    const juce::File logFile = carta::diagnosticLogFile();
+    if (logFile.existsAsFile()) {
+        logFile.revealToUser();
+    } else {
+        logFile.getParentDirectory().revealToUser();
+    }
+    status.setText("Log file: " + logFile.getFullPathName(), juce::dontSendNotification);
 }

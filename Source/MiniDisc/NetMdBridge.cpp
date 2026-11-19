@@ -21,6 +21,7 @@
 
 #include "MiniDisc/NetMdBridge.h"
 
+#include "IO/DiagnosticLog.h"
 #include "MiniDisc/NativeCodecs.h"
 
 #include <juce_core/juce_core.h>
@@ -550,11 +551,24 @@ bool runSessionHelperCommand(const std::string& sessionLine, const HelperProgres
 bool invokeNetMdHelperUnlocked(const std::vector<std::string>& cliArgs,
                                const std::string& sessionLine, const HelperProgressWindow& win,
                                juce::var& outResultObj, std::string& error) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string op = cliArgs.empty() ? "unknown" : cliArgs[0];
+    const std::string dev = cliArgs.size() > 1 ? cliArgs[1] : "";
     std::string rawLine;
-    if (mockSession().isRunning()) {
-        return runSessionHelperCommand(sessionLine, win, outResultObj, rawLine, error);
+    const bool ok = mockSession().isRunning()
+                        ? runSessionHelperCommand(sessionLine, win, outResultObj, rawLine, error)
+                        : runOneShotHelperCommand(cliArgs, win, outResultObj, rawLine, error);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    if (ok) {
+        logDiagnostic("netmd", op + (dev.empty() ? "" : " " + dev) + " -> ok (" +
+                                   std::to_string(ms) + " ms)");
+    } else {
+        logDiagnostic("netmd", op + (dev.empty() ? "" : " " + dev) + " -> FAIL (" +
+                                   std::to_string(ms) + " ms): " + error);
     }
-    return runOneShotHelperCommand(cliArgs, win, outResultObj, rawLine, error);
+    return ok;
 }
 
 #else
@@ -820,11 +834,24 @@ bool runSessionHelperCommand(const std::string& sessionLine, const HelperProgres
 bool invokeNetMdHelperUnlocked(const std::vector<std::string>& cliArgs,
                                const std::string& sessionLine, const HelperProgressWindow& win,
                                juce::var& outResultObj, std::string& error) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string op = cliArgs.empty() ? "unknown" : cliArgs[0];
+    const std::string dev = cliArgs.size() > 1 ? cliArgs[1] : "";
     std::string rawLine;
-    if (mockSession().isRunning()) {
-        return runSessionHelperCommand(sessionLine, win, outResultObj, rawLine, error);
+    const bool ok = mockSession().isRunning()
+                        ? runSessionHelperCommand(sessionLine, win, outResultObj, rawLine, error)
+                        : runOneShotHelperCommand(cliArgs, win, outResultObj, rawLine, error);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    if (ok) {
+        logDiagnostic("netmd", op + (dev.empty() ? "" : " " + dev) + " -> ok (" +
+                                   std::to_string(ms) + " ms)");
+    } else {
+        logDiagnostic("netmd", op + (dev.empty() ? "" : " " + dev) + " -> FAIL (" +
+                                   std::to_string(ms) + " ms): " + error);
     }
-    return runOneShotHelperCommand(cliArgs, win, outResultObj, rawLine, error);
+    return ok;
 }
 
 #endif
@@ -937,6 +964,14 @@ bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& ou
             out.tracks.push_back(std::move(tr));
         }
     }
+    logDiagnostic("probe", out.deviceName + " [" + out.deviceId + "] fw=" + out.versionCode +
+                               " spUpload=" + (out.supportsSpUpload ? "1" : "0") +
+                               " forceToc=" + (out.supportsForceTocEdit ? "1" : "0") +
+                               " disc=" + (out.discPresent ? "1" : "0") +
+                               " writable=" + (out.writable ? "1" : "0") +
+                               " tracks=" + std::to_string(out.trackCount) +
+                               " used=" + std::to_string(out.usedSeconds) + "s" +
+                               " left=" + std::to_string(out.leftSeconds) + "s");
     return true;
 }
 
@@ -998,10 +1033,38 @@ bool readDeviceUtocSectorsUnlocked(
                             rawSectors[4].data(), parsedState, error);
 }
 
+bool validatePhysicalUtocClusters(const UtocDiscState& utoc, std::string& error) {
+    // Rainbow Book: clusters 0..49 (0x00..0x31) are reserved for lead-in / UTOC.
+    // Writing virtual clusters (e.g. kFirstAudioCluster = 1 from Export UTOC)
+    // to a physical MiniDisc causes 'TOC Error' on every player.
+    constexpr std::uint16_t kMinPhysicalAudioCluster = 50;
+    for (int t = 1; t <= static_cast<int>(utoc.trackCount); ++t) {
+        std::uint8_t slot = utoc.trackMap[static_cast<std::size_t>(t)];
+        std::set<std::uint8_t> visited;
+        while (slot != 0 && visited.insert(slot).second) {
+            const auto& frag = utoc.fragments[slot];
+            if (!frag.isValid() || frag.start.cluster < kMinPhysicalAudioCluster ||
+                frag.end.cluster < frag.start.cluster) {
+                error = "Refusing to write virtual/invalid UTOC cluster address (cluster " +
+                        std::to_string(frag.start.cluster) +
+                        " < 50) to physical MiniDisc. Use Erase & Record MiniDisc or import UTOC "
+                        "directly from the disc.";
+                return false;
+            }
+            slot = frag.link;
+        }
+    }
+    return true;
+}
+
 bool writeDeviceUtocSectorsUnlocked(
     const std::string& deviceId, const UtocDiscState& utocState,
     const std::array<std::uint8_t, kUtocSectorBytes>* preservedSector3, bool confirmHardware,
     const HelperProgressWindow& win, std::string& error) {
+    if (!isNetMdMockDeviceId(deviceId) && !validatePhysicalUtocClusters(utocState, error)) {
+        return false;
+    }
+
     std::array<std::uint8_t, kUtocSectorBytes> sec0{};
     std::array<std::uint8_t, kUtocSectorBytes> sec1{};
     std::array<std::uint8_t, kUtocSectorBytes> sec2{};
@@ -1009,6 +1072,15 @@ bool writeDeviceUtocSectorsUnlocked(
     if (!compileUtocSectors(utocState, sec0, sec1, sec2, sec4, error)) {
         return false;
     }
+
+    const bool hasFullWidth = std::any_of(utocState.fullTitleMap.begin(),
+                                          utocState.fullTitleMap.end(),
+                                          [](std::uint8_t s) { return s != 0; });
+    // Ensure Sector 0 used-sectors bitmask (byte 0x23) flags Sectors 0, 1, 2
+    // (and Sector 4 when full-width titles exist) so players read titles cleanly.
+    sec0[0x23] = static_cast<std::uint8_t>(sec0[0x23] | 0x07u | (hasFullWidth ? 0x10u : 0x00u));
+    const int sectorMask = (hasFullWidth || (sec0[0x23] & 0x10u) != 0) ? 23 : 7;
+    const std::string maskStr = std::to_string(sectorMask);
 
     std::vector<std::uint8_t> packed(5 * kUtocSectorBytes, 0);
     std::memcpy(packed.data() + 0 * kUtocSectorBytes, sec0.data(), kUtocSectorBytes);
@@ -1027,15 +1099,40 @@ bool writeDeviceUtocSectorsUnlocked(
     }
     const std::string inPath = tmp.getFile().getFullPathName().toStdString();
 
-    // Mask 0x17 = 23 = (1<<0)|(1<<1)|(1<<2)|(1<<4): commit Sectors 0, 1, 2, 4; preserve Sector 3.
-    std::vector<std::string> cli = {"write-utoc", deviceId, "--in", inPath, "--mask", "23"};
+    std::vector<std::string> cli = {"write-utoc", deviceId, "--in", inPath, "--mask", maskStr};
     if (confirmHardware) {
         cli.push_back("--confirm-hardware");
     }
     const std::string sess = "write-utoc\t" + percentEncode(deviceId) + "\t" +
-                             percentEncode(inPath) + "\t23\t" + (confirmHardware ? "1" : "0");
+                             percentEncode(inPath) + "\t" + maskStr + "\t" +
+                             (confirmHardware ? "1" : "0");
     juce::var resObj;
-    return invokeNetMdHelperUnlocked(cli, sess, win, resObj, error);
+    if (!invokeNetMdHelperUnlocked(cli, sess, win, resObj, error)) {
+        return false;
+    }
+    logDiagnostic("utoc", "write-utoc ok: device=" + deviceId +
+                              " tracks=" + std::to_string(utocState.trackCount) +
+                              " mask=" + maskStr +
+                              " usedSectors=0x" +
+                              juce::String::toHexString(sec0[0x23]).toStdString());
+
+    if (!isNetMdMockDeviceId(deviceId)) {
+        std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> verifyRaw{};
+        UtocDiscState verifyUtoc{};
+        std::string verifyErr;
+        if (readDeviceUtocSectorsUnlocked(deviceId, verifyRaw, verifyUtoc, HelperProgressWindow{},
+                                          verifyErr) &&
+            verifyUtoc.trackCount != utocState.trackCount) {
+            error = "Device DRAM UTOC verification mismatch after TOCWRT (expected " +
+                    std::to_string(utocState.trackCount) + " tracks, read back " +
+                    std::to_string(verifyUtoc.trackCount) + ").";
+            logDiagnostic("utoc", error);
+            return false;
+        }
+        logDiagnostic("utoc", "DRAM UTOC readback verified: trackCount=" +
+                                  std::to_string(verifyUtoc.trackCount));
+    }
+    return true;
 }
 
 bool uploadSpanUnlocked(const std::string& deviceId, int modeCode,
@@ -1994,7 +2091,10 @@ bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confir
         remappedFromHardware = tryPreserveDeviceSector0Topology(disc, deviceUtoc, logicalUtoc);
     }
 
-    if (!remappedFromHardware && !isNetMdMockDeviceId(resolvedId) && !hasImportedHeaders) {
+    std::string physCheckErr;
+    const bool importedHasPhysicalLayout =
+        hasImportedHeaders && validatePhysicalUtocClusters(logicalUtoc, physCheckErr);
+    if (!remappedFromHardware && !isNetMdMockDeviceId(resolvedId) && !importedHasPhysicalLayout) {
         error = "Physical audio layout on MiniDisc does not match the current track spans; use "
                 "Erase & Record MiniDisc to upload audio first.";
         return false;

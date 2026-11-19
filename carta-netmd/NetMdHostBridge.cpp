@@ -2326,7 +2326,7 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_out(int handle, int endpoi
         int transferred = 0;
         const int rc = libusb_bulk_transfer(it->second.usbHandle, ep,
                                             const_cast<unsigned char*>(data + totalSent), chunkLen,
-                                            &transferred, 60000);
+                                            &transferred, 120000);
         if (rc != 0 || transferred <= 0) {
             carta::setErrorLocked(std::string("USB bulk OUT failed: ") + libusb_error_name(rc));
             return -1;

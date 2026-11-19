@@ -540,8 +540,9 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
             o->setProperty("used_fragments", budget.usedFragments);
             o->setProperty("shared_fragments", budget.sharedFragmentCount);
             result = juce::var(o);
-            uiStatus = "Committed UTOC Sectors 0/1/2/4 (" + juce::String(budget.usedTracks) +
-                       " tracks, " + juce::String(budget.usedFragments) + " fragments).";
+            uiStatus = "Committed UTOC (" + juce::String(budget.usedTracks) + " tracks, " +
+                       juce::String(budget.usedFragments) +
+                       " fragments). Eject & re-insert disc for player display to refresh.";
             return true;
         });
 }
@@ -583,7 +584,7 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
             result = juce::var(o);
             uiStatus = "Recorded " + juce::String(rec.uploadedPhysicalSegments) +
                        " physical segment(s) -> " + juce::String(rec.logicalTracks) +
-                       " UTOC track(s).";
+                       " UTOC track(s). Eject & re-insert disc for player display to refresh.";
             return true;
         });
 }
