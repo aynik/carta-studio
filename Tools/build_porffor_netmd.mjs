@@ -521,7 +521,10 @@ exports.CORE_MACROS = { fw_compat_bridge: { properties: {} } };
                 logger: this.logger,
                 getMaxPatchesAmount: () => this.getMaxPatchesAmount(),
                 markPatchAsPermanent: (p) => this.markPatchAsPermanent(p),
-                patch: (...a) => this.patch(...a),
+                patch: (address, value, patchNumber) => {
+                    const slot = patchNumber !== undefined ? patchNumber : overwrittenMethods.getIncrementalPatchNumber();
+                    return this.patch(address, value, slot);
+                },
                 envelop: (...a) => this.envelop(...a),
                 getCurrentlyLoaded: () => this.getCurrentlyLoaded(),
                 getFreeMemoryMap: () => this.getFreeMemoryMap(),

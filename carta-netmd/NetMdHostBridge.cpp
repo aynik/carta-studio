@@ -2231,7 +2231,7 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_control_out(int handle, int req
     const int rc =
         libusb_control_transfer(it->second.usbHandle, bmReq, static_cast<uint8_t>(request),
                                 static_cast<uint16_t>(value), static_cast<uint16_t>(index),
-                                const_cast<unsigned char*>(data), static_cast<uint16_t>(len), 5000);
+                                const_cast<unsigned char*>(data), static_cast<uint16_t>(len), 30000);
     if (rc < 0) {
         carta::setErrorLocked(std::string("USB control OUT failed: ") + libusb_error_name(rc));
         return -1;
@@ -2277,7 +2277,7 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_control_in(int handle, int requ
                                                LIBUSB_RECIPIENT_INTERFACE);
     const int rc = libusb_control_transfer(
         it->second.usbHandle, bmReq, static_cast<uint8_t>(request), static_cast<uint16_t>(value),
-        static_cast<uint16_t>(index), out, static_cast<uint16_t>(max_len), 5000);
+        static_cast<uint16_t>(index), out, static_cast<uint16_t>(max_len), 30000);
     if (rc < 0) {
         carta::setErrorLocked(std::string("USB control IN failed: ") + libusb_error_name(rc));
         return -1;
