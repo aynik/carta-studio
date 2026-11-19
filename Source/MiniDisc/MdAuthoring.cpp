@@ -1063,8 +1063,8 @@ bool syncTracksFromClips(const Session& session, MdDisc& disc, std::string& erro
         if (clipIdx < 0 || clipIdx >= static_cast<int>(clips.size())) {
             return;
         }
-        std::int64_t st = 0;
-        std::int64_t en = 0;
+        juce::int64 st = 0;
+        juce::int64 en = 0;
         if (!clipSampleRange(clips[static_cast<std::size_t>(clipIdx)], st, en) || en <= st) {
             return;
         }
@@ -1073,7 +1073,8 @@ bool syncTracksFromClips(const Session& session, MdDisc& disc, std::string& erro
                                              .replaceCharacters("\r\n", "  ")
                                              .trim()
                                              .toStdString());
-        out.push_back({st, en, layerIdx, std::move(label)});
+        out.push_back({static_cast<std::int64_t>(st), static_cast<std::int64_t>(en), layerIdx,
+                       std::move(label)});
     };
 
     std::vector<ClipEntry> items;
@@ -1173,8 +1174,8 @@ bool syncTracksFromLayerClips(const Session& session, MdDisc& disc, std::string&
         };
         std::vector<ClipEntry> items;
         for (const auto& clip : session.tracks[0].clips) {
-            std::int64_t s = 0;
-            std::int64_t e = 0;
+            juce::int64 s = 0;
+            juce::int64 e = 0;
             if (!clipSampleRange(clip, s, e) || e <= s) {
                 continue;
             }
@@ -1182,7 +1183,8 @@ bool syncTracksFromLayerClips(const Session& session, MdDisc& disc, std::string&
             if (label.empty()) {
                 label = "Track " + std::to_string(items.size() + 1);
             }
-            items.push_back({s, e, std::move(label)});
+            items.push_back(
+                {static_cast<std::int64_t>(s), static_cast<std::int64_t>(e), std::move(label)});
         }
         std::sort(items.begin(), items.end(), [](const ClipEntry& a, const ClipEntry& b) {
             return std::tie(a.start, a.end) < std::tie(b.start, b.end);

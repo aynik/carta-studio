@@ -1216,6 +1216,7 @@ try {
     )
   } else if (isWin) {
     const tmpImpLib = path.join(codecWork, outSpec.impLibFile)
+    const winCompatInc = path.join(studioDir, 'Tools', 'porffor-win32-compat')
     runChecked(
       clangBin,
       [
@@ -1225,6 +1226,8 @@ try {
         '-ffp-contract=off',
         '-fno-math-errno',
         '-fvisibility=hidden',
+        '-I',
+        winCompatInc,
         `-Wl,/IMPLIB:${tmpImpLib}`,
         patchedC,
         '-o',

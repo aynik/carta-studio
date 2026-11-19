@@ -12340,7 +12340,9 @@ struct StudioComponentTests {
             if (dialog) {
                 dialog->getTextEditor("name")->setText(juce::String::fromUTF8("  新しい曲  "));
                 dialog->exitModalState(1);
-                juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+                for (int i = 0; i < 50 && studio.savePromptActive; ++i) {
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+                }
             }
             check(studio.session.markers[0].name == juce::String::fromUTF8("新しい曲"),
                   "F2 preserves Unicode in the renamed marker");
@@ -12358,7 +12360,9 @@ struct StudioComponentTests {
             if (dialog) {
                 dialog->getTextEditor("name")->setText("   ");
                 dialog->exitModalState(1);
-                juce::MessageManager::getInstance()->runDispatchLoopUntil(20);
+                for (int i = 0; i < 50 && studio.savePromptActive; ++i) {
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+                }
             }
             check(studio.editGeneration == revision &&
                       studio.session.markers[0].name == "Original" &&

@@ -2701,6 +2701,7 @@ async function main() {
     )
   } else if (isWin) {
     const tmpObj = path.join(workDir, 'netmd_porffor.obj')
+    const winCompatInc = path.join(studioDir, 'Tools', 'porffor-win32-compat')
     runChecked(
       clangBin,
       [
@@ -2710,6 +2711,8 @@ async function main() {
         '-fno-fast-math',
         '-ffp-contract=off',
         '-fno-math-errno',
+        '-I',
+        winCompatInc,
         generatedCPath,
         '-o',
         tmpObj,
