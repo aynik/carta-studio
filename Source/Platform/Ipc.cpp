@@ -32,7 +32,7 @@
 namespace carta {
 namespace {
 
-const char* help = R"(Carta Studio
+const char* helpPart1 = R"(Carta Studio
 Usage:
   CartaStudio [audio-file ...]       Launch the editor and queue audio imports
   CartaStudio --help                 Show this command tree
@@ -199,7 +199,9 @@ Usage:
                                     Select time from the point to a boundary
   CartaStudio ipc select range FIRST_TRACK LAST_TRACK START_SAMPLE END_SAMPLE
                                     Select half-open sample range
-  CartaStudio ipc select tracks START_SAMPLE END_SAMPLE TRACK [TRACK ...]
+)";
+
+const char* helpPart2 = R"(  CartaStudio ipc select tracks START_SAMPLE END_SAMPLE TRACK [TRACK ...]
                                     Select a range on independent tracks
   CartaStudio ipc edit move-range TARGET_TRACK START_SAMPLE
                                     Move selected time, mixing destination overlaps
@@ -731,7 +733,7 @@ struct IpcServer::Impl {
             return false;
         }
 
-        struct stat st {};
+        struct stat st{};
         if (lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
             (st.st_mode & 077) != 0) {
             failure = "IPC directory must be private and owned by the current user";
@@ -872,7 +874,8 @@ int runIpcClient(int argc, char* argv[]) {
     }
     const juce::String first = juce::String::fromUTF8(argv[1]);
     if (first == "--help" || first == "-h") {
-        std::fputs(help, stdout);
+        std::fputs(helpPart1, stdout);
+        std::fputs(helpPart2, stdout);
         return 0;
     }
 
@@ -900,7 +903,8 @@ int runIpcClient(int argc, char* argv[]) {
         cmdIndex = 3;
     }
     if (argc <= cmdIndex || juce::String(argv[cmdIndex]) == "--help") {
-        std::fputs(help, stdout);
+        std::fputs(helpPart1, stdout);
+        std::fputs(helpPart2, stdout);
         return argc <= cmdIndex ? 2 : 0;
     }
 

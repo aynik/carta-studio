@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory(prefix='carta-gtk-alert-') as directory:
         if find('Import audio'):
             keys('key', 'Return')
         wait_for(lambda: not find('Import audio'))
-        wait_for(lambda: call('status')['track_count'] == 2 and not call('status')['pending_imports'])
+        wait_for(lambda: len(call('tracks')[0]['clips']) == 2 and not call('status')['pending_imports'])
         original = call('tracks')[0]['clips']
         keys('windowactivate', '--sync', main)
         keys('mousemove', '--window', main, '190', '100')
@@ -75,7 +75,7 @@ with tempfile.TemporaryDirectory(prefix='carta-gtk-alert-') as directory:
         time.sleep(0.15)
         keys('mouseup', '1')
         keys('keyup', 'ctrl')
-        copied = wait_for(lambda: (rows if len(rows := call('tracks')[0]['clips']) == 2 else None))
+        copied = wait_for(lambda: (rows if len(rows := call('tracks')[0]['clips']) == 3 else None))
         assert copied[0] == original[0] and copied[1]['source'] == original[0]['source'] and copied[1]['start_sample'] > copied[0]['start_sample'], copied
         call('edit', 'undo')
         assert call('tracks')[0]['clips'] == original, 'one undo must remove the drag copy'

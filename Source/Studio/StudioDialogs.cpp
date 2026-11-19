@@ -907,11 +907,11 @@ juce::String QuietGapList::getNameForRow(int index) {
     return (sourceScope ? "Source silence, samples " : "Master-mix quiet gap, samples ") +
            juce::String(row.range.start) + " to " + juce::String(row.range.end) +
            ", end exclusive. " +
-           (sourceScope ? (row.detachable.end > row.detachable.start
-                               ? "Safe detach interior " + juce::String(row.detachable.start) +
-                                     " to " + juce::String(row.detachable.end) + ". "
-                               : juce::String("No safe detach interior. ")) +
-                              "Selection includes overlapping clips."
+           (sourceScope  ? (row.detachable.end > row.detachable.start
+                                ? "Safe detach interior " + juce::String(row.detachable.start) +
+                                      " to " + juce::String(row.detachable.end) + ". "
+                                : juce::String("No safe detach interior. ")) +
+                               "Selection includes overlapping clips."
             : row.marked ? "Contains a marker."
                          : "No marker in gap.");
 }
@@ -1011,7 +1011,8 @@ QuietMarkerSuggestions::QuietMarkerSuggestions(
     if (onBrowse) {
         addAndMakeVisible(browse);
         browse.onClick = [this] {
-            onBrowse([safe = juce::Component::SafePointer<QuietMarkerSuggestions>(this)] {
+            auto* self = this;
+            onBrowse([safe = juce::Component::SafePointer<QuietMarkerSuggestions>(self)] {
                 if (safe != nullptr) {
                     safe->close();
                 }
