@@ -699,9 +699,11 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
             const auto& st = pre.device;
             const juce::String fw =
                 st.versionCode.empty() ? "?" : juce::String::fromUTF8(st.versionCode.c_str());
+            const juce::String spLabel =
+                !st.supportsSpUpload ? "No" : (fw.startsWithChar('R') ? "Type-R" : "Type-S");
             snap.badgeText = "FW " + fw + dot +
                              "ForceTOC: " + (st.supportsForceTocEdit ? "OK" : "NO") + dot +
-                             "SPUpload: " + (st.supportsSpUpload ? "Type-S" : "No");
+                             "SPUpload: " + spLabel;
             const bool spNeeded =
                 std::any_of(plan.spans.begin(), plan.spans.end(), [](const auto& s) {
                     return s.codec == carta::MdCodecMode::spStereo ||
@@ -736,8 +738,8 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
                                   "). Add tracks on Tracks & UTOC to record.";
             } else if (spNeeded && !st.supportsSpUpload) {
                 snap.statusText =
-                    "SP upload requires a Type-S NetMD recorder (switch tracks to LP2/LP4 or "
-                    "connect Type-S hardware).";
+                    "SP upload requires a Type-S or Type-R NetMD recorder (switch tracks to "
+                    "LP2/LP4 or connect compatible hardware).";
             } else {
                 snap.statusText =
                     "Ready to record " + juce::String(static_cast<int>(plan.spans.size())) +
@@ -874,7 +876,7 @@ void Studio::triggerRecordStartFromUi() {
             .withTitle("Erase & record MiniDisc")
             .withMessage(
                 "Erase the disc in '" + selectedId +
-                "', upload ATRAC tracks via NetMD / Type-S SPUpload, and commit full UTOC Sectors "
+                "', upload ATRAC tracks via NetMD / SPUpload, and commit full UTOC Sectors "
                 "0, 1, 2, and 4?")
             .withButton("Erase & Record")
             .withButton("Cancel")

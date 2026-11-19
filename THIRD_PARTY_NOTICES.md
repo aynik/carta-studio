@@ -48,6 +48,7 @@ exact license terms of every upstream dependency:
 
 ### netmd-exploits
 - **Upstream**: https://github.com/asivery/netmd-exploits
+- **Fork (Type-R SPUpload)**: https://github.com/aynik/netmd-exploits
 - **Copyright**: Copyright (c) asivery & contributors
 - **License**: GNU General Public License v2.0 (GPL-2.0)
 

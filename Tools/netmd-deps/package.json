@@ -2,8 +2,12 @@
   "name": "carta-studio-netmd-deps",
   "private": true,
   "dependencies": {
-    "netmd-exploits": "^0.5.12",
+    "netmd-exploits": "https://github.com/aynik/netmd-exploits/archive/2d591faa89e4770a026960455a4532b3c59c99c1.tar.gz",
     "netmd-js": "^4.4.1",
     "netmd-tocmanip": "^0.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "typescript": "^5.9.3"
   }
 }

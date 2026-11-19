@@ -162,7 +162,14 @@ function ensurePrereqs(needPorffor) {
     })
   }
 
-  if (!fs.existsSync(path.join(netmdDepsModules, 'netmd-js'))) {
+  const committedLockPath = path.join(committedNetmdDepsDir, 'package-lock.json')
+  const buildLockPath = path.join(netmdDepsDir, 'package-lock.json')
+  const lockChanged =
+    !fs.existsSync(buildLockPath) ||
+    !fs.existsSync(committedLockPath) ||
+    fs.readFileSync(buildLockPath, 'utf8') !== fs.readFileSync(committedLockPath, 'utf8')
+
+  if (!fs.existsSync(path.join(netmdDepsModules, 'netmd-js')) || lockChanged) {
     if (!fs.existsSync(path.join(committedNetmdDepsDir, 'package.json'))) {
       throw new Error(`Missing committed NetMD manifests in ${committedNetmdDepsDir}`)
     }
@@ -171,11 +178,22 @@ function ensurePrereqs(needPorffor) {
       path.join(committedNetmdDepsDir, 'package.json'),
       path.join(netmdDepsDir, 'package.json')
     )
-    fs.copyFileSync(
-      path.join(committedNetmdDepsDir, 'package-lock.json'),
-      path.join(netmdDepsDir, 'package-lock.json')
-    )
+    fs.copyFileSync(committedLockPath, buildLockPath)
     runChecked('npm', ['ci', '--ignore-scripts', '--prefix', netmdDepsDir], {
+      stdio: 'inherit',
+    })
+  }
+
+  // If netmd-exploits was installed from a git fork (without prebuilt dist/),
+  // compile its TypeScript sources via the pinned typescript devDependency.
+  const exploitsPkgDir = path.join(netmdDepsModules, 'netmd-exploits')
+  const exploitsDistSpUpload = path.join(exploitsPkgDir, 'dist', 'exploits', 'sp-upload.js')
+  if (!fs.existsSync(exploitsDistSpUpload)) {
+    const tscJs = path.join(netmdDepsModules, 'typescript', 'bin', 'tsc')
+    if (!fs.existsSync(tscJs)) {
+      throw new Error(`Missing typescript compiler at ${tscJs} to build netmd-exploits`)
+    }
+    runChecked(process.execPath, [tscJs, '-p', path.join(exploitsPkgDir, 'tsconfig.json')], {
       stdio: 'inherit',
     })
   }
@@ -1490,7 +1508,10 @@ function bcdTimeArrayToSeconds(arr) {
   return (Number(arr[0]) || 0) * 3600 + (Number(arr[1]) || 0) * 60 + (Number(arr[2]) || 0);
 }
 
-const SP_UPLOAD_VERSIONS = ['S1.000', 'S1.100', 'S1.200', 'S1.300', 'S1.400', 'S1.500', 'S1.600'];
+const SP_UPLOAD_VERSIONS = [
+  'S1.000', 'S1.100', 'S1.200', 'S1.300', 'S1.400', 'S1.500', 'S1.600',
+  'R1.000', 'R1.100', 'R1.200', 'R1.300', 'R1.400',
+];
 
 export async function netmdProbeDevice(deviceId) {
   const { info, netMd, iface } = await openNetMdSession(deviceId);
@@ -1607,10 +1628,16 @@ export async function netmdUploadTrack(deviceId, modeCode, wireBytes, hwTitle, f
       const factoryIface = await iface.factory();
       const esm = await ExploitStateManager.create(iface, factoryIface);
       if (!SP_UPLOAD_VERSIONS.includes(esm.device.versionCode)) {
-        throw new Error('Raw ATRAC1 SP upload requires Type-S firmware (got ' + esm.device.versionCode + ')');
+        throw new Error('Raw ATRAC1 SP upload requires Type-S or Type-R firmware (got ' + esm.device.versionCode + ')');
       }
       let uploadedIdx = -1;
-      await esm.require(KillEepromWrite);
+      // On Type-R (CXD2677), KillEepromWrite patches SPI EEPROM access used
+      // during sendKeyData (causing EKB rejection 0x92) and Type-R SPUpload
+      // does not execute custom shellcode, so skip KillEepromWrite on R*.
+      const useKillEeprom = !esm.device.versionCode.startsWith('R');
+      if (useKillEeprom) {
+        await esm.require(KillEepromWrite);
+      }
       try {
         const ch = modeCode === 1 ? 1 : 2;
         await esm.envelop(SPUpload, ch, async (spUpload) => {
@@ -1627,7 +1654,9 @@ export async function netmdUploadTrack(deviceId, modeCode, wireBytes, hwTitle, f
           uploadedIdx = Number(trkIdx);
         });
       } finally {
-        await esm.unload(KillEepromWrite);
+        if (useKillEeprom) {
+          await esm.unload(KillEepromWrite);
+        }
       }
       return uploadedIdx;
     }
