@@ -481,7 +481,9 @@ int cmdMockSnapshot(const std::string& outDir) {
     oss << "{\"event\":\"result\",\"ok\":true"
         << ",\"sp_upload_used_count\":" << snap.spUploadUsedCount
         << ",\"safety_patch_applied\":" << (snap.safetyPatchApplied ? "true" : "false")
-        << ",\"toc_commit_count\":" << snap.tocCommitCount << ",\"uploaded_tracks\":[";
+        << ",\"toc_commit_count\":" << snap.tocCommitCount
+        << ",\"toc_poll_count\":" << snap.tocPollCount << ",\"slept_ms\":" << snap.sleptMs
+        << ",\"uploaded_tracks\":[";
     for (std::size_t i = 0; i < snap.uploadedTracks.size(); ++i) {
         const auto& tr = snap.uploadedTracks[i];
         if (i > 0) {
@@ -559,7 +561,7 @@ int runSessionLoop(bool enableMock) {
 }
 
 void printUsage() {
-    std::cerr << "carta-netmd 0.1.1 (GPL-2.0) - Standalone NetMD USB helper\n"
+    std::cerr << "carta-netmd 0.1.2 (GPL-2.0) - Standalone NetMD USB helper\n"
               << "Built with netmd-js & netmd-exploits (GPL-2.0) and libusb-1.0 (LGPL-2.1).\n"
               << "Usage:\n"
               << "  carta-netmd list\n"
@@ -584,7 +586,7 @@ int main(int argc, char** argv) {
 
     const std::string cmd = argv[1];
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "carta-netmd 0.1.1 (GPL-2.0)\n";
+        std::cout << "carta-netmd 0.1.2 (GPL-2.0)\n";
         return 0;
     }
     if (cmd == "--help" || cmd == "-h") {

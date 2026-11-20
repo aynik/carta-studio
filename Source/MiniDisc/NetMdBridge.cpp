@@ -1838,10 +1838,13 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
                                    "' does not support ForceTOCEdit");
         }
         if (report.requiresSpUpload && !report.device.supportsSpUpload) {
-            recBlockers.push_back("ATRAC1 SP upload requires Type-S or Type-R firmware (got '" +
-                                  report.device.versionCode + "')");
+            recBlockers.push_back(
+                "ATRAC1 SP upload requires Type-S, Type-R, or supported Hi-MD firmware (got '" +
+                report.device.versionCode + "')");
         }
 
+        const bool isHiMd = !report.device.versionCode.empty() &&
+                            report.device.versionCode.front() == 'H';
         const bool isTypeR = !report.device.versionCode.empty() &&
                              report.device.versionCode.front() == 'R';
         std::ostringstream badge;
@@ -1850,7 +1853,7 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
               << "  |  ForceTOC: " << (report.device.supportsForceTocEdit ? "OK" : "NO")
               << "  |  SP-Upload: "
               << (report.device.supportsSpUpload
-                      ? (isTypeR ? "Type-R OK" : "Type-S OK")
+                      ? (isHiMd ? "Hi-MD OK" : (isTypeR ? "Type-R OK" : "Type-S OK"))
                       : (report.requiresSpUpload ? "REQUIRED (NO)" : "N/A"));
         report.exploitBadge = badge.str();
     }
@@ -1904,9 +1907,12 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
             << ", ForceTOC=" << (report.device.supportsForceTocEdit ? "OK" : "NO") << ", SP="
             << (report.device.supportsSpUpload
                     ? ((!report.device.versionCode.empty() &&
-                        report.device.versionCode.front() == 'R')
-                           ? "Type-R"
-                           : "Type-S")
+                        report.device.versionCode.front() == 'H')
+                           ? "Hi-MD"
+                           : ((!report.device.versionCode.empty() &&
+                               report.device.versionCode.front() == 'R')
+                                  ? "Type-R"
+                                  : "Type-S"))
                     : (report.requiresSpUpload ? "NO" : "N/A"));
     } else {
         sum << "Device: "
@@ -2197,8 +2203,9 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         return false;
     }
     if (requiresSpUpload && !status.supportsSpUpload) {
-        error = "Raw ATRAC1 SP recording requires Type-S or Type-R firmware (got '" +
-                status.versionCode + "').";
+        error =
+            "Raw ATRAC1 SP recording requires Type-S, Type-R, or supported Hi-MD firmware (got '" +
+            status.versionCode + "').";
         return false;
     }
 

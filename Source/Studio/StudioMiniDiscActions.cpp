@@ -701,7 +701,10 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
             const juce::String fw =
                 st.versionCode.empty() ? "?" : juce::String::fromUTF8(st.versionCode.c_str());
             const juce::String spLabel =
-                !st.supportsSpUpload ? "No" : (fw.startsWithChar('R') ? "Type-R" : "Type-S");
+                !st.supportsSpUpload
+                    ? "No"
+                    : (fw.startsWithChar('H') ? "Hi-MD"
+                                              : (fw.startsWithChar('R') ? "Type-R" : "Type-S"));
             snap.badgeText = "FW " + fw + dot +
                              "ForceTOC: " + (st.supportsForceTocEdit ? "OK" : "NO") + dot +
                              "SPUpload: " + spLabel;
@@ -739,8 +742,8 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
                                   "). Add tracks on Tracks & UTOC to record.";
             } else if (spNeeded && !st.supportsSpUpload) {
                 snap.statusText =
-                    "SP upload requires a Type-S or Type-R NetMD recorder (switch tracks to "
-                    "LP2/LP4 or connect compatible hardware).";
+                    "SP upload requires a Type-S, Type-R, or supported Hi-MD recorder (switch "
+                    "tracks to LP2/LP4 or connect compatible hardware).";
             } else {
                 snap.statusText =
                     "Ready to record " + juce::String(static_cast<int>(plan.spans.size())) +

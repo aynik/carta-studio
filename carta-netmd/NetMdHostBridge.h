@@ -73,6 +73,7 @@ struct NetMdMockSnapshot {
     bool usbCodeExecApplied = false;
     int spUploadUsedCount = 0;
     int tocCommitCount = 0;
+    int tocPollCount = 0;
     std::int64_t sleptMs = 0;
     std::string displayOverride;
     std::vector<NetMdMockUploadedTrack> uploadedTracks;
@@ -194,6 +195,11 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_cp932(int to_utf8, const std::uint8
 CARTA_NETMD_HOST_EXPORT void carta_netmd_host_sleep_ms(int ms);
 
 CARTA_NETMD_HOST_EXPORT void carta_netmd_host_report_step(int done, int total);
+
+CARTA_NETMD_HOST_EXPORT double carta_netmd_host_now_ms(void);
+
+CARTA_NETMD_HOST_EXPORT void carta_netmd_host_report_toc_wait(int elapsed_ms, int max_ms,
+                                                              int done);
 
 CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_list(std::uint8_t* json_out, int json_cap);
 

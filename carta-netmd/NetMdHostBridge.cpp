@@ -293,6 +293,8 @@ struct MockDeviceState {
     bool usbCodeExecApplied = false;
     int spUploadUsedCount = 0;
     int tocCommitCount = 0;
+    int tocPollCount = 0;
+    int tocPollBusyRemaining = 0;
     std::int64_t sleptMs = 0;
     std::string displayOverride;
 
@@ -423,6 +425,8 @@ struct MockDeviceState {
         usbCodeExecApplied = false;
         spUploadUsedCount = 0;
         tocCommitCount = 0;
+        tocPollCount = 0;
+        tocPollBusyRemaining = 0;
         sleptMs = 0;
         displayOverride.clear();
         resetDiscAndSession();
@@ -826,6 +830,22 @@ bool handleMockVendorControlOut(const std::uint8_t* data, int len) {
             } else if (containsLe32Pattern(data + 4, len - 4, kMockForceTocEditInFirmwareAddr)) {
                 g_mock.committedUtoc = g_mock.utocCache;
                 g_mock.tocCommitCount += 1;
+                g_mock.tocPollBusyRemaining = 2;
+            } else if (len == 4 + 36 && readLe32(data + 4 + 0x00) == 0xe59f0014u &&
+                       readLe32(data + 4 + 0x18) == 0xe12fff1eu) {
+                g_mock.tocPollCount += 1;
+                if (g_mock.tocPollBusyRemaining >= 2) {
+                    writeLe32(r.data() + 4 + 0x1c, 0x20u);
+                    writeLe32(r.data() + 4 + 0x20, 0x00u);
+                    --g_mock.tocPollBusyRemaining;
+                } else if (g_mock.tocPollBusyRemaining == 1) {
+                    writeLe32(r.data() + 4 + 0x1c, 0x00u);
+                    writeLe32(r.data() + 4 + 0x20, 0x01u);
+                    --g_mock.tocPollBusyRemaining;
+                } else {
+                    writeLe32(r.data() + 4 + 0x1c, 0x00u);
+                    writeLe32(r.data() + 4 + 0x20, 0x00u);
+                }
             }
         }
         pushReply(std::move(r));
@@ -1419,6 +1439,7 @@ NetMdMockSnapshot getMockNetMdSnapshot() {
     snap.usbCodeExecApplied = g_mock.usbCodeExecApplied;
     snap.spUploadUsedCount = g_mock.spUploadUsedCount;
     snap.tocCommitCount = g_mock.tocCommitCount;
+    snap.tocPollCount = g_mock.tocPollCount;
     snap.sleptMs = g_mock.sleptMs;
     snap.displayOverride = g_mock.displayOverride;
     snap.uploadedTracks = g_mock.uploadedTracks;
@@ -1978,6 +1999,45 @@ CARTA_NETMD_HOST_EXPORT void carta_netmd_host_report_step(int done, int total) {
     }
     const double frac = static_cast<double>(done) / static_cast<double>(total);
     carta::updateNetMdProgressPhase({}, frac);
+}
+
+CARTA_NETMD_HOST_EXPORT double carta_netmd_host_now_ms(void) {
+    bool hasRealUsbOpen = false;
+    std::int64_t mockMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        carta::ensureMockInitLocked();
+        for (const auto& kv : carta::g_handles) {
+            if (!kv.second.isMock) {
+                hasRealUsbOpen = true;
+                break;
+            }
+        }
+        mockMs = carta::g_mock.sleptMs;
+    }
+    if (!hasRealUsbOpen) {
+        return static_cast<double>(mockMs);
+    }
+    static const auto kMonotonicStart = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                     kMonotonicStart)
+        .count();
+}
+
+CARTA_NETMD_HOST_EXPORT void carta_netmd_host_report_toc_wait(int elapsed_ms, int max_ms,
+                                                              int done) {
+    if (done != 0) {
+        carta::updateNetMdProgressPhase("Committing UTOC to disc (TOCWRT)...", 1.0);
+        return;
+    }
+    const int elapsedSec = std::max(0, elapsed_ms) / 1000;
+    const double targetMs = (max_ms > 0) ? std::min<double>(max_ms, 15000.0) : 15000.0;
+    const double pollFrac =
+        std::clamp(static_cast<double>(std::max(0, elapsed_ms)) / targetMs, 0.0, 0.95);
+    const double overallFrac = 0.5 + 0.45 * pollFrac;
+    carta::updateNetMdProgressPhase(
+        "Committing UTOC to disc (TOCWRT — " + std::to_string(elapsedSec) + "s)...",
+        overallFrac);
 }
 
 CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_list(std::uint8_t* json_out, int json_cap) {

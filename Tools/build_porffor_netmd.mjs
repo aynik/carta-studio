@@ -89,6 +89,19 @@ const FORCE_TOC_VERSIONS = [
   'R1.200',
   'R1.300',
   'R1.400',
+  'Hn1.000',
+  'Hn1.100',
+  'Hn1.10A',
+  'Hn1.200',
+  'Hn1.20A',
+  'Hr1.000',
+  'Hp1.000',
+  'Hx1.040',
+  'Hx1.060',
+  'Hx1.070',
+  'Hx1.080',
+  'Hx1.090',
+  'Hx1.0A0',
 ]
 
 // ---------------------------------------------------------------------------
@@ -236,11 +249,34 @@ function latestMtimeMs(targetPath) {
 
 /**
  * Pre-assemble `ForceTOCEdit` ARM/THUMB machine-code payloads offline for each
- * supported Sony Type-S/R firmware version so the runtime requires no assembler.
+ * supported Sony Type-S/R/Hi-MD firmware version so the runtime requires no assembler.
  *
  * @param {NodeRequire} requireFromDeps - CommonJS loader anchored in `netmd-deps`.
- * @returns {Promise<{lowerMap: Record<string, number[]>, triggerMap: Record<string, number[]>, raiseMap: Record<string, number[]>}>}
  */
+function writeU32LE(buf, offset, value) {
+  buf[offset] = value & 0xff
+  buf[offset + 1] = (value >>> 8) & 0xff
+  buf[offset + 2] = (value >>> 16) & 0xff
+  buf[offset + 3] = (value >>> 24) & 0xff
+}
+
+function buildStatusReadCode(pendingFlagAddress, activeStateAddress, activeStateSize) {
+  if (activeStateSize !== 1 && activeStateSize !== 4) {
+    throw new Error(`Unsupported tocActiveStateSize: ${activeStateSize}`)
+  }
+  const stub = new Uint8Array(36)
+  writeU32LE(stub, 0x00, 0xe59f0014)
+  writeU32LE(stub, 0x04, 0xe5900000)
+  writeU32LE(stub, 0x08, 0xe58f000c)
+  writeU32LE(stub, 0x0c, 0xe59f000c)
+  writeU32LE(stub, 0x10, activeStateSize === 1 ? 0xe5d00000 : 0xe5900000)
+  writeU32LE(stub, 0x14, 0xe58f0004)
+  writeU32LE(stub, 0x18, 0xe12fff1e)
+  writeU32LE(stub, 0x1c, pendingFlagAddress)
+  writeU32LE(stub, 0x20, activeStateAddress)
+  return Array.from(stub)
+}
+
 async function preassembleForceTocPayloads(requireFromDeps) {
   const { Assembler } = requireFromDeps(
     'netmd-exploits/dist/assembler/assembler.js'
@@ -258,6 +294,11 @@ async function preassembleForceTocPayloads(requireFromDeps) {
   const lowerMap = {}
   const triggerMap = {}
   const raiseMap = {}
+  const skipFlushAddrMap = {}
+  const skipFlushValMap = {}
+  const pollStubMap = {}
+  const pollMaskMap = {}
+  const pollActiveSizeMap = {}
 
   for (const ver of FORCE_TOC_VERSIONS) {
     const fakeManager = {
@@ -279,9 +320,44 @@ async function preassembleForceTocPayloads(requireFromDeps) {
     raiseMap[ver] = Array.from(
       inst.assembleProperty('raiseLowerCode', { lowerOrRaise: 0x01 })
     )
+    const skipAddr = inst.getPropertyOrNull('skipFlushAddress')
+    if (skipAddr !== null) {
+      skipFlushAddrMap[ver] = skipAddr
+      skipFlushValMap[ver] = Array.from(inst.getProperty('skipFlushValue'))
+    }
+    const pendingFlagAddr = inst.getPropertyOrNull('tocPendingFlagAddress')
+    const pendingFlagMask = inst.getPropertyOrNull('tocPendingFlagMask')
+    const activeStateAddr = inst.getPropertyOrNull('tocActiveStateAddress')
+    const activeStateSize = inst.getPropertyOrNull('tocActiveStateSize')
+    if (
+      pendingFlagAddr === null ||
+      pendingFlagMask === null ||
+      activeStateAddr === null ||
+      activeStateSize === null
+    ) {
+      throw new Error(
+        `Missing TOC completion poll properties in ForceTOCEdit for firmware ${ver}`
+      )
+    }
+    pollStubMap[ver] = buildStatusReadCode(
+      pendingFlagAddr,
+      activeStateAddr,
+      activeStateSize
+    )
+    pollMaskMap[ver] = pendingFlagMask
+    pollActiveSizeMap[ver] = activeStateSize
   }
 
-  return { lowerMap, triggerMap, raiseMap }
+  return {
+    lowerMap,
+    triggerMap,
+    raiseMap,
+    skipFlushAddrMap,
+    skipFlushValMap,
+    pollStubMap,
+    pollMaskMap,
+    pollActiveSizeMap,
+  }
 }
 
 /**
@@ -569,10 +645,109 @@ function toByteMap(rawMap) {
 const PREASSEMBLED_LOWER = toByteMap(${JSON.stringify(forceTocTables.lowerMap)});
 const PREASSEMBLED_TRIGGER = toByteMap(${JSON.stringify(forceTocTables.triggerMap)});
 const PREASSEMBLED_RAISE = toByteMap(${JSON.stringify(forceTocTables.raiseMap)});
+const PREASSEMBLED_SKIP_ADDR = ${JSON.stringify(forceTocTables.skipFlushAddrMap)};
+const PREASSEMBLED_SKIP_VAL = toByteMap(${JSON.stringify(forceTocTables.skipFlushValMap)});
+const PREASSEMBLED_POLL_STUB = toByteMap(${JSON.stringify(forceTocTables.pollStubMap)});
+const PREASSEMBLED_POLL_MASK = ${JSON.stringify(forceTocTables.pollMaskMap)};
+const PREASSEMBLED_POLL_ACTIVE_SIZE = ${JSON.stringify(forceTocTables.pollActiveSizeMap)};
+
+const INITIAL_POLL_DELAY_MS = 1000;
+const POLL_INTERVAL_MS = 500;
+const CONSECUTIVE_IDLE_REQUIRED = 2;
+const SETTLE_BUFFER_MS = 1000;
+const MAX_WAIT_MS = 50000;
+const MAX_CONSECUTIVE_POLL_ERRORS = 3;
+
+function readU32LE(buf, off) {
+  return ((buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0);
+}
+
+function nowMs() {
+  const h = globalThis.__cartaNetMdHost;
+  if (h && h.nowMs) return h.nowMs();
+  return Date.now();
+}
+
+function reportTocWait(elapsedMs, maxMs, done) {
+  const h = globalThis.__cartaNetMdHost;
+  if (h && h.reportTocWait) h.reportTocWait(elapsedMs | 0, maxMs | 0, done ? 1 : 0);
+}
 
 class ForceTOCEdit extends exploit_1.Exploit {
+    constructor() {
+        super(...arguments);
+        this._policies = {
+            stateManagerUnpatchLegal: true,
+        };
+    }
     getPropertyStore() {
         return {};
+    }
+    async init() {
+        await super.init();
+        const ver = this.stateManager.device.versionCode;
+        const skipAddr = PREASSEMBLED_SKIP_ADDR[ver];
+        const skipVal = PREASSEMBLED_SKIP_VAL[ver];
+        if (skipAddr !== undefined && skipVal) {
+            await this.stateManager.patch(skipAddr, skipVal);
+        }
+    }
+    async waitForTOCWriteCompletion(codeExecution) {
+        const ver = this.stateManager.device.versionCode;
+        const readStub = PREASSEMBLED_POLL_STUB[ver];
+        const pendingFlagMask = PREASSEMBLED_POLL_MASK[ver];
+        const activeStateSize = PREASSEMBLED_POLL_ACTIVE_SIZE[ver];
+        if (!readStub || pendingFlagMask === undefined || activeStateSize === undefined) {
+            await (0, utils_1.sleep)(MAX_WAIT_MS);
+            return;
+        }
+        const startTime = nowMs();
+        reportTocWait(0, MAX_WAIT_MS, 0);
+        await (0, utils_1.sleep)(INITIAL_POLL_DELAY_MS);
+        let idleCount = 0;
+        let consecutiveErrors = 0;
+        while (nowMs() - startTime < MAX_WAIT_MS) {
+            try {
+                const reply = await codeExecution.execute(readStub);
+                if (!reply || reply.length < readStub.length) {
+                    throw new Error('Truncated TOC status reply');
+                }
+                const pendingFlag = readU32LE(reply, 0x1c);
+                const rawActiveState = readU32LE(reply, 0x20);
+                const activeState = activeStateSize === 1 ? (rawActiveState & 0xff) : rawActiveState;
+                consecutiveErrors = 0;
+                const isBusy = ((pendingFlag & pendingFlagMask) !== 0) || (activeState !== 0);
+                const elapsed = nowMs() - startTime;
+                reportTocWait(elapsed, MAX_WAIT_MS, 0);
+                if (isBusy) {
+                    idleCount = 0;
+                } else {
+                    idleCount++;
+                    if (idleCount >= CONSECUTIVE_IDLE_REQUIRED) {
+                        await (0, utils_1.sleep)(SETTLE_BUFFER_MS);
+                        reportTocWait(nowMs() - startTime, MAX_WAIT_MS, 1);
+                        return;
+                    }
+                }
+            } catch (err) {
+                idleCount = 0;
+                consecutiveErrors++;
+                if (consecutiveErrors >= MAX_CONSECUTIVE_POLL_ERRORS) {
+                    const remaining = MAX_WAIT_MS - (nowMs() - startTime);
+                    if (remaining > 0) {
+                        await (0, utils_1.sleep)(remaining);
+                    }
+                    reportTocWait(MAX_WAIT_MS, MAX_WAIT_MS, 1);
+                    return;
+                }
+            }
+            const remaining = MAX_WAIT_MS - (nowMs() - startTime);
+            if (remaining <= 0) {
+                break;
+            }
+            await (0, utils_1.sleep)(Math.min(POLL_INTERVAL_MS, remaining));
+        }
+        reportTocWait(MAX_WAIT_MS, MAX_WAIT_MS, 1);
     }
     async forceTOCEdit() {
         const ver = this.stateManager.device.versionCode;
@@ -582,16 +757,17 @@ class ForceTOCEdit extends exploit_1.Exploit {
         if (!lowerCode || !triggerCode || !raiseCode) {
             throw new exploit_1.CompatibilityError('ForceTOCEdit is not preassembled for firmware version ' + ver);
         }
-        if (!ver.startsWith('R'))
+        const isTypeS = ver.startsWith('S');
+        if (isTypeS)
             await (0, netmd_js_1.display)(this.factoryIface, 'TOCWRT', true);
         await this.stateManager.envelop(usb_code_execution_1.USBCodeExecution, async (codeExecution) => {
             await codeExecution.execute(lowerCode);
             await (0, utils_1.sleep)(1000);
             await codeExecution.execute(triggerCode);
-            await (0, utils_1.sleep)(50000);
+            await this.waitForTOCWriteCompletion(codeExecution);
             await codeExecution.execute(raiseCode);
         });
-        if (!ver.startsWith('R'))
+        if (isTypeS)
             await this.factoryIface.setDisplayMode(netmd_js_1.DisplayMode.DEFAULT);
     }
 }
@@ -1514,6 +1690,9 @@ function bcdTimeArrayToSeconds(arr) {
 const SP_UPLOAD_VERSIONS = [
   'S1.000', 'S1.100', 'S1.200', 'S1.300', 'S1.400', 'S1.500', 'S1.600',
   'R1.000', 'R1.100', 'R1.200', 'R1.300', 'R1.400',
+  'Hn1.000', 'Hn1.100', 'Hn1.10A', 'Hn1.200', 'Hn1.20A',
+  'Hr1.000', 'Hp1.000',
+  'Hx1.040', 'Hx1.060', 'Hx1.070', 'Hx1.080', 'Hx1.090', 'Hx1.0A0',
 ];
 
 export async function netmdProbeDevice(deviceId) {
@@ -1631,13 +1810,12 @@ export async function netmdUploadTrack(deviceId, modeCode, wireBytes, hwTitle, f
       const factoryIface = await iface.factory();
       const esm = await ExploitStateManager.create(iface, factoryIface);
       if (!SP_UPLOAD_VERSIONS.includes(esm.device.versionCode)) {
-        throw new Error('Raw ATRAC1 SP upload requires Type-S or Type-R firmware (got ' + esm.device.versionCode + ')');
+        throw new Error('Raw ATRAC1 SP upload requires Type-S, Type-R, or supported Hi-MD firmware (got ' + esm.device.versionCode + ')');
       }
       let uploadedIdx = -1;
-      // On Type-R (CXD2677), KillEepromWrite patches SPI EEPROM access used
-      // during sendKeyData (causing EKB rejection 0x92) and Type-R SPUpload
-      // does not execute custom shellcode, so skip KillEepromWrite on R*.
-      const useKillEeprom = !esm.device.versionCode.startsWith('R');
+      // KillEepromWrite is only supported on Type-S/R and on Type-R blocks
+      // SPI EEPROM access used by sendKeyData, so only load it on Type-S.
+      const useKillEeprom = esm.device.versionCode.startsWith('S');
       if (useKillEeprom) {
         await esm.require(KillEepromWrite);
       }
@@ -1711,21 +1889,25 @@ export async function netmdWriteUtocSectors(deviceId, sectors5, sectorsMask) {
     if (!ForceTOCEdit.SUPPORTED_VERSIONS.includes(esm.device.versionCode)) {
       throw new Error('ForceTOCEdit exploit unsupported on firmware ' + esm.device.versionCode);
     }
-    await esm.require(KillEepromWrite);
+    const useKillEeprom = esm.device.versionCode.startsWith('S') || esm.device.versionCode.startsWith('R');
+    if (useKillEeprom) {
+      await esm.require(KillEepromWrite);
+    }
     try {
       for (let s = 0; s < 5; s++) {
         if ((sectorsMask & (1 << s)) !== 0) {
           const slice = sectors5.slice(s * 2352, (s + 1) * 2352);
           await writeUTOCSector(factoryIface, s, slice);
         }
-        reportHostStep(s + 1, 6);
+        reportHostStep(s + 1, 10);
       }
-      reportHostStep(6, 6);
       await esm.envelop(ForceTOCEdit, async (fte) => {
         await fte.forceTOCEdit();
       });
     } finally {
-      await esm.unload(KillEepromWrite);
+      if (useKillEeprom) {
+        await esm.unload(KillEepromWrite);
+      }
     }
   } finally {
     await netMd.finalize();
@@ -2161,6 +2343,21 @@ globalThis.__cartaNetMdHost = {
       carta_netmd_host_report_step((int)PF_F64(d), (int)PF_F64(tot));
     \`;
   },
+  nowMs() {
+    let ms = 0;
+    Porffor.c\`
+      ms = (f64)carta_netmd_host_now_ms();
+    \`;
+    return ms;
+  },
+  reportTocWait(elapsedMs, maxMs, done) {
+    const e = elapsedMs | 0;
+    const m = maxMs | 0;
+    const d = done | 0;
+    Porffor.c\`
+      carta_netmd_host_report_toc_wait((int)PF_F64(e), (int)PF_F64(m), (int)PF_F64(d));
+    \`;
+  },
   usbListJson() {
     const cap = 16384;
     const buf = new Uint8Array(cap);
@@ -2432,6 +2629,8 @@ extern int carta_netmd_host_random_bytes(uint8_t* out_ptr, int len);
 extern int carta_netmd_host_cp932(int to_utf8, const uint8_t* in_ptr, int in_len, uint8_t* out_ptr, int out_cap);
 extern void carta_netmd_host_sleep_ms(int ms);
 extern void carta_netmd_host_report_step(int done, int total);
+extern double carta_netmd_host_now_ms(void);
+extern void carta_netmd_host_report_toc_wait(int elapsed_ms, int max_ms, int done);
 extern int carta_netmd_host_usb_list(uint8_t* json_out, int json_cap);
 extern int carta_netmd_host_usb_open(const char* device_id);
 extern int carta_netmd_host_usb_close(int handle);

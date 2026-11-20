@@ -47,6 +47,8 @@ struct TestMockSnapshot {
     int spUploadUsedCount = 0;
     bool safetyPatchApplied = false;
     int tocCommitCount = 0;
+    int tocPollCount = 0;
+    std::int64_t sleptMs = 0;
     std::vector<TestMockUploadedTrack> uploadedTracks;
     std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committedUtoc{};
 };
@@ -81,6 +83,8 @@ bool fetchMockSnapshot(TestMockSnapshot& out, std::string& error) {
     out.spUploadUsedCount = static_cast<int>(obj->getProperty("sp_upload_used_count"));
     out.safetyPatchApplied = static_cast<bool>(obj->getProperty("safety_patch_applied"));
     out.tocCommitCount = static_cast<int>(obj->getProperty("toc_commit_count"));
+    out.tocPollCount = static_cast<int>(obj->getProperty("toc_poll_count"));
+    out.sleptMs = static_cast<std::int64_t>(static_cast<juce::int64>(obj->getProperty("slept_ms")));
 
     juce::MemoryBlock utocData;
     if (!tmpDir.getChildFile("committed_utoc.bin").loadFileAsData(utocData) ||
@@ -363,6 +367,12 @@ int main() {
         REQUIRE(snap.safetyPatchApplied,
                 "Expected KillEepromWrite safety patch applied on SP upload");
         REQUIRE(snap.tocCommitCount == 1, "Expected 1 ForceTOCEdit UTOC commit");
+        REQUIRE(snap.tocPollCount == 4,
+                "Expected 4 ForceTOCEdit completion polls (2 busy + 2 idle), got: " +
+                    std::to_string(snap.tocPollCount));
+        REQUIRE(snap.sleptMs > 0 && snap.sleptMs < 15000,
+                "Expected ForceTOCEdit polling to finish well under 50s fallback, sleptMs=" +
+                    std::to_string(snap.sleptMs));
 
         for (std::size_t u = 0; u < physPlan.spans.size(); ++u) {
             const auto& span = physPlan.spans[u];
