@@ -140,6 +140,9 @@ bool isMockNetMdEnabled() noexcept;
 /** Resets all mock patch slots, tracks, keys, and UTOC cache/committed buffers. */
 void resetMockNetMdState();
 
+/** Seeds mock UTOC cache & committed buffers from 5 raw 2,352-byte sectors and syncs tracks. */
+void seedMockNetMdUtoc(const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& sectors);
+
 /** Returns a consistent copy of the mock NetMD recorder state. */
 NetMdMockSnapshot getMockNetMdSnapshot();
 

@@ -111,6 +111,12 @@ struct NetMdPreflightReport {
     bool canRecord = false;
     int uniqueUploadSegments = 0;
     int logicalTracks = 0;
+    bool hasLoadedDisc = false;
+    int preservedOnDiscTracks = 0;
+    int onDiscClusters = 0;
+    int newUploadClusters = 0;
+    int reclaimedClusters = 0;
+    bool needsPreUploadReclaim = false;
     UtocBudget budget{};
     NetMdDeviceStatus device{};
     std::string exploitBadge;
@@ -119,7 +125,7 @@ struct NetMdPreflightReport {
     std::string blocker;
 };
 
-/** Summary returned upon completing a full erase, encode, upload, and UTOC commit. */
+/** Summary returned upon completing a sync / record operation on NetMD hardware. */
 struct NetMdRecordResult {
     std::string deviceId;
     int uploadedPhysicalSegments = 0;
@@ -127,6 +133,13 @@ struct NetMdRecordResult {
     int groups = 0;
     std::int64_t encodedBytes = 0;
     bool committedUtoc = false;
+    int preservedOnDiscTracks = 0;
+    int reclaimedClusters = 0;
+    bool needsReloadToFinishUpload = false;
+    std::string nextActionHint;
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRawSectors{};
+    bool hasCommittedRawSectors = false;
+    std::string committedSector0Hash;
     UtocBudget budget{};
 };
 
@@ -145,6 +158,10 @@ bool probeNetMdDevice(const std::string& deviceId, NetMdDeviceStatus& out, std::
 NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDisc& disc,
                                              const std::string& preferredDeviceId);
 
+/** Evaluates preflight from an already-probed `NetMdDeviceStatus` with zero USB calls. */
+NetMdPreflightReport preflightNetMdRecordingWithStatus(const Session& session, const MdDisc& disc,
+                                                       const NetMdDeviceStatus& deviceStatus);
+
 /**
  * Erases the inserted MiniDisc (converting Hi-MD formatted discs back to Standard MD).
  * Requires `confirmHardware` or active `ScopedHardwareWriteConfirmation` on real hardware.
@@ -161,15 +178,25 @@ bool readNetMdDiscUtoc(const std::string& deviceId,
                        UtocDiscState& outState, std::string& error);
 
 /**
- * Updates UTOC Sectors 0, 1, 2, and 4 via ForceTOCEdit without erasing recorded audio.
- * Preserves hardware physical cluster `50.0.0` allocations and Sector 3 verbatim.
+ * Probes the device, reads physical UTOC Sectors 0/1/2/3/4, and decodes the inserted MiniDisc
+ * into an editable `MdDisc` with `loadedDisc.active = true` and `baselineSector0Hash` recorded.
  */
-bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confirmHardware,
-                    UtocBudget& outBudget, std::string& error);
+bool loadNetMdDisc(const std::string& deviceId, MdDisc& outDisc, NetMdDeviceStatus* outStatus,
+                   std::string& error);
 
 /**
- * Renders and encodes all coalesced physical spans, erases the disc, uploads each span,
- * remaps Sector 0 to the device's physical cluster placements, and commits UTOC via TOCWRT.
+ * Updates UTOC Sectors 0, 1, 2, and 4 via ForceTOCEdit without erasing recorded audio.
+ * Preserves hardware physical cluster allocations and Sector 3 verbatim.
+ */
+bool writeNetMdUtoc(
+    const MdDisc& disc, const std::string& deviceId, bool confirmHardware, UtocBudget& outBudget,
+    std::string& error, std::string* outCommittedSector0Hash = nullptr,
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>* outCommittedRawSectors = nullptr);
+
+/**
+ * Synchronizes the authored MiniDisc onto hardware non-destructively when loaded from a disc
+ * (or writes to a blank disc when starting from an empty project; refuses to overwrite non-empty
+ * unloaded discs without an explicit erase).
  */
 bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::string& deviceId,
                      bool confirmHardware, NetMdRecordResult& outResult, std::string& error);
@@ -192,6 +219,11 @@ bool setNetMdTestMockSessionEnabled(bool enabled, std::string& error);
 
 /** Resets mock device state inside an active test mock session. */
 bool resetNetMdTestMockSession(std::string& error);
+
+/** Seeds 5 raw UTOC sectors into the active test mock session (for read-only & non-destructive tests). */
+bool seedNetMdTestMockUtoc(
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors,
+    std::string& error);
 
 /** Enables or disables simulated real-hardware confirmation guard in an active test mock session.
  */

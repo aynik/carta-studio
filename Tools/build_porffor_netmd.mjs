@@ -1695,14 +1695,23 @@ const SP_UPLOAD_VERSIONS = [
   'Hx1.040', 'Hx1.060', 'Hx1.070', 'Hx1.080', 'Hx1.090', 'Hx1.0A0',
 ];
 
-export async function netmdProbeDevice(deviceId) {
+const MAX_AVC_PROBE_TRACKS = 40;
+function isUsbTransportError(err) {
+  const msg = err && err.message ? String(err.message) : String(err || '');
+  return msg.indexOf('USB ') === 0 || msg.indexOf('LIBUSB_') !== -1 ||
+         msg.indexOf('Timed out waiting for NetMD reply') !== -1;
+}
+
+export async function netmdProbeDevice(deviceId, includeTracks) {
+  const wantTracks = includeTracks === undefined ? true : Boolean(includeTracks);
   const { info, netMd, iface } = await openNetMdSession(deviceId);
   try {
     let versionCode = '';
     try {
       const factoryIface = await iface.factory();
       versionCode = await getDescriptiveDeviceCode(factoryIface);
-    } catch (_) {
+    } catch (e) {
+      if (isUsbTransportError(e)) throw e;
       versionCode = '';
     }
     const status = await getDeviceStatus(iface);
@@ -1729,21 +1738,33 @@ export async function netmdProbeDevice(deviceId) {
         usedSeconds = bcdTimeArrayToSeconds(cap[0]);
         totalSeconds = bcdTimeArrayToSeconds(cap[1]);
         leftSeconds = bcdTimeArrayToSeconds(cap[2]);
-      } catch (_) {}
-      try { discTitle = await iface.getDiscTitle(false); } catch (_) {}
-      try { fullWidthTitle = await iface.getDiscTitle(true); } catch (_) {}
-      if (discTitle !== 'Hi-MD Disc') {
+      } catch (e) {
+        if (isUsbTransportError(e)) throw e;
+      }
+      try { discTitle = await iface.getDiscTitle(false); } catch (e) {
+        if (isUsbTransportError(e)) throw e;
+      }
+      try { fullWidthTitle = await iface.getDiscTitle(true); } catch (e) {
+        if (isUsbTransportError(e)) throw e;
+      }
+      if (wantTracks && discTitle !== 'Hi-MD Disc' && trackCount > 0 && trackCount <= MAX_AVC_PROBE_TRACKS) {
         for (let t = 0; t < trackCount; t++) {
           let hw = '';
           let fw = '';
           let dur = 0;
           let codec = 'SP';
-          try { hw = await iface.getTrackTitle(t, false); } catch (_) {}
-          try { fw = await iface.getTrackTitle(t, true); } catch (_) {}
+          try { hw = await iface.getTrackTitle(t, false); } catch (e) {
+            if (isUsbTransportError(e)) throw e;
+          }
+          try { fw = await iface.getTrackTitle(t, true); } catch (e) {
+            if (isUsbTransportError(e)) throw e;
+          }
           try {
             const lenArr = await iface.getTrackLength(t);
             dur = bcdTimeArrayToSeconds(lenArr);
-          } catch (_) {}
+          } catch (e) {
+            if (isUsbTransportError(e)) throw e;
+          }
           try {
             const encInfo = await iface.getTrackEncoding(t);
             const enc = Array.isArray(encInfo) ? encInfo[0] : 0;
@@ -1752,7 +1773,9 @@ export async function netmdProbeDevice(deviceId) {
             else if (enc === 0x93) codec = 'LP4';
             else if (ch === 0x01) codec = 'Mono';
             else codec = 'SP';
-          } catch (_) {}
+          } catch (e) {
+            if (isUsbTransportError(e)) throw e;
+          }
           tracks.push({
             index: t,
             title: hw || '',
@@ -2492,11 +2515,11 @@ export function bridgeListDevices() {
   }
 }
 
-export function bridgeProbeDevice(idPtr, idLen) {
+export function bridgeProbeDevice(idPtr, idLen, includeTracks) {
   globalThis.__resetPromiseJobs();
   try {
     const devId = utf8DecodeBytes(copyInBytes(idPtr, idLen));
-    const json = __syncAwait(netmdProbeDevice(devId));
+    const json = __syncAwait(netmdProbeDevice(devId, (includeTracks | 0) !== 0));
     return writeScratchBytes(utf8EncodeBytes(json));
   } catch (err) {
     copyLastHostError(err && err.message ? err.message : String(err));
@@ -2558,7 +2581,7 @@ export function bridgeWriteUtocSectors(idPtr, idLen, secPtr, secLen, sectorsMask
 
 if (globalThis.__cartaPorfforRetain) {
   bridgeListDevices();
-  bridgeProbeDevice(0, 0);
+  bridgeProbeDevice(0, 0, 1);
   bridgeEraseDisc(0, 0);
   bridgeUploadTrack(0, 0, 0, 0, 0, 0, 0, 0, 0);
   bridgeReadUtocSectors(0, 0);
@@ -2593,7 +2616,7 @@ function patchGeneratedC(cSource) {
   }
 
   const fnList = findFn('bridgeListDevices', 0)
-  const fnProbe = findFn('bridgeProbeDevice', 2)
+  const fnProbe = findFn('bridgeProbeDevice', 3)
   const fnErase = findFn('bridgeEraseDisc', 2)
   const fnUpload = findFn('bridgeUploadTrack', 9)
   const fnReadUtoc = findFn('bridgeReadUtocSectors', 2)
@@ -2697,7 +2720,7 @@ int netmd_pf_list_devices(void) {
 }
 
 CARTA_PF_EXPORT
-int netmd_pf_probe_device(const char* device_id_ptr, int device_id_len) {
+int netmd_pf_probe_device(const char* device_id_ptr, int device_id_len, int include_tracks) {
   volatile int anchor = 0;
   porf_c_stack_top = (void*)&anchor;
   netmd_ensure_init();
@@ -2706,7 +2729,7 @@ int netmd_pf_probe_device(const char* device_id_ptr, int device_id_len) {
   g_pf_out_len = 0;
   return (int)${fnProbe}(
     porf_box(0, 0), porf_box(0, 0),
-    (f64)(uintptr_t)device_id_ptr, (f64)device_id_len
+    (f64)(uintptr_t)device_id_ptr, (f64)device_id_len, (f64)include_tracks
   ).val;
 }
 

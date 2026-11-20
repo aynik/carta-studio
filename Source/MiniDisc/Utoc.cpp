@@ -16,6 +16,8 @@
 
 #include "MiniDisc/Utoc.h"
 
+#include <juce_cryptography/juce_cryptography.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -44,8 +46,6 @@ namespace {
 // ============================================================================
 // Internal Binary, UTF-8/JIS, & Slot-Pool Helpers
 // ============================================================================
-
-constexpr std::uint16_t kFirstAudioCluster = 1;
 
 std::uint16_t readBe16(const std::uint8_t* p) noexcept {
     return static_cast<std::uint16_t>((static_cast<unsigned>(p[0]) << 8) | p[1]);
@@ -691,20 +691,60 @@ std::string fullWidthDigitsForRange(int startTrack, int endTrack) {
     return normalizeToFullWidthUtf8(ascii);
 }
 
-/** Converts UTOC sound-group counts back to 44.1 kHz timeline samples per codec mode. */
+/** Converts UTOC sound-group counts back to exact 44.1 kHz timeline samples per codec mode. */
 std::int64_t samplesForUnits(int units, const std::string& mode) noexcept {
     if (units <= 0) {
         return 0;
     }
-    // SP Stereo consumes 2 sound groups per 512-sample frame; LP4 consumes 1 group per 1024-sample
-    // frame.
     if (mode == "sp-stereo") {
-        return static_cast<std::int64_t>(units / 2) * 512;
+        return static_cast<std::int64_t>(units) * 256;
     }
     if (mode == "lp4") {
         return static_cast<std::int64_t>(units) * 1024;
     }
     return static_cast<std::int64_t>(units) * 512;
+}
+
+std::uint8_t modeBytePreservingNonFlags(std::uint8_t rawModeByte, MdCodecMode codec,
+                                         bool writeProtected, bool scms, bool emphasis) {
+    if (rawModeByte == 0) {
+        return utocModeFromTrack(mdCodecModeToString(codec), writeProtected, scms, emphasis);
+    }
+    const bool origWp = (rawModeByte & kUtocWritable) == 0;
+    const bool origScms = (rawModeByte & kUtocScmsDigCopy) != 0;
+    const bool origEmph = (rawModeByte & kUtocEmphasis) != 0;
+    if (writeProtected == origWp && scms == origScms && emphasis == origEmph) {
+        return rawModeByte;
+    }
+    std::uint8_t m = static_cast<std::uint8_t>(
+        rawModeByte &
+        ~static_cast<std::uint8_t>(kUtocWritable | kUtocScmsDigCopy | kUtocEmphasis));
+    if (!writeProtected) {
+        m |= kUtocWritable;
+    }
+    if (scms) {
+        m |= kUtocScmsDigCopy;
+        m &= static_cast<std::uint8_t>(~kUtocScmsUnrestricted);
+    }
+    if (emphasis) {
+        m |= kUtocEmphasis;
+    }
+    return m;
+}
+
+std::vector<MdPhysRange> readPhysRangeChain(const UtocDiscState& state, std::uint8_t headSlot) {
+    std::vector<MdPhysRange> ranges;
+    std::set<std::uint8_t> visited;
+    std::uint8_t slot = headSlot;
+    while (slot != 0 && visited.insert(slot).second) {
+        const auto& f = state.fragments[slot];
+        if (f.isValid() && f.end.toLinearGroup() >= f.start.toLinearGroup()) {
+            ranges.push_back({{f.start.cluster, f.start.sector, f.start.group},
+                              {f.end.cluster, f.end.sector, f.end.group}});
+        }
+        slot = f.link;
+    }
+    return ranges;
 }
 
 } // namespace
@@ -1072,17 +1112,19 @@ bool compileUtocSectors(const UtocDiscState& state,
 // Budget, Authoring Conversion, & Inspection
 // ============================================================================
 
-UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medium) {
+UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medium,
+                             int totalClustersOverride) {
     UtocBudget budget;
-    budget.totalClusters = discMediumClusterCapacity(medium);
+    budget.totalClusters =
+        totalClustersOverride > 0 ? totalClustersOverride : discMediumClusterCapacity(medium);
     budget.usedTracks = static_cast<int>(state.trackCount);
 
     std::set<int> usedFragSlots;
+    std::set<std::uint16_t> occupiedClusters;
     std::map<std::tuple<std::uint16_t, std::uint8_t, std::uint8_t, std::uint16_t, std::uint8_t,
                         std::uint8_t>,
              int>
         physUseCount;
-    std::uint16_t maxCluster = 0;
 
     for (int t = 1; t <= budget.usedTracks; ++t) {
         std::uint8_t slot = state.trackMap[static_cast<std::size_t>(t)];
@@ -1092,7 +1134,9 @@ UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medi
             usedFragSlots.insert(slot);
             const auto& frag = state.fragments[slot];
             if (frag.isValid()) {
-                maxCluster = std::max(maxCluster, std::max(frag.start.cluster, frag.end.cluster));
+                for (std::uint16_t c = frag.start.cluster; c <= frag.end.cluster; ++c) {
+                    occupiedClusters.insert(c);
+                }
                 const auto key =
                     std::make_tuple(frag.start.cluster, frag.start.sector, frag.start.group,
                                     frag.end.cluster, frag.end.sector, frag.end.group);
@@ -1102,9 +1146,7 @@ UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medi
         }
     }
     budget.usedFragments = static_cast<int>(usedFragSlots.size());
-    if (maxCluster >= kFirstAudioCluster) {
-        budget.usedClusters = static_cast<int>(maxCluster - kFirstAudioCluster + 1);
-    }
+    budget.usedClusters = static_cast<int>(occupiedClusters.size());
     for (const auto& [_, cnt] : physUseCount) {
         if (cnt > 1) {
             ++budget.sharedFragmentCount;
@@ -1128,6 +1170,13 @@ UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medi
     budget.usedHalfWidthCells = countChainCells(state.halfTitleMap, state.halfTitleCells);
     budget.usedFullWidthCells = countChainCells(state.fullTitleMap, state.fullTitleCells);
     return budget;
+}
+
+std::string computeUtocSectorSha256Hex(const std::uint8_t* sector2352) {
+    if (!sector2352) {
+        return {};
+    }
+    return juce::SHA256(sector2352, kUtocSectorBytes).toHexString().toLowerCase().toStdString();
 }
 
 bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& error) {
@@ -1165,6 +1214,9 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         out.sec4Padding = base.sec4Padding;
     } else {
         out.deviceSignature = kCartaUtocSignature;
+    }
+    if (disc.loadedDisc.active && disc.loadedDisc.deviceSignature != 0) {
+        out.deviceSignature = disc.loadedDisc.deviceSignature;
     }
     out.hasSector0 = true;
     out.hasSector1 = true;
@@ -1224,8 +1276,9 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
 
     for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
         const auto& tr = disc.tracks[t];
-        const auto modeStr = mdCodecModeToString(effectiveTrackCodec(disc, tr));
-        const std::uint8_t modeByte =
+        const auto codec = effectiveTrackCodec(disc, tr);
+        const auto modeStr = mdCodecModeToString(codec);
+        const std::uint8_t defaultModeByte =
             utocModeFromTrack(modeStr, tr.writeProtected, tr.scmsCopyProtected, tr.emphasis);
         std::uint8_t nextLink = 0;
         const auto& placements = byTrack[t];
@@ -1234,7 +1287,11 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
             UtocFragment frag;
             frag.start = {p->startAddr.cluster, p->startAddr.sector, p->startAddr.group};
             frag.end = {p->endAddr.cluster, p->endAddr.sector, p->endAddr.group};
-            frag.mode = modeByte;
+            frag.mode =
+                p->isOnDisc
+                    ? modeBytePreservingNonFlags(p->rawModeByte, codec, tr.writeProtected,
+                                                 tr.scmsCopyProtected, tr.emphasis)
+                    : defaultModeByte;
             frag.link = nextLink;
             std::uint8_t assigned = 0;
             if (!allocFragmentSlot(frag, assigned)) {
@@ -1245,22 +1302,88 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         out.trackMap[t + 1] = nextLink;
     }
 
-    // Reserve free-area pointer P-FRA in trackMap[0] when medium capacity leaves free clusters & a
-    // slot remains.
-    const int capClusters = mdTotalClusters(disc.medium);
-    const std::uint16_t nextFreeCluster =
-        static_cast<std::uint16_t>(kMdFirstAudioCluster + plan.usedClusters);
-    if (capClusters > 0 &&
-        nextFreeCluster < static_cast<std::uint16_t>(capClusters + kMdFirstAudioCluster) &&
-        out.nextFreeTrackSlot != 0) {
-        const std::uint8_t slot = out.nextFreeTrackSlot;
-        out.nextFreeTrackSlot = out.fragments[slot].link;
-        out.fragments[slot].start = {nextFreeCluster, 0, 0};
-        out.fragments[slot].mode = 0;
-        out.fragments[slot].end = {
-            static_cast<std::uint16_t>(capClusters + kMdFirstAudioCluster - 1), 31, 10};
-        out.fragments[slot].link = 0;
-        out.trackMap[0] = slot;
+    // Reserve P-DFA (0x2E) and free-area pointer P-FRA (trackMap[0]).
+    if (disc.loadedDisc.active) {
+        out.sec0aPadding[14] = 0;
+        auto countRemainingSlots = [&]() {
+            std::size_t count = 0;
+            std::array<bool, kUtocSlots> seen{};
+            for (std::uint8_t s = out.nextFreeTrackSlot; s != 0 && count < kUtocSlots;
+                 s = out.fragments[s].link) {
+                if (seen[s]) {
+                    break;
+                }
+                seen[s] = true;
+                ++count;
+            }
+            return count;
+        };
+        auto allocRangeChain = [&](const std::vector<MdPhysRange>& ranges, std::uint8_t& outHead) {
+            outHead = 0;
+            std::uint8_t prevSlot = 0;
+            for (const auto& r : ranges) {
+                if (out.nextFreeTrackSlot == 0) {
+                    break;
+                }
+                const std::uint8_t slot = out.nextFreeTrackSlot;
+                out.nextFreeTrackSlot = out.fragments[slot].link;
+                out.fragments[slot].start = {r.start.cluster, r.start.sector, r.start.group};
+                out.fragments[slot].mode = 0;
+                out.fragments[slot].end = {r.end.cluster, r.end.sector, r.end.group};
+                out.fragments[slot].link = 0;
+                if (prevSlot == 0) {
+                    outHead = slot;
+                } else {
+                    out.fragments[prevSlot].link = slot;
+                }
+                prevSlot = slot;
+            }
+        };
+
+        if (!disc.loadedDisc.defectiveRanges.empty()) {
+            if (countRemainingSlots() < disc.loadedDisc.defectiveRanges.size()) {
+                error = "UTOC Sector 0 fragment table exceeded 255 slots (insufficient space for "
+                        "defective area P-DFA).";
+                return false;
+            }
+            allocRangeChain(disc.loadedDisc.defectiveRanges, out.sec0aPadding[14]);
+        }
+
+        if (!plan.reclaimedFreeRanges.empty()) {
+            const std::size_t freeSlots = countRemainingSlots();
+            if (freeSlots > 0) {
+                std::vector<MdPhysRange> toLink = plan.reclaimedFreeRanges;
+                if (toLink.size() > freeSlots) {
+                    std::sort(toLink.begin(), toLink.end(),
+                              [](const MdPhysRange& a, const MdPhysRange& b) {
+                                  return (a.end.toLinearUnits() - a.start.toLinearUnits()) >
+                                         (b.end.toLinearUnits() - b.start.toLinearUnits());
+                              });
+                    toLink.resize(freeSlots);
+                    std::sort(toLink.begin(), toLink.end(),
+                              [](const MdPhysRange& a, const MdPhysRange& b) {
+                                  return a.start < b.start;
+                              });
+                }
+                allocRangeChain(toLink, out.trackMap[0]);
+            }
+        }
+    } else {
+        const int capClusters = mdTotalClusters(disc.medium);
+        const std::uint16_t nextFreeCluster =
+            static_cast<std::uint16_t>(kMdFirstAudioCluster + plan.usedClusters);
+        if (capClusters > 0 &&
+            nextFreeCluster < static_cast<std::uint16_t>(capClusters + kMdFirstAudioCluster) &&
+            out.nextFreeTrackSlot != 0) {
+            const std::uint8_t slot = out.nextFreeTrackSlot;
+            out.nextFreeTrackSlot = out.fragments[slot].link;
+            out.fragments[slot].start = {nextFreeCluster, 0, 0};
+            out.fragments[slot].mode = 0;
+            out.fragments[slot].end = {
+                static_cast<std::uint16_t>(capClusters + kMdFirstAudioCluster - 1), 31, 10};
+            out.fragments[slot].link = 0;
+            out.trackMap[0] = slot;
+        }
     }
 
     // 2. Sector 1 (half-width) & Sector 4 (full-width) titles and groups.
@@ -1307,7 +1430,7 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         discFwHeader = fw;
     } else {
         discHwEncoded = discHwPlainBytes;
-        discFwHeader = !disc.fullWidthTitle.empty() ? disc.fullWidthTitle : disc.halfWidthTitle;
+        discFwHeader = disc.fullWidthTitle;
     }
 
     if (!allocateTitleCells(out.halfTitleCells, out.nextFreeHalfTitleSlot, discHwEncoded,
@@ -1315,7 +1438,7 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         error = "UTOC Sector 1 half-width title cells exceeded 255 slots.";
         return false;
     }
-    if (needFullWidth) {
+    if (needFullWidth && !discFwHeader.empty()) {
         out.hasSector4 = true;
         const auto fwBytes = encodeFullWidthShiftJis(discFwHeader, error);
         if (!error.empty()) {
@@ -1338,10 +1461,9 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
             error = "UTOC Sector 1 half-width title cells exceeded 255 slots.";
             return false;
         }
-        if (needFullWidth) {
-            const std::string fwSrc =
-                !tr.fullWidthTitle.empty() ? tr.fullWidthTitle : tr.halfWidthTitle;
-            const auto fwBytes = encodeFullWidthShiftJis(fwSrc, error);
+        if (needFullWidth && !tr.fullWidthTitle.empty()) {
+            out.hasSector4 = true;
+            const auto fwBytes = encodeFullWidthShiftJis(tr.fullWidthTitle, error);
             if (!error.empty()) {
                 return false;
             }
@@ -1399,17 +1521,9 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
     return true;
 }
 
-bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error) {
-    error.clear();
-    out = {};
-    if (!state.hasSector0) {
-        error = "UTOC Sector 0 is required to reconstruct an MD disc.";
-        return false;
-    }
-    out.medium = MdMedium::md80;
-    out.defaultCodec = MdCodecMode::spStereo;
+namespace {
 
-    const int nTracks = static_cast<int>(state.trackCount);
+void populateDiscHeaderAndGroups(const UtocDiscState& state, int nTracks, MdDisc& out) {
     const std::string rawDiscHw = readHalfWidthTitleSlot(state, 0);
     const std::string rawDiscFw = readFullWidthTitleSlot(state, 0);
 
@@ -1425,6 +1539,45 @@ bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error)
             out.discTimestamp = formatUtocTimestampString(ts);
         }
     }
+
+    for (const auto& g : groups) {
+        MdGroup mg;
+        mg.startTrack = g.startTrack;
+        mg.endTrack = g.endTrack;
+        mg.halfWidthTitle = g.halfWidthTitle;
+        mg.fullWidthTitle = g.fullWidthTitle;
+        out.groups.push_back(std::move(mg));
+    }
+}
+
+void readTrackTitleAndTimestamp(const UtocDiscState& state, int oneBasedTrack, MdTrack& tr) {
+    tr.id = makeMdTrackId();
+    tr.halfWidthTitle = readHalfWidthTitleSlot(state, oneBasedTrack);
+    tr.fullWidthTitle = readFullWidthTitleSlot(state, oneBasedTrack);
+    if (state.hasSector2 &&
+        state.timestampMap[static_cast<std::size_t>(oneBasedTrack)] != 0) {
+        const auto& ts =
+            state.timestamps[state.timestampMap[static_cast<std::size_t>(oneBasedTrack)]];
+        if (ts.isValid()) {
+            tr.timestamp = formatUtocTimestampString(ts);
+        }
+    }
+}
+
+} // namespace
+
+bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error) {
+    error.clear();
+    out = {};
+    if (!state.hasSector0) {
+        error = "UTOC Sector 0 is required to reconstruct an MD disc.";
+        return false;
+    }
+    out.medium = MdMedium::md80;
+    out.defaultCodec = MdCodecMode::spStereo;
+
+    const int nTracks = static_cast<int>(state.trackCount);
+    populateDiscHeaderAndGroups(state, nTracks, out);
 
     // Assign each unique physical fragment range (start, end, codecMode) a deterministic
     // non-overlapping timeline slice so shared UTOC fragments remain shared in MdDisc.
@@ -1476,15 +1629,7 @@ bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error)
 
     for (int t = 1; t <= nTracks; ++t) {
         MdTrack tr;
-        tr.id = makeMdTrackId();
-        tr.halfWidthTitle = readHalfWidthTitleSlot(state, t);
-        tr.fullWidthTitle = readFullWidthTitleSlot(state, t);
-        if (state.hasSector2 && state.timestampMap[static_cast<std::size_t>(t)] != 0) {
-            const auto& ts = state.timestamps[state.timestampMap[static_cast<std::size_t>(t)]];
-            if (ts.isValid()) {
-                tr.timestamp = formatUtocTimestampString(ts);
-            }
-        }
+        readTrackTitleAndTimestamp(state, t, tr);
 
         std::uint8_t slot = state.trackMap[static_cast<std::size_t>(t)];
         std::set<std::uint8_t> guard;
@@ -1535,15 +1680,6 @@ bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error)
         }
     }
 
-    for (const auto& g : groups) {
-        MdGroup mg;
-        mg.startTrack = g.startTrack;
-        mg.endTrack = g.endTrack;
-        mg.halfWidthTitle = g.halfWidthTitle;
-        mg.fullWidthTitle = g.fullWidthTitle;
-        out.groups.push_back(std::move(mg));
-    }
-
     std::array<std::uint8_t, kUtocSectorBytes> s0{};
     std::array<std::uint8_t, kUtocSectorBytes> s1{};
     std::array<std::uint8_t, kUtocSectorBytes> s2{};
@@ -1557,6 +1693,242 @@ bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error)
     }
 
     return validateMdDisc(out, error);
+}
+
+bool loadMdDiscFromDeviceUtoc(
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors,
+    const std::string& sourceDeviceId, MdDisc& out, std::string& error) {
+    error.clear();
+    out = {};
+
+    UtocDiscState state{};
+    if (!parseUtocSectors(rawSectors[0].data(), rawSectors[1].data(), rawSectors[2].data(),
+                          rawSectors[4].data(), state, error)) {
+        return false;
+    }
+    if (!state.hasSector0) {
+        error = "UTOC Sector 0 is required to load a MiniDisc.";
+        return false;
+    }
+    if (utocHasNonAudioTrack(state)) {
+        error = "Inserted disc contains Hi-MD / non-audio data tracks; erase to reformat for "
+                "standard MiniDisc.";
+        return false;
+    }
+
+    const int nTracks = static_cast<int>(state.trackCount);
+    populateDiscHeaderAndGroups(state, nTracks, out);
+
+    out.loadedDisc.active = true;
+    out.loadedDisc.sourceDeviceId = sourceDeviceId;
+    out.loadedDisc.baselineSector0Hash = computeUtocSectorSha256Hex(rawSectors[0].data());
+    out.loadedDisc.deviceSignature = state.deviceSignature;
+    out.loadedDisc.initialFreeRanges = readPhysRangeChain(state, state.trackMap[0]);
+    out.loadedDisc.defectiveRanges = readPhysRangeChain(state, state.sec0aPadding[14]);
+    out.loadedDisc.rawSector3.assign(rawSectors[3].begin(), rawSectors[3].end());
+    out.importedUtocSectors[0].assign(rawSectors[0].begin(), rawSectors[0].end());
+    out.importedUtocSectors[1].assign(rawSectors[1].begin(), rawSectors[1].end());
+    out.importedUtocSectors[2].assign(rawSectors[2].begin(), rawSectors[2].end());
+    out.importedUtocSectors[3].assign(rawSectors[4].begin(), rawSectors[4].end());
+
+    struct RawFragInterval {
+        std::int64_t startLin = 0;
+        std::int64_t endLin = 0;
+        MdCodecMode codec = MdCodecMode::spStereo;
+        std::uint8_t rawModeByte = 0;
+    };
+    std::vector<RawFragInterval> intervals;
+
+    std::uint16_t minCluster = 0;
+    std::uint16_t maxCluster = 0;
+    auto noteClusterSpan = [&](std::uint16_t sCluster, std::uint16_t eCluster) {
+        if (sCluster > 0) {
+            minCluster = (minCluster == 0) ? sCluster : std::min(minCluster, sCluster);
+        }
+        maxCluster = std::max(maxCluster, eCluster);
+    };
+    for (const auto& r : out.loadedDisc.initialFreeRanges) {
+        noteClusterSpan(r.start.cluster, r.end.cluster);
+    }
+    for (const auto& r : out.loadedDisc.defectiveRanges) {
+        noteClusterSpan(r.start.cluster, r.end.cluster);
+    }
+
+    for (int t = 1; t <= nTracks; ++t) {
+        std::uint8_t slot = state.trackMap[static_cast<std::size_t>(t)];
+        std::set<std::uint8_t> guard;
+        int fragCount = 0;
+        while (slot != 0 && guard.insert(slot).second) {
+            const auto& frag = state.fragments[slot];
+            if (frag.isValid()) {
+                const std::int64_t sLin = frag.start.toLinearGroup();
+                const std::int64_t eLin = frag.end.toLinearGroup();
+                if (eLin < sLin) {
+                    error = "UTOC track " + std::to_string(t) + " has inverted fragment range.";
+                    out = {};
+                    return false;
+                }
+                const auto modeStr = audioModeFromUtocMode(frag.mode);
+                MdCodecMode codec = MdCodecMode::spStereo;
+                parseMdCodecMode(modeStr, codec);
+                intervals.push_back({sLin, eLin, codec, frag.mode});
+                noteClusterSpan(frag.start.cluster, frag.end.cluster);
+                ++fragCount;
+            }
+            slot = frag.link;
+        }
+        if (fragCount == 0) {
+            error = "UTOC track " + std::to_string(t) + " has no valid audio fragments.";
+            out = {};
+            return false;
+        }
+    }
+
+    if (maxCluster == 0) {
+        out.loadedDisc.physicalStartCluster = 50;
+        out.loadedDisc.physicalLastCluster =
+            static_cast<std::uint16_t>(50 + mdTotalClusters(MdMedium::md80) - 1);
+    } else {
+        out.loadedDisc.physicalStartCluster = std::max<std::uint16_t>(1, minCluster);
+        out.loadedDisc.physicalLastCluster =
+            std::max(out.loadedDisc.physicalStartCluster, maxCluster);
+    }
+    const int physTotal = out.loadedDisc.physicalTotalClusters();
+    out.medium = (physTotal <= 1900)
+                     ? MdMedium::md60
+                     : ((physTotal <= 2260) ? MdMedium::md74 : MdMedium::md80);
+
+    auto nonFlagModeBits = [](std::uint8_t m) noexcept -> std::uint8_t {
+        return static_cast<std::uint8_t>(
+            m & ~static_cast<std::uint8_t>(kUtocWritable | kUtocScmsDigCopy | kUtocEmphasis));
+    };
+
+    std::sort(intervals.begin(), intervals.end(),
+              [](const RawFragInterval& a, const RawFragInterval& b) {
+                  return std::tie(a.startLin, a.endLin) < std::tie(b.startLin, b.endLin);
+              });
+
+    std::vector<RawFragInterval> coalesced;
+    for (const auto& iv : intervals) {
+        if (coalesced.empty()) {
+            coalesced.push_back(iv);
+            continue;
+        }
+        auto& cur = coalesced.back();
+        const bool sameFormat =
+            (iv.codec == cur.codec && nonFlagModeBits(iv.rawModeByte) == nonFlagModeBits(cur.rawModeByte));
+        if (iv.startLin <= cur.endLin && !sameFormat) {
+            error = "UTOC contains overlapping physical fragments with conflicting audio codecs.";
+            out = {};
+            return false;
+        }
+        if (iv.startLin <= cur.endLin + 1 && sameFormat) {
+            cur.endLin = std::max(cur.endLin, iv.endLin);
+        } else {
+            coalesced.push_back(iv);
+        }
+    }
+
+    std::int64_t timelineCursor = 0;
+    out.loadedDisc.regions.reserve(coalesced.size());
+    for (std::size_t i = 0; i < coalesced.size(); ++i) {
+        const auto& c = coalesced[i];
+        MdOnDiscRegion reg;
+        reg.id = "od-" + std::to_string(i);
+        reg.codec = c.codec;
+        reg.rawModeByte = c.rawModeByte;
+        const auto ps = UtocAddress::fromLinearGroup(c.startLin);
+        const auto pe = UtocAddress::fromLinearGroup(c.endLin);
+        reg.physStart = {ps.cluster, ps.sector, ps.group};
+        reg.physEnd = {pe.cluster, pe.sector, pe.group};
+        reg.unitCount = static_cast<int>(c.endLin - c.startLin + 1);
+        reg.timelineStartSample = timelineCursor;
+        reg.timelineEndSample =
+            timelineCursor + static_cast<std::int64_t>(reg.unitCount) * mdSamplesPerUnit(c.codec);
+        timelineCursor = reg.timelineEndSample;
+        out.loadedDisc.regions.push_back(std::move(reg));
+    }
+
+    std::map<MdCodecMode, int> codecCounts;
+    for (int t = 1; t <= nTracks; ++t) {
+        MdTrack tr;
+        readTrackTitleAndTimestamp(state, t, tr);
+
+        std::uint8_t slot = state.trackMap[static_cast<std::size_t>(t)];
+        std::set<std::uint8_t> guard;
+        bool hasFragMode = false;
+        std::uint8_t firstFragMode = 0;
+        MdCodecMode trackCodec = MdCodecMode::spStereo;
+
+        while (slot != 0 && guard.insert(slot).second) {
+            const auto& frag = state.fragments[slot];
+            if (frag.isValid()) {
+                const auto modeStr = audioModeFromUtocMode(frag.mode);
+                MdCodecMode codec = MdCodecMode::spStereo;
+                parseMdCodecMode(modeStr, codec);
+                if (!hasFragMode) {
+                    firstFragMode = frag.mode;
+                    trackCodec = codec;
+                    hasFragMode = true;
+                } else if (codec != trackCodec) {
+                    error = "UTOC track " + std::to_string(t) +
+                            " mixes incompatible audio codecs across fragments.";
+                    out = {};
+                    return false;
+                }
+
+                const std::int64_t sLin = frag.start.toLinearGroup();
+                const std::int64_t eLin = frag.end.toLinearGroup();
+                bool mapped = false;
+                for (const auto& reg : out.loadedDisc.regions) {
+                    const std::int64_t rStart = reg.physStart.toLinearUnits();
+                    const std::int64_t rEnd = reg.physEnd.toLinearUnits();
+                    if (sLin >= rStart && eLin <= rEnd && reg.codec == codec) {
+                        const std::int64_t uSamples = mdSamplesPerUnit(reg.codec);
+                        tr.parts.push_back(
+                            {reg.timelineStartSample + (sLin - rStart) * uSamples,
+                             reg.timelineStartSample + (eLin - rStart + 1) * uSamples});
+                        mapped = true;
+                        break;
+                    }
+                }
+                if (!mapped) {
+                    error = "Internal error mapping UTOC track " + std::to_string(t) +
+                            " fragment to loaded region.";
+                    out = {};
+                    return false;
+                }
+            }
+            slot = frag.link;
+        }
+
+        if (hasFragMode) {
+            tr.codecOverride = trackCodec;
+            tr.writeProtected = (firstFragMode & kUtocWritable) == 0;
+            tr.scmsCopyProtected = (firstFragMode & kUtocScmsDigCopy) != 0;
+            tr.emphasis = (firstFragMode & kUtocEmphasis) != 0;
+            ++codecCounts[trackCodec];
+        }
+        out.tracks.push_back(std::move(tr));
+    }
+
+    if (!codecCounts.empty()) {
+        MdCodecMode bestCodec = MdCodecMode::spStereo;
+        int bestCount = -1;
+        for (const auto& [c, cnt] : codecCounts) {
+            if (cnt > bestCount) {
+                bestCount = cnt;
+                bestCodec = c;
+            }
+        }
+        out.defaultCodec = bestCodec;
+    }
+
+    if (!validateMdDisc(out, error)) {
+        out = {};
+        return false;
+    }
+    return true;
 }
 
 bool utocHasNonAudioTrack(const UtocDiscState& state) noexcept {

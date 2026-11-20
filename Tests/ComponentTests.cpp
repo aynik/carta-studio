@@ -616,8 +616,9 @@ struct StudioComponentTests {
             check(!rectsOverlap({dock.deviceCardTitle.getBounds(), dock.recordDeviceBox.getBounds(),
                                  dock.refreshRecordButton.getBounds()}),
                   "Device card top row does not overlap");
-            check(!rectsOverlap(
-                      {dock.readDiscTocButton.getBounds(), dock.eraseDiscButton.getBounds()}),
+            check(!rectsOverlap({dock.loadDiscButton.getBounds(),
+                                 dock.readDiscTocButton.getBounds(),
+                                 dock.eraseDiscButton.getBounds()}),
                   "Device card bottom buttons do not overlap");
             check(
                 !rectsOverlap({dock.planCardTitle.getBounds(), dock.utocSummaryLabel.getBounds()}),
@@ -635,10 +636,12 @@ struct StudioComponentTests {
                           {dock.deviceCardTitle.getBounds(), dock.recordDeviceBox.getBounds(),
                            dock.refreshRecordButton.getBounds(), dock.recordBadgeLabel.getBounds(),
                            dock.deviceDiscMeterBounds, dock.deviceTrackList.getBounds(),
-                           dock.readDiscTocButton.getBounds(), dock.eraseDiscButton.getBounds()},
+                           dock.loadDiscButton.getBounds(), dock.readDiscTocButton.getBounds(),
+                           dock.eraseDiscButton.getBounds()},
                           dock.deviceCardBounds),
                       "Device card widgets and device track list fit inside device card at 1180px");
                 check(!rectsOverlap({dock.deviceDiscMeterBounds, dock.deviceTrackList.getBounds(),
+                                     dock.loadDiscButton.getBounds(),
                                      dock.readDiscTocButton.getBounds()}),
                       "Device meter, track list, and action buttons do not overlap");
                 check(dock.deviceTrackList.isVisible() &&

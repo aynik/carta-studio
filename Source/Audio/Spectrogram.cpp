@@ -195,8 +195,9 @@ juce::Image makeTile(const Audio& audio, const Clip* clip, juce::int64 startFram
     const int samples = audio.numSamples();
     const int channels = audio.numChannels();
 
-    if (samples <= 0 || channels <= 0 || !std::isfinite(audio.sampleRate) ||
-        audio.sampleRate <= 0 || startFrame < 0 || startFrame >= samples || framesPerColumn <= 0 ||
+    if (audio.onDiscPlaceholder || samples <= 0 || channels <= 0 ||
+        !std::isfinite(audio.sampleRate) || audio.sampleRate <= 0 || startFrame < 0 ||
+        startFrame >= samples || framesPerColumn <= 0 ||
         columns <= 0 || columns > 128 ||
         static_cast<juce::int64>(columns) * height * channels > 2000000 ||
         framesPerColumn > (std::numeric_limits<juce::int64>::max() - startFrame) / columns) {

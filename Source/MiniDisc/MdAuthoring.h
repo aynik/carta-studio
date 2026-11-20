@@ -82,6 +82,73 @@ struct MdPhysAddr {
         return cluster == o.cluster && sector == o.sector && group == o.group;
     }
     bool operator!=(const MdPhysAddr& o) const noexcept { return !(*this == o); }
+    bool operator<(const MdPhysAddr& o) const noexcept {
+        return toLinearUnits() < o.toLinearUnits();
+    }
+};
+
+/** Inclusive physical sound-group address interval `[start, end]`. */
+struct MdPhysRange {
+    MdPhysAddr start{};
+    MdPhysAddr end{};
+
+    bool operator==(const MdPhysRange& o) const noexcept {
+        return start == o.start && end == o.end;
+    }
+    bool operator!=(const MdPhysRange& o) const noexcept { return !(*this == o); }
+};
+
+/** One coalesced contiguous on-disc audio region mapped onto timeline `[startSample, endSample)`. */
+struct MdOnDiscRegion {
+    std::string id;
+    MdCodecMode codec = MdCodecMode::spStereo;
+    std::uint8_t rawModeByte = 0;
+    MdPhysAddr physStart{};
+    MdPhysAddr physEnd{};
+    int unitCount = 0;
+    std::int64_t timelineStartSample = 0;
+    std::int64_t timelineEndSample = 0;
+    bool audioDownloaded = false;
+
+    bool operator==(const MdOnDiscRegion& o) const noexcept {
+        return id == o.id && codec == o.codec && rawModeByte == o.rawModeByte &&
+               physStart == o.physStart && physEnd == o.physEnd && unitCount == o.unitCount &&
+               timelineStartSample == o.timelineStartSample &&
+               timelineEndSample == o.timelineEndSample &&
+               audioDownloaded == o.audioDownloaded;
+    }
+    bool operator!=(const MdOnDiscRegion& o) const noexcept { return !(*this == o); }
+};
+
+/** Physical topology & safety baseline captured when loading an existing MiniDisc. */
+struct MdLoadedDiscState {
+    bool active = false;
+    std::string sourceDeviceId;
+    std::string baselineSector0Hash;
+    std::uint16_t deviceSignature = 0;
+    std::uint16_t physicalStartCluster = 50;
+    std::uint16_t physicalLastCluster = 2251;
+    std::vector<MdOnDiscRegion> regions;
+    std::vector<MdPhysRange> initialFreeRanges;
+    std::vector<MdPhysRange> defectiveRanges;
+    std::vector<std::uint8_t> rawSector3;
+
+    int physicalTotalClusters() const noexcept {
+        return physicalLastCluster >= physicalStartCluster
+                   ? static_cast<int>(physicalLastCluster - physicalStartCluster + 1)
+                   : 0;
+    }
+
+    bool operator==(const MdLoadedDiscState& o) const noexcept {
+        return active == o.active && sourceDeviceId == o.sourceDeviceId &&
+               baselineSector0Hash == o.baselineSector0Hash &&
+               deviceSignature == o.deviceSignature &&
+               physicalStartCluster == o.physicalStartCluster &&
+               physicalLastCluster == o.physicalLastCluster && regions == o.regions &&
+               initialFreeRanges == o.initialFreeRanges &&
+               defectiveRanges == o.defectiveRanges && rawSector3 == o.rawSector3;
+    }
+    bool operator!=(const MdLoadedDiscState& o) const noexcept { return !(*this == o); }
 };
 
 /** Half-open timeline audio reference `[startSample, endSample)` at 44.1 kHz. */
@@ -164,13 +231,15 @@ struct MdDisc {
     std::vector<MdGroup> groups;
     /** Optional raw UTOC Sectors 0, 1, 2, 4 imported from a physical disc or bundle. */
     std::array<std::vector<std::uint8_t>, 4> importedUtocSectors;
+    /** Loaded-disc physical topology when editing an existing MiniDisc non-destructively. */
+    MdLoadedDiscState loadedDisc;
 
     bool operator==(const MdDisc& o) const noexcept {
         return medium == o.medium && defaultCodec == o.defaultCodec &&
                halfWidthTitle == o.halfWidthTitle && fullWidthTitle == o.fullWidthTitle &&
                discTimestamp == o.discTimestamp && autoTrackOnImport == o.autoTrackOnImport &&
                tracks == o.tracks && groups == o.groups &&
-               importedUtocSectors == o.importedUtocSectors;
+               importedUtocSectors == o.importedUtocSectors && loadedDisc == o.loadedDisc;
     }
     bool operator!=(const MdDisc& o) const noexcept { return !(*this == o); }
 };
@@ -185,15 +254,18 @@ struct MdPhysicalSpan {
     int clusterCount = 0;
 };
 
-/** Physical placement of a single MdPart inside a coalesced MdPhysicalSpan. */
+/** Physical placement of a single MdPart inside a coalesced upload span or on-disc region. */
 struct MdPartPlacement {
     int trackIndex = 0; // 0-based
     int partIndex = 0;  // 0-based
-    int spanIndex = 0;  // 0-based into MdPhysicalPlan::spans
+    int spanIndex = -1; // 0-based into MdPhysicalPlan::spans, or -1 if on-disc
     int unitOffsetInSpan = 0;
     int unitCount = 0;
     MdPhysAddr startAddr{};
     MdPhysAddr endAddr{}; // inclusive last unit
+    bool isOnDisc = false;
+    int onDiscRegionIndex = -1;
+    std::uint8_t rawModeByte = 0;
 };
 
 /** Complete physical allocation and UTOC fragment plan derived from an MdDisc. */
@@ -207,6 +279,12 @@ struct MdPhysicalPlan {
     int usedClusters = 0;
     int uncoalescedClusters = 0;
     int savedClusters = 0;
+    int onDiscClusters = 0;
+    int newUploadClusters = 0;
+    int reclaimedClusters = 0;
+    int initialFreeClusters = 0;
+    int freeClustersAfterReclaim = 0;
+    std::vector<MdPhysRange> reclaimedFreeRanges;
 };
 
 // ============================================================================
@@ -234,6 +312,10 @@ std::int64_t mdFrameQuantumSamples(MdCodecMode mode) noexcept;
 /** Returns UTOC sound groups consumed per codec quantum (2 SP-Stereo/LP2, 1 SP-Mono/LP4). */
 int mdUnitsPerQuantum(MdCodecMode mode) noexcept;
 
+/** Returns exact 44.1 kHz PCM samples per single UTOC sound group (256 SP-St, 512 SP-Mo/LP2, 1024
+ * LP4). */
+std::int64_t mdSamplesPerUnit(MdCodecMode mode) noexcept;
+
 /** Returns encoded audio channel count (1 for SP Mono, 2 otherwise). */
 int mdChannelsForCodec(MdCodecMode mode) noexcept;
 
@@ -246,6 +328,19 @@ MdCodecMode effectiveTrackCodec(const MdDisc& disc, const MdTrack& track) noexce
 
 /** Returns true when `disc` matches a freshly initialized empty authoring state. */
 bool isDefaultMdDisc(const MdDisc& disc) noexcept;
+
+/**
+ * Resolves which loaded-disc region completely encloses `part`.
+ * Returns `>= 0` (region index), `-1` (completely outside all regions), or `-2` (spans/partial
+ * boundary overlap).
+ */
+int findMdOnDiscRegionForPart(const MdLoadedDiscState& loaded, const MdPart& part) noexcept;
+
+/** Returns true when `disc.loadedDisc.active` and at least one part lies on disc. */
+bool mdTrackUsesOnDiscAudio(const MdDisc& disc, const MdTrack& track) noexcept;
+
+/** Counts whole clusters completely covered by physical free ranges `ranges`. */
+int countWholeFreeClusters(const std::vector<MdPhysRange>& ranges) noexcept;
 
 /** Generates a globally unique stable track ID ("md-<uuid8>-<seq>"). */
 std::string makeMdTrackId();

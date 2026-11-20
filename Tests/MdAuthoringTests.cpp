@@ -8,10 +8,14 @@
  * boundary/part manipulation at the 44.1 kHz project sample rate.
  */
 #include "MiniDisc/MdAuthoring.h"
-#include "Editing/Editing.h"
 #include "Core/Session.h"
+#include "Editing/Editing.h"
+#include "IO/SessionIO.h"
 #include "MiniDisc/Utoc.h"
 
+#include <juce_audio_formats/juce_audio_formats.h>
+
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -342,6 +346,235 @@ void testInteractiveRibbonAndMultiLayerClipSync() {
           "1..1");
 }
 
+/** Verifies Stage 1 loaded-disc lock, placeholder silence render, auto-track preservation, and v26 SessionIO. */
+void testLoadedDiscLocksPlaceholderAndSessionIO() {
+    carta::MdDisc loaded;
+    loaded.medium = carta::MdMedium::md80;
+    loaded.defaultCodec = carta::MdCodecMode::spStereo;
+    loaded.halfWidthTitle = "Loaded Master";
+    loaded.loadedDisc.active = true;
+    loaded.loadedDisc.sourceDeviceId = "mock:mz-n920";
+    loaded.loadedDisc.baselineSector0Hash =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    loaded.loadedDisc.deviceSignature = 0x534F;
+    loaded.loadedDisc.physicalStartCluster = 50;
+    loaded.loadedDisc.physicalLastCluster = 2300;
+    loaded.loadedDisc.regions = {
+        {"od-0", carta::MdCodecMode::spStereo, 0xCE, {50, 0, 0}, {50, 31, 10}, 352, 0, 90112},
+        {"od-1", carta::MdCodecMode::lp2, 0xC2, {52, 0, 0}, {53, 31, 10}, 704, 90112, 450560}};
+    loaded.loadedDisc.initialFreeRanges = {{{100, 0, 0}, {2300, 31, 10}}};
+    loaded.loadedDisc.defectiveRanges = {{{200, 0, 0}, {200, 31, 10}}};
+    loaded.loadedDisc.rawSector3.assign(carta::kUtocSectorBytes, 0xA5);
+
+    carta::MdTrack t1;
+    t1.id = "od-t1";
+    t1.halfWidthTitle = "Disc Track 1";
+    t1.codecOverride = carta::MdCodecMode::spStereo;
+    t1.parts = {{0, 90112}};
+    carta::MdTrack t2;
+    t2.id = "od-t2";
+    t2.halfWidthTitle = "Disc Track 2";
+    t2.codecOverride = carta::MdCodecMode::lp2;
+    t2.parts = {{90112, 450560}};
+    loaded.tracks = {t1, t2};
+
+    carta::Session session;
+    carta::populateLoadedDiscSession(loaded, session);
+    check(session.tracks.size() == 1 && session.tracks[0].clips.size() == 2,
+          "populateLoadedDiscSession creates locked placeholder clips on Track 0");
+    check(session.tracks[0].clips[0].lockedOnDisc && session.tracks[0].clips[1].lockedOnDisc &&
+              session.tracks[0].clips[0].audio->onDiscPlaceholder &&
+              !session.tracks[0].clips[0].audio->hasPcm(),
+          "placeholder clips carry onDiscPlaceholder=true and lockedOnDisc=true with 0 PCM RAM");
+
+    // Placeholder rendering adds zero contribution and zero peak ranges safely
+    juce::AudioBuffer<float> mix(2, 1024);
+    mix.clear();
+    mix.setSample(0, 0, 0.25f);
+    session.render(mix, 0, 1024, 0.0, carta::sessionRate, 2);
+    bool silenceExact = (mix.getSample(0, 0) == 0.25f);
+    for (int ch = 0; ch < mix.getNumChannels(); ++ch) {
+        for (int i = 0; i < mix.getNumSamples(); ++i) {
+            if (ch == 0 && i == 0) {
+                continue;
+            }
+            if (mix.getSample(ch, i) != 0.0f) {
+                silenceExact = false;
+            }
+        }
+    }
+    check(silenceExact, "Session::render outputs exact silence for onDiscPlaceholder clips");
+    const auto wf = carta::waveformRange(*session.tracks[0].clips[0].audio, 0, 0, 1000);
+    check(wf.getStart() == 0.0f && wf.getEnd() == 0.0f,
+          "waveformRange returns 0..0 safely on onDiscPlaceholder audio");
+
+    // preservesOnDiscAudio guards
+    juce::String lockErr;
+    {
+        carta::Session s = session;
+        s.tracks[0].clips[0].start += 0.5;
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks moving locked on-disc clip");
+    }
+    {
+        carta::Session s = session;
+        s.tracks[0].clips[0].duration -= 0.1;
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks trimming locked on-disc clip");
+    }
+    {
+        carta::Session s = session;
+        s.tracks[0].clips[0].fadeIn = 0.25;
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks adding fade to locked on-disc clip");
+    }
+    {
+        carta::Session s = session;
+        s.tracks[0].clips[0].gain = 0.5f;
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks changing gain on locked on-disc clip");
+    }
+    {
+        carta::Session s = session;
+        s.tracks[0].clips.erase(s.tracks[0].clips.begin());
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks deleting locked on-disc clip");
+    }
+    {
+        carta::Session s = session;
+        s.tracks[0].clips.push_back(s.tracks[0].clips[0]);
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks duplicating locked on-disc clip");
+    }
+    {
+        carta::Session s = session;
+        auto local = makeSilentAudio(44100);
+        // Overlapping a locked clip on Track 0 fails
+        carta::Clip overlapClip;
+        overlapClip.audio = local;
+        overlapClip.start = 0.0;
+        overlapClip.offset = 0.0;
+        overlapClip.duration = 1.0;
+        overlapClip.name = "Overlap";
+        s.tracks[0].clips.push_back(overlapClip);
+        check(!carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio blocks placing new clip overlapping locked clip on same track");
+    }
+    {
+        carta::Session s = session;
+        auto local = makeSilentAudio(44100);
+        // Appending unlocked local audio on Track 1 (or after locked clips) succeeds!
+        carta::Clip newClip;
+        newClip.audio = local;
+        newClip.start = 450560.0 / carta::sessionRate;
+        newClip.offset = 0.0;
+        newClip.duration = 1.0;
+        newClip.name = "New";
+        carta::Track newTr;
+        newTr.name = "Overdub";
+        newTr.clips.push_back(newClip);
+        s.tracks.push_back(std::move(newTr));
+        check(carta::preservesOnDiscAudio(session, s, lockErr),
+              "preservesOnDiscAudio allows adding new unlocked audio tracks/clips: " +
+                  lockErr.toStdString());
+
+        // Auto-track & sync preservation
+        carta::MdDisc d = s.mdDisc;
+        std::string mdErr;
+        check(carta::applyAutoTrackForPlacedClip(d, "NewClip.wav", 450560, 494660),
+              "applyAutoTrackForPlacedClip appends track on loaded disc");
+        check(d.tracks.size() == 3 && d.tracks[0].id == "od-t1" && d.tracks[1].id == "od-t2" &&
+                  d.tracks[2].halfWidthTitle == "NewClip",
+              "applyAutoTrackForPlacedClip preserves loaded on-disc tracks");
+
+        carta::MdDisc synced = s.mdDisc;
+        check(carta::syncTracksFromClips(s, synced, mdErr),
+              "syncTracksFromClips on loaded disc succeeds: " + mdErr);
+        check(synced.tracks.size() >= 3 && synced.tracks[0].id == "od-t1" &&
+                  synced.tracks[1].id == "od-t2",
+              "syncTracksFromClips preserves loaded on-disc tracks while adding unlocked clips");
+    }
+
+    // SessionIO v26 save/load roundtrip (plus v25 stays default for non-loaded projects)
+    {
+        const auto tmpDir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                                .getChildFile("carta_loaded_disc_io_" +
+                                              juce::String(juce::Time::getHighResolutionTicks()));
+        check(tmpDir.createDirectory(), "create temp dir for v26 SessionIO test");
+        struct Cleanup {
+            juce::File d;
+            ~Cleanup() { d.deleteRecursively(); }
+        } cleanup{tmpDir};
+
+        const auto v26File = tmpDir.getChildFile("loaded_disc.carta");
+        juce::String ioErr;
+        check(carta::saveSession(session, 2, v26File, ioErr),
+              "saveSession v26 loaded disc failed: " + ioErr.toStdString());
+        const auto parsedJson = juce::JSON::parse(v26File.loadFileAsString());
+        check(static_cast<int>(parsedJson["version"]) == 26,
+              "loaded disc session must serialize at project version 26");
+
+        carta::Session reopened;
+        int reopenedCh = 0;
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        check(carta::loadSession(reopened, reopenedCh, fm, v26File, ioErr),
+              "loadSession v26 loaded disc failed: " + ioErr.toStdString());
+        check(reopened.mdDisc == session.mdDisc && reopened.tracks.size() == 1 &&
+                  reopened.tracks[0].clips.size() == 2 &&
+                  reopened.tracks[0].clips[0].lockedOnDisc &&
+                  reopened.tracks[0].clips[0].onDiscRegionId == "od-0" &&
+                  reopened.tracks[0].clips[0].audio->onDiscPlaceholder &&
+                  reopened.tracks[0].clips[0].audio->placeholderFrames == 90112,
+              "loadSession v26 restores loadedDisc metadata, locked clips, and placeholder Audio "
+              "identically");
+
+        // Verify non-loaded project still writes v25
+        carta::Session v25Session;
+        v25Session.mdDisc.halfWidthTitle = "Plain";
+        const auto wavFile = tmpDir.getChildFile("plain.wav");
+        {
+            juce::AudioFormatManager wfm;
+            wfm.registerBasicFormats();
+            if (auto* fmt = wfm.findFormatForFileExtension("wav")) {
+                std::unique_ptr<juce::OutputStream> outStream(wavFile.createOutputStream());
+                auto writer = fmt->createWriterFor(
+                    outStream,
+                    juce::AudioFormatWriterOptions{}
+                        .withSampleRate(44100.0)
+                        .withNumChannels(2)
+                        .withBitsPerSample(16));
+                if (writer) {
+                    juce::AudioBuffer<float> buf(2, 1024);
+                    buf.clear();
+                    writer->writeFromAudioSampleBuffer(buf, 0, 1024);
+                }
+            }
+        }
+        auto aPlain = carta::loadAudio(fm, wavFile, ioErr);
+        check(aPlain != nullptr, "loadAudio plain.wav failed: " + ioErr.toStdString());
+        if (!aPlain) {
+            return;
+        }
+        carta::Clip plainClip;
+        plainClip.audio = aPlain;
+        plainClip.start = 0.0;
+        plainClip.offset = 0.0;
+        plainClip.duration = 1024.0 / 44100.0;
+        plainClip.name = "Plain";
+        carta::Track plainTrack;
+        plainTrack.name = "Layer 1";
+        plainTrack.clips.push_back(plainClip);
+        v25Session.tracks.push_back(std::move(plainTrack));
+        const auto v25File = tmpDir.getChildFile("plain_v25.carta");
+        check(carta::saveSession(v25Session, 2, v25File, ioErr),
+              "saveSession non-loaded project failed: " + ioErr.toStdString());
+        const auto parsedV25 = juce::JSON::parse(v25File.loadFileAsString());
+        check(static_cast<int>(parsedV25["version"]) == 25,
+              "non-loaded project must remain at project version 25");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -350,6 +583,7 @@ int main() {
     testGroupConsistencyAcrossTrackEdits();
     testPhysicalPlanCoalescingAndUtocRoundtrip();
     testInteractiveRibbonAndMultiLayerClipSync();
+    testLoadedDiscLocksPlaceholderAndSessionIO();
     if (gFailures == 0) {
         std::cout << "MdAuthoringTests passed.\n";
         return 0;

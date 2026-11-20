@@ -350,17 +350,240 @@ struct MockDeviceState {
         p[2] = static_cast<std::uint8_t>(((addr.sector & 0x0Fu) << 4) | (addr.group & 0x0Fu));
     }
 
+    static UtocAddress decodeUtocAddr(const std::uint8_t* p) noexcept {
+        return {static_cast<std::uint16_t>((static_cast<unsigned>(p[0]) << 6) | (p[1] >> 2)),
+                static_cast<std::uint8_t>(((p[1] & 0x03u) << 4) | (p[2] >> 4)),
+                static_cast<std::uint8_t>(p[2] & 0x0Fu)};
+    }
+
     static std::uint8_t mockUtocModeForTrack(const std::string& mode) noexcept {
-        // Default: writable (0x01) + audio (0x00) + SCMS unrestricted (0x40) | SP/stereo flags.
-        std::uint8_t m = 0x41u;
+        // Writable (0x80) | SCMS unrestricted (0x40) | SP/Stereo bits.
+        std::uint8_t m = 0xC0u;
         if (mode == "sp-stereo") {
-            m |= 0x80u | 0x04u;
+            m |= 0x04u | 0x02u;
         } else if (mode == "sp-mono") {
-            m |= 0x80u;
-        } else if (mode == "lp2") {
             m |= 0x04u;
+        } else if (mode == "lp2") {
+            m |= 0x02u;
         }
         return m;
+    }
+
+    static std::string modeFromMockUtocByte(std::uint8_t m) {
+        const bool stereo = (m & 0x02u) != 0;
+        const bool sp = (m & 0x04u) != 0;
+        if (sp && stereo) {
+            return "sp-stereo";
+        }
+        if (sp) {
+            return "sp-mono";
+        }
+        if (stereo) {
+            return "lp2";
+        }
+        return "lp4";
+    }
+
+    static std::string readMockTitleChain(const std::array<std::uint8_t, kUtocSectorBytes>& sec,
+                                          int slotIndex) {
+        std::uint8_t slot = sec[0x30 + static_cast<std::size_t>(slotIndex)];
+        std::array<bool, 256> seen{};
+        std::vector<std::uint8_t> raw;
+        while (slot != 0 && !seen[slot]) {
+            seen[slot] = true;
+            const std::uint8_t* cell = sec.data() + 0x130 + static_cast<std::size_t>(slot) * 8u;
+            for (int j = 0; j < 7; ++j) {
+                if (cell[j] == 0) {
+                    slot = 0;
+                    break;
+                }
+                raw.push_back(cell[j]);
+            }
+            if (slot != 0) {
+                slot = cell[7];
+            }
+        }
+        return cp932ToUtf8Lossy(raw);
+    }
+
+    void syncMockTracksFromUtocCache() {
+        const auto& sec0 = utocCache[0];
+        const int nTracks = std::min<int>(sec0[0x1F], 255);
+
+        const auto prevTracks = std::move(uploadedTracks);
+        uploadedTracks.clear();
+        uploadedTracks.reserve(static_cast<std::size_t>(nTracks));
+
+        discTitleHalf = readMockTitleChain(utocCache[1], 0);
+        discTitleFull = readMockTitleChain(utocCache[4], 0);
+
+        std::uint16_t maxEndCluster = 49;
+        for (int t = 1; t <= nTracks; ++t) {
+            NetMdMockUploadedTrack trk;
+            trk.trackIndex = t - 1;
+            trk.halfWidthTitle = readMockTitleChain(utocCache[1], t);
+            trk.fullWidthTitle = readMockTitleChain(utocCache[4], t);
+            std::uint8_t slot = sec0[0x30 + static_cast<std::size_t>(t)];
+            std::array<bool, 256> seen{};
+            std::int64_t totalUnits = 0;
+            bool firstFrag = true;
+            while (slot != 0 && !seen[slot]) {
+                seen[slot] = true;
+                const std::uint8_t* f = sec0.data() + 0x130 + static_cast<std::size_t>(slot) * 8u;
+                const auto s = decodeUtocAddr(f);
+                const auto e = decodeUtocAddr(f + 4);
+                const auto modeByte = f[3];
+                if (s.cluster != 0 || s.sector != 0 || s.group != 0 || e.cluster != 0 ||
+                    e.sector != 0 || e.group != 0) {
+                    if (firstFrag) {
+                        trk.startAddr = s;
+                        trk.mode = modeFromMockUtocByte(modeByte);
+                        firstFrag = false;
+                    }
+                    trk.endAddr = e;
+                    maxEndCluster = std::max(maxEndCluster, std::max(s.cluster, e.cluster));
+                    if (e.toLinearGroup() >= s.toLinearGroup()) {
+                        totalUnits += (e.toLinearGroup() - s.toLinearGroup() + 1);
+                    }
+                }
+                slot = f[7];
+            }
+            if (trk.mode == "sp-stereo") {
+                trk.frameCount = static_cast<int>(totalUnits / 2);
+            } else if (trk.mode == "lp4") {
+                trk.frameCount = static_cast<int>(totalUnits * 2);
+            } else {
+                trk.frameCount = static_cast<int>(totalUnits);
+            }
+            for (const auto& prev : prevTracks) {
+                if (prev.startAddr.cluster == trk.startAddr.cluster &&
+                    prev.startAddr.sector == trk.startAddr.sector &&
+                    prev.startAddr.group == trk.startAddr.group &&
+                    prev.endAddr.cluster == trk.endAddr.cluster &&
+                    prev.endAddr.sector == trk.endAddr.sector &&
+                    prev.endAddr.group == trk.endAddr.group && !prev.decryptedAudioBytes.empty()) {
+                    trk.decryptedAudioBytes = prev.decryptedAudioBytes;
+                    break;
+                }
+            }
+            uploadedTracks.push_back(std::move(trk));
+        }
+        nextFreeCluster = std::max<std::uint16_t>(50, static_cast<std::uint16_t>(maxEndCluster + 1));
+    }
+
+    bool appendMockTrackToUtocCache(NetMdMockUploadedTrack& rec, std::size_t soundGroups,
+                                      std::string& error) {
+        auto& sec0 = utocCache[0];
+        const int nTracks = sec0[0x1F];
+        if (nTracks >= 255) {
+            error = "MockNetMd: track table exceeded 255 tracks.";
+            return false;
+        }
+
+        const std::uint16_t clustersNeeded =
+            static_cast<std::uint16_t>(std::max<std::size_t>(1, (soundGroups + 351u) / 352u));
+
+        // Find free slot for the new track fragment (from free list or scanning unused slots).
+        std::uint8_t newSlot = sec0[0x2F];
+        if (newSlot != 0) {
+            sec0[0x2F] = sec0[0x130 + static_cast<std::size_t>(newSlot) * 8u + 7u];
+        } else {
+            std::array<bool, 256> used{};
+            used[0] = true;
+            auto markChain = [&](std::uint8_t head) {
+                std::uint8_t s = head;
+                while (s != 0 && !used[s]) {
+                    used[s] = true;
+                    s = sec0[0x130 + static_cast<std::size_t>(s) * 8u + 7u];
+                }
+            };
+            markChain(sec0[0x2E]);
+            markChain(sec0[0x30]);
+            for (int t = 1; t <= nTracks; ++t) {
+                markChain(sec0[0x30 + static_cast<std::size_t>(t)]);
+            }
+            for (int s = 1; s < 256; ++s) {
+                if (!used[static_cast<std::size_t>(s)]) {
+                    newSlot = static_cast<std::uint8_t>(s);
+                    break;
+                }
+            }
+        }
+        if (newSlot == 0) {
+            error = "MockNetMd: no free Sector 0 fragment slot available for upload.";
+            return false;
+        }
+
+        std::uint16_t allocCluster = nextFreeCluster;
+        bool allocatedFromPfra = false;
+        std::uint8_t prevPfraSlot = 0;
+        std::uint8_t pfraSlot = sec0[0x30];
+        std::array<bool, 256> pfraSeen{};
+        while (pfraSlot != 0 && !pfraSeen[pfraSlot]) {
+            pfraSeen[pfraSlot] = true;
+            std::uint8_t* f = sec0.data() + 0x130 + static_cast<std::size_t>(pfraSlot) * 8u;
+            const auto s = decodeUtocAddr(f);
+            const auto e = decodeUtocAddr(f + 4);
+            const std::uint16_t firstWhole =
+                (s.sector == 0 && s.group == 0) ? s.cluster : static_cast<std::uint16_t>(s.cluster + 1);
+            const std::uint16_t lastWhole =
+                (e.sector == 31 && e.group == 10)
+                    ? e.cluster
+                    : (e.cluster > 0 ? static_cast<std::uint16_t>(e.cluster - 1) : 0);
+            if (lastWhole >= firstWhole &&
+                static_cast<std::uint16_t>(lastWhole - firstWhole + 1) >= clustersNeeded) {
+                allocCluster = firstWhole;
+                allocatedFromPfra = true;
+                const std::uint16_t remStart =
+                    static_cast<std::uint16_t>(firstWhole + clustersNeeded);
+                if (remStart <= e.cluster) {
+                    encodeUtocAddr(f, UtocAddress{remStart, 0, 0});
+                } else {
+                    const std::uint8_t nextLink = f[7];
+                    if (prevPfraSlot == 0) {
+                        sec0[0x30] = nextLink;
+                    } else {
+                        sec0[0x130 + static_cast<std::size_t>(prevPfraSlot) * 8u + 7u] = nextLink;
+                    }
+                    f[0] = f[1] = f[2] = f[3] = f[4] = f[5] = f[6] = 0;
+                    f[7] = sec0[0x2F];
+                    sec0[0x2F] = pfraSlot;
+                }
+                break;
+            }
+            prevPfraSlot = pfraSlot;
+            pfraSlot = f[7];
+        }
+
+        if (!allocatedFromPfra && sec0[0x30] != 0) {
+            error = "MockNetMd: insufficient free clusters in P-FRA for upload.";
+            return false;
+        }
+
+        const UtocAddress startAddr{allocCluster, 0, 0};
+        const std::size_t lastGroupOffset = (soundGroups - 1u) % 352u;
+        const UtocAddress endAddr{
+            static_cast<std::uint16_t>(allocCluster + clustersNeeded - 1u),
+            static_cast<std::uint8_t>(lastGroupOffset / 11u),
+            static_cast<std::uint8_t>(lastGroupOffset % 11u)};
+        nextFreeCluster = std::max<std::uint16_t>(
+            nextFreeCluster, static_cast<std::uint16_t>(endAddr.cluster + 1u));
+
+        rec.trackIndex = nTracks;
+        rec.startAddr = startAddr;
+        rec.endAddr = endAddr;
+
+        std::uint8_t* dst = sec0.data() + 0x130 + static_cast<std::size_t>(newSlot) * 8u;
+        encodeUtocAddr(dst, startAddr);
+        dst[3] = mockUtocModeForTrack(rec.mode);
+        encodeUtocAddr(dst + 4, endAddr);
+        dst[7] = 0;
+
+        sec0[0x30 + static_cast<std::size_t>(nTracks + 1)] = newSlot;
+        sec0[0x1E] = 1;
+        sec0[0x1F] = static_cast<std::uint8_t>(nTracks + 1);
+        uploadedTracks.push_back(rec);
+        return true;
     }
 
     void syncCacheUtocFromTracks() {
@@ -569,10 +792,76 @@ struct UsbOpenHandle {
     int interfaceNumber = 0;
     std::uint16_t vendorId = 0;
     std::uint16_t productId = 0;
+    bool hadIoError = false;
 };
 
 std::map<int, UsbOpenHandle> g_handles;
 int g_nextHandle = 1;
+
+bool isRecoverableUsbIoError(int rc) noexcept {
+    return rc == LIBUSB_ERROR_IO || rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT ||
+           rc == LIBUSB_ERROR_NO_DEVICE;
+}
+
+bool openAndClaimUsbDeviceLocked(libusb_context* ctx, const std::string& targetId, unsigned vid,
+                                 unsigned pid, libusb_device_handle** outHandle,
+                                 std::string& outErr) {
+    *outHandle = nullptr;
+    outErr.clear();
+
+    libusb_device** devs = nullptr;
+    const ssize_t cnt = libusb_get_device_list(ctx, &devs);
+    libusb_device* exactMatch = nullptr;
+    std::vector<libusb_device*> vidPidMatches;
+    for (ssize_t i = 0; i < cnt; ++i) {
+        libusb_device_descriptor desc{};
+        if (libusb_get_device_descriptor(devs[i], &desc) != 0) {
+            continue;
+        }
+        if (desc.idVendor == vid && desc.idProduct == pid) {
+            vidPidMatches.push_back(devs[i]);
+            if (formatUsbDeviceId(devs[i], desc) == targetId ||
+                formatLegacyUsbDeviceId(devs[i], desc) == targetId) {
+                exactMatch = devs[i];
+                break;
+            }
+        }
+    }
+
+    libusb_device* chosen =
+        exactMatch ? exactMatch : (vidPidMatches.size() == 1 ? vidPidMatches.front() : nullptr);
+    libusb_device_handle* usbHandle = nullptr;
+    int opened = -1;
+    if (chosen != nullptr) {
+        opened = libusb_open(chosen, &usbHandle);
+    }
+    if (devs) {
+        libusb_free_device_list(devs, 1);
+    }
+
+    if (opened != 0 || !usbHandle) {
+        if (usbHandle) {
+            libusb_close(usbHandle);
+        }
+        outErr = "Failed to open NetMD USB device " + targetId +
+                 (chosen != nullptr && opened != 0 ? (std::string(": ") + libusb_error_name(opened))
+                                                   : "");
+        return false;
+    }
+
+#ifdef LIBUSB_API_VERSION
+    libusb_set_auto_detach_kernel_driver(usbHandle, 1);
+#endif
+    const int claimRc = libusb_claim_interface(usbHandle, 0);
+    if (claimRc != 0) {
+        libusb_close(usbHandle);
+        outErr = std::string("Failed claiming USB interface 0: ") + libusb_error_name(claimRc);
+        return false;
+    }
+
+    *outHandle = usbHandle;
+    return true;
+}
 
 void ensureMockInitLocked() {
     if (!g_mockInitialized) {
@@ -1134,7 +1423,6 @@ bool handleMockVendorControlOut(const std::uint8_t* data, int len) {
             } else {
                 g_mock.discTitleHalf = titleUtf8;
             }
-            g_mock.syncCacheUtocFromTracks();
         } else {
             const bool isFull = (subObj == 0x1803);
             const std::uint16_t slot = readBe16(data + 7);
@@ -1144,7 +1432,6 @@ bool handleMockVendorControlOut(const std::uint8_t* data, int len) {
                 } else {
                     g_mock.uploadedTracks[slot].halfWidthTitle = titleUtf8;
                 }
-                g_mock.syncCacheUtocFromTracks();
             }
         }
         std::vector<std::uint8_t> r(data, data + 21);
@@ -1324,7 +1611,6 @@ bool finalizeMockBulkUpload() {
         finalAudio = std::move(decrypted);
     }
 
-    const int trackIndex = static_cast<int>(g_mock.uploadedTracks.size());
     std::size_t soundGroups = 1;
     if (modeStr == "sp-stereo" || modeStr == "sp-mono") {
         soundGroups = std::max<std::size_t>(1, finalAudio.size() / 212u);
@@ -1332,27 +1618,19 @@ bool finalizeMockBulkUpload() {
         soundGroups = std::max<std::size_t>(1, finalAudio.size() / 192u);
     }
 
-    const std::uint16_t clustersNeeded =
-        static_cast<std::uint16_t>(std::max<std::size_t>(1, (soundGroups + 351u) / 352u));
-    const UtocAddress startAddr{g_mock.nextFreeCluster, 0, 0};
-    const std::size_t lastGroupOffset = (soundGroups - 1u) % 352u;
-    const UtocAddress endAddr{
-        static_cast<std::uint16_t>(g_mock.nextFreeCluster + clustersNeeded - 1u),
-        static_cast<std::uint8_t>(lastGroupOffset / 11u),
-        static_cast<std::uint8_t>(lastGroupOffset % 11u)};
-    g_mock.nextFreeCluster = static_cast<std::uint16_t>(g_mock.nextFreeCluster + clustersNeeded);
-
     NetMdMockUploadedTrack rec;
-    rec.trackIndex = trackIndex;
     rec.mode = modeStr;
     rec.wireFormat = g_mock.pendingWireFormat;
     rec.discFormat = g_mock.pendingDiscFormat;
     rec.frameCount = g_mock.pendingFrameCount;
-    rec.startAddr = startAddr;
-    rec.endAddr = endAddr;
     rec.decryptedAudioBytes = std::move(finalAudio);
-    g_mock.uploadedTracks.push_back(std::move(rec));
-    g_mock.syncCacheUtocFromTracks();
+    std::string mockAllocErr;
+    if (!g_mock.appendMockTrackToUtocCache(rec, soundGroups, mockAllocErr)) {
+        g_mock.awaitingBulk = false;
+        setErrorLocked(mockAllocErr);
+        return false;
+    }
+    const int trackIndex = rec.trackIndex;
     g_mock.awaitingBulk = false;
 
     // Build post-bulk reply expected by netmd-interface.js:1618-1623:
@@ -1426,6 +1704,15 @@ void resetMockNetMdState() {
     std::lock_guard<std::mutex> lock(g_hostMutex);
     g_mock.resetAll();
     g_mockInitialized = true;
+}
+
+void seedMockNetMdUtoc(const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& sectors) {
+    std::lock_guard<std::mutex> lock(g_hostMutex);
+    g_mock.resetAll();
+    g_mockInitialized = true;
+    g_mock.utocCache = sectors;
+    g_mock.committedUtoc = sectors;
+    g_mock.syncMockTracksFromUtocCache();
 }
 
 NetMdMockSnapshot getMockNetMdSnapshot() {
@@ -2138,57 +2425,67 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_open(const char* device_id) {
         return -1;
     }
 
-    libusb_device** devs = nullptr;
-    const ssize_t cnt = libusb_get_device_list(ctx, &devs);
-    libusb_device* exactMatch = nullptr;
-    std::vector<libusb_device*> vidPidMatches;
-    for (ssize_t i = 0; i < cnt; ++i) {
-        libusb_device_descriptor desc{};
-        if (libusb_get_device_descriptor(devs[i], &desc) != 0) {
-            continue;
-        }
-        if (desc.idVendor == vid && desc.idProduct == pid) {
-            vidPidMatches.push_back(devs[i]);
-            if (carta::formatUsbDeviceId(devs[i], desc) == targetId ||
-                carta::formatLegacyUsbDeviceId(devs[i], desc) == targetId) {
-                exactMatch = devs[i];
-                break;
-            }
-        }
-    }
-
-    libusb_device* chosen =
-        exactMatch ? exactMatch : (vidPidMatches.size() == 1 ? vidPidMatches.front() : nullptr);
     libusb_device_handle* usbHandle = nullptr;
-    int opened = -1;
-    if (chosen != nullptr) {
-        opened = libusb_open(chosen, &usbHandle);
-    }
-    if (devs) {
-        libusb_free_device_list(devs, 1);
-    }
-
-    if (opened != 0 || !usbHandle) {
-        if (usbHandle) {
-            libusb_close(usbHandle);
-        }
+    std::string openErr;
+    if (!carta::openAndClaimUsbDeviceLocked(ctx, targetId, vid, pid, &usbHandle, openErr)) {
         libusb_exit(ctx);
-        carta::setErrorLocked("Failed to open NetMD USB device " + targetId +
-                              (chosen != nullptr && opened != 0
-                                   ? (std::string(": ") + libusb_error_name(opened))
-                                   : ""));
+        carta::setErrorLocked(openErr);
         return -1;
     }
 
-#ifdef LIBUSB_API_VERSION
-    libusb_set_auto_detach_kernel_driver(usbHandle, 1);
-#endif
-    const int claimRc = libusb_claim_interface(usbHandle, 0);
-    if (claimRc != 0) {
+    // Read-only NetMD EP0 health check (0xC1 0x01 getReplyLength). If a prior session or
+    // hardware wake left EP0 wedged (e.g. Darwin kIOReturnNotResponding / LIBUSB_ERROR_IO),
+    // resetting and reopening the USB port clears the condition without touching the disc.
+    std::uint8_t probeBuf[4]{};
+    const uint8_t probeReq = static_cast<uint8_t>(
+        LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE);
+    int probeRc = libusb_control_transfer(usbHandle, probeReq, 0x01, 0, 0, probeBuf,
+                                          static_cast<uint16_t>(sizeof(probeBuf)), 2000);
+    if (probeRc < 0 && carta::isRecoverableUsbIoError(probeRc)) {
+        (void)libusb_reset_device(usbHandle);
+        libusb_release_interface(usbHandle, 0);
+        libusb_close(usbHandle);
+        usbHandle = nullptr;
+        libusb_exit(ctx);
+        ctx = nullptr;
+
+        bool recovered = false;
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(attempt == 0 ? 450 : 250));
+            if (libusb_init(&ctx) != 0 || !ctx) {
+                ctx = nullptr;
+                continue;
+            }
+            std::string retryErr;
+            if (!carta::openAndClaimUsbDeviceLocked(ctx, targetId, vid, pid, &usbHandle,
+                                                    retryErr)) {
+                libusb_exit(ctx);
+                ctx = nullptr;
+                continue;
+            }
+            probeRc = libusb_control_transfer(usbHandle, probeReq, 0x01, 0, 0, probeBuf,
+                                              static_cast<uint16_t>(sizeof(probeBuf)), 2000);
+            if (probeRc >= 0) {
+                recovered = true;
+                break;
+            }
+            libusb_release_interface(usbHandle, 0);
+            libusb_close(usbHandle);
+            usbHandle = nullptr;
+            libusb_exit(ctx);
+            ctx = nullptr;
+        }
+        if (!recovered) {
+            carta::setErrorLocked("NetMD USB device not responding after port reset: " +
+                                  std::string(libusb_error_name(probeRc)));
+            return -1;
+        }
+    } else if (probeRc < 0) {
+        libusb_release_interface(usbHandle, 0);
         libusb_close(usbHandle);
         libusb_exit(ctx);
-        carta::setErrorLocked(std::string("Failed claiming USB interface 0: ") +
-                              libusb_error_name(claimRc));
+        carta::setErrorLocked(std::string("USB control IN failed: ") + libusb_error_name(probeRc));
         return -1;
     }
 
@@ -2214,6 +2511,9 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_close(int handle) {
         carta::g_mock.open = false;
     } else {
         if (it->second.usbHandle) {
+            if (it->second.hadIoError) {
+                (void)libusb_reset_device(it->second.usbHandle);
+            }
             libusb_release_interface(it->second.usbHandle, it->second.interfaceNumber);
             libusb_close(it->second.usbHandle);
         }
@@ -2293,6 +2593,9 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_control_out(int handle, int req
                                 static_cast<uint16_t>(value), static_cast<uint16_t>(index),
                                 const_cast<unsigned char*>(data), static_cast<uint16_t>(len), 30000);
     if (rc < 0) {
+        if (rc == LIBUSB_ERROR_IO || rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT) {
+            it->second.hadIoError = true;
+        }
         carta::setErrorLocked(std::string("USB control OUT failed: ") + libusb_error_name(rc));
         return -1;
     }
@@ -2339,6 +2642,9 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_control_in(int handle, int requ
         it->second.usbHandle, bmReq, static_cast<uint8_t>(request), static_cast<uint16_t>(value),
         static_cast<uint16_t>(index), out, static_cast<uint16_t>(max_len), 30000);
     if (rc < 0) {
+        if (rc == LIBUSB_ERROR_IO || rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT) {
+            it->second.hadIoError = true;
+        }
         carta::setErrorLocked(std::string("USB control IN failed: ") + libusb_error_name(rc));
         return -1;
     }
@@ -2388,6 +2694,9 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_out(int handle, int endpoi
                                             const_cast<unsigned char*>(data + totalSent), chunkLen,
                                             &transferred, 120000);
         if (rc != 0 || transferred <= 0) {
+            if (rc == LIBUSB_ERROR_IO || rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT) {
+                it->second.hadIoError = true;
+            }
             carta::setErrorLocked(std::string("USB bulk OUT failed: ") + libusb_error_name(rc));
             return -1;
         }
@@ -2416,6 +2725,9 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_in(int handle, int endpoin
     const int rc =
         libusb_bulk_transfer(it->second.usbHandle, ep, out, max_len, &transferred, 30000);
     if (rc != 0) {
+        if (rc == LIBUSB_ERROR_IO || rc == LIBUSB_ERROR_PIPE || rc == LIBUSB_ERROR_TIMEOUT) {
+            it->second.hadIoError = true;
+        }
         carta::setErrorLocked(std::string("USB bulk IN failed: ") + libusb_error_name(rc));
         return -1;
     }

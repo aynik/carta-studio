@@ -1031,6 +1031,18 @@ bool trimTracksToRange(Session&, const TimeSelection&, juce::String& error);
 /** Preserve markers that were inside the master before a content-only edit. */
 bool preservesMarkerBounds(const Session& before, const Session& after, juce::String& error);
 
+/**
+ * Ensures every locked on-disc audio clip remains intact at the same track and geometry/envelope,
+ * and no non-locked local clip overlaps any locked on-disc region.
+ */
+bool preservesOnDiscAudio(const Session& before, const Session& after, juce::String& error);
+
+/**
+ * Populates a clean `Session` representing a loaded MiniDisc with locked placeholder clips for each
+ * physical on-disc region on Track 0 (`"MiniDisc"`).
+ */
+void populateLoadedDiscSession(const MdDisc& loadedDisc, Session& session);
+
 // Preserve linked group identities across a prepared timeline edit. The
 // candidate may be adjusted when an implicit first track gains a marker.
 /** Split all clips crossing either range endpoint on the selected tracks. */

@@ -313,6 +313,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         bool hasTimestamp = false;
         int partCount = 0;
         bool sharesPhysicalSpan = false;
+        bool onDisc = false;
         juce::int64 totalSamples = 0;
         juce::int64 firstStartSample = 0;
         juce::int64 firstEndSample = 0;
@@ -344,6 +345,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         int spanClusterEnd = 0;
         int spanRefCount = 0;
         bool sharesPhysicalSpan = false;
+        bool onDisc = false;
     };
 
     /** Device, preflight, and live operation status pushed by the parent Studio window. */
@@ -354,6 +356,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         carta::NetMdDeviceStatus deviceStatus;
         juce::String badgeText;
         juce::String statusText;
+        bool canLoadDisc = false;
         bool canReadToc = false;
         bool canErase = false;
         bool canWriteUtoc = false;
@@ -382,6 +385,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     std::function<void()> onExportUtoc;
     std::function<void()> onRefreshRecord;
     std::function<void()> onRecordPreflight;
+    std::function<void()> onLoadDisc;
     std::function<void()> onReadDiscToc;
     std::function<void()> onEraseDisc;
     std::function<void()> onRecordWriteUtoc;
@@ -590,6 +594,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::Label recordBadgeLabel;
     DeviceTrackListModel deviceTrackModel;
     juce::ListBox deviceTrackList;
+    juce::TextButton loadDiscButton{"Load Disc"};
     juce::TextButton readDiscTocButton{"Read Disc TOC..."};
     juce::TextButton eraseDiscButton{"Erase Disc..."};
     juce::Label planCardTitle;
@@ -598,5 +603,5 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::ListBox planList;
     juce::Label recordStatusLabel;
     juce::TextButton writeUtocButton{"Write UTOC Only..."};
-    juce::TextButton recordDiscButton{"Erase & Record MiniDisc..."};
+    juce::TextButton recordDiscButton{"Record MiniDisc..."};
 };

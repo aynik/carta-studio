@@ -107,6 +107,7 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     discWorkspace.onReviewWav = [this] { startDiscProgramWavExport(); };
     discWorkspace.onRefreshRecord = [this] { refreshRecordWorkspace(true); };
     discWorkspace.onRecordPreflight = [this] { triggerRecordProbeFromUi(); };
+    discWorkspace.onLoadDisc = [this] { triggerLoadDiscFromUi(); };
     discWorkspace.onReadDiscToc = [this] { triggerReadDiscTocFromUi(); };
     discWorkspace.onEraseDisc = [this] { triggerEraseDiscFromUi(); };
     discWorkspace.onRecordWriteUtoc = [this] { triggerRecordWriteUtocFromUi(); };

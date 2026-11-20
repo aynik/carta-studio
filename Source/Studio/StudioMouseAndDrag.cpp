@@ -1099,6 +1099,26 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
 
         if (hit >= 0) {
             groupDragClips = std::move(chosen);
+            bool lockedClipInGroup = false;
+            for (const auto& ref : groupDragClips) {
+                if (ref.track >= 0 && ref.track < static_cast<int>(session.tracks.size())) {
+                    const auto& trClips = session.tracks[static_cast<size_t>(ref.track)].clips;
+                    if (ref.clip >= 0 && ref.clip < static_cast<int>(trClips.size()) &&
+                        trClips[static_cast<size_t>(ref.clip)].lockedOnDisc) {
+                        lockedClipInGroup = true;
+                        break;
+                    }
+                }
+            }
+            if (lockedClipInGroup) {
+                groupDragClips.clear();
+                restoreGestureClipSelection();
+                status.setText("On-disc audio clips are locked (read-only until downloaded). "
+                               "Split tracks or edit metadata in the MiniDisc panel.",
+                               juce::dontSendNotification);
+                repaint();
+                return;
+            }
             groupDragGeneration = editGeneration;
             groupEdgeEnd = endEdge;
             groupDragAnchorTrack = track;
@@ -1250,6 +1270,15 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
     // 9. Fade handles, time-selection edges, clip body time selection, or clip move/trim.
     const int fade = fadeHandleAt(e.getPosition());
     if (fade != 0 && !e.mods.isAltDown() && !e.mods.isCommandDown()) {
+        if (session.tracks[static_cast<size_t>(selectedTrack)]
+                .clips[static_cast<size_t>(selectedClip)]
+                .lockedOnDisc) {
+            timelineClipSelection = std::move(previousClipSelection);
+            status.setText("On-disc audio clips are locked; fades cannot be edited until audio "
+                           "is downloaded.",
+                           juce::dontSendNotification);
+            return;
+        }
         selectionBeforeClips = std::move(previousClipSelection);
         selectionClipSnapshotValid = true;
         dragOriginal = session.tracks[static_cast<size_t>(selectedTrack)]
@@ -1429,9 +1458,20 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
         }
 
         const int i = chosen;
+        selectedClip = i;
+        if (clips[static_cast<size_t>(i)].lockedOnDisc) {
+            selectionClipSnapshotValid = false;
+            dragMode = kDragNone;
+            copyGestureCandidate = false;
+            status.setText("Selected on-disc clip " +
+                               carta::clipDisplayName(clips[static_cast<size_t>(i)]) +
+                               " (locked read-only until downloaded).",
+                           juce::dontSendNotification);
+            repaint();
+            return;
+        }
         selectionBeforeClips = std::move(previousClipSelection);
         selectionClipSnapshotValid = true;
-        selectedClip = i;
         const auto rect = clipRect(clips[static_cast<size_t>(i)], t);
         dragMode = e.x < rect.getX() + kClipEdgeHitPx       ? kDragClipTrimLeft
                    : e.x > rect.getRight() - kClipEdgeHitPx ? kDragClipTrimRight
@@ -2158,7 +2198,8 @@ void Studio::mouseUp(const juce::MouseEvent& e) {
                 }
             }
             allowed =
-                proposed && (stable || carta::preservesMarkerBounds(dragBefore, *proposed, error));
+                proposed && carta::preservesOnDiscAudio(dragBefore, *proposed, error) &&
+                (stable || carta::preservesMarkerBounds(dragBefore, *proposed, error));
             if (allowed) {
                 range = stable && masterRangeValid && masterRangeRevision == generation
                             ? masterRange
@@ -2692,6 +2733,9 @@ void Studio::finishGroupDrag(juce::Point<int> point) {
                            : carta::prepareClipGroupMove(session, candidate, groupDragClips,
                                                          groupDragSamples, groupDragTracks, error,
                                                          &movedRefs);
+            if (prepared && !carta::preservesOnDiscAudio(session, candidate, error)) {
+                prepared = false;
+            }
             if (prepared) {
                 prepared = nextSelection.restore(candidate, movedRefs, editGeneration + 1);
                 if (!prepared) {

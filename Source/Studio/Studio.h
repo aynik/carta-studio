@@ -562,7 +562,7 @@ class Studio final : public juce::AudioAppComponent,
      */
     template <class F>
     bool mutate(F f, juce::String* rejection, juce::String action, bool retainSelection = false,
-                bool renderGeometryStable = false) {
+                bool renderGeometryStable = false, bool allowOnDiscMutation = false) {
         const juce::ScopedLock guard(lock);
         if (dragMode != kDragNone) {
             const juce::String message = "Finish or cancel the current drag first.";
@@ -579,7 +579,8 @@ class Studio final : public juce::AudioAppComponent,
         bool changed = f();
         if (changed) {
             juce::String error;
-            if (renderGeometryStable || carta::preservesMarkerBounds(old.session, session, error)) {
+            if ((allowOnDiscMutation || carta::preservesOnDiscAudio(old.session, session, error)) &&
+                (renderGeometryStable || carta::preservesMarkerBounds(old.session, session, error))) {
                 pushHistory(std::move(old), std::move(action), renderGeometryStable);
                 if (retainSelection) {
                     retainIndexStableSelections(previousGeneration);
@@ -610,7 +611,8 @@ class Studio final : public juce::AudioAppComponent,
      */
     template <class Prepare, class Publish>
     bool prepareRangeSessionEdit(Prepare prepare, Publish publish, juce::String action,
-                                 juce::String& error, bool renderGeometryStable = false) {
+                                 juce::String& error, bool renderGeometryStable = false,
+                                 bool allowOnDiscMutation = false) {
         const auto generation = editGeneration;
         carta::Session candidate;
         carta::PlaybackRange candidateRange;
@@ -625,7 +627,9 @@ class Studio final : public juce::AudioAppComponent,
             }
 #endif
             candidate = session;
-            changed = prepare(candidate);
+            changed = prepare(candidate) &&
+                      (allowOnDiscMutation ||
+                       carta::preservesOnDiscAudio(session, candidate, error));
             if (changed) {
                 candidateRange =
                     renderGeometryStable && masterRangeValid && masterRangeRevision == generation
@@ -938,6 +942,11 @@ class Studio final : public juce::AudioAppComponent,
             netMdPendingAlertTitle.clear();
             netMdPendingAlertBody.clear();
             netMdPendingPreflight.reset();
+            netMdPendingLoadedDisc.reset();
+            netMdPendingHasCommittedRaw = false;
+            netMdPendingCommittedHash.clear();
+            netMdPendingNeedsReload = false;
+            netMdPendingShowLoadAlerts = true;
         }
         netMdDonePending.store(false);
         carta::setNetMdProgress(op, initialPhase, 0.0);
@@ -974,15 +983,18 @@ class Studio final : public juce::AudioAppComponent,
                                            bool hiMd, const carta::MdDisc* committedDisc = nullptr);
     void startNetMdReadUtocJob(const std::string& devId, const juce::File& outFile,
                                const juce::String& outPath, bool showPopup);
+    void startNetMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
     void startNetMdEraseJob(const std::string& devId, bool confirmHardware);
     void startNetMdWriteUtocJob(const carta::Session& snapshot, const std::string& devId,
                                 bool confirmHardware);
     void startNetMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
                              bool confirmHardware);
+    bool applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& error);
     void pollNetMdJobProgress();
     void refreshRecordWorkspace(bool scanDevices);
     void triggerRecordProbeFromUi();
     void triggerReadDiscTocFromUi();
+    void triggerLoadDiscFromUi();
     void triggerEraseDiscFromUi();
     void triggerRecordWriteUtocFromUi();
     void triggerRecordStartFromUi();
@@ -1432,6 +1444,13 @@ class Studio final : public juce::AudioAppComponent,
     juce::String netMdPendingAlertTitle;
     juce::String netMdPendingAlertBody;
     std::optional<carta::NetMdPreflightReport> netMdPendingPreflight;
+    std::optional<carta::MdDisc> netMdPendingLoadedDisc;
+    std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5>
+        netMdPendingCommittedRawSectors{};
+    bool netMdPendingHasCommittedRaw = false;
+    std::string netMdPendingCommittedHash;
+    bool netMdPendingNeedsReload = false;
+    bool netMdPendingShowLoadAlerts = true;
     juce::File workspaceSettingsFile;
     carta::WorkspacePreferences lastWorkspacePreferences;
     juce::String discWorkspaceAudioError;

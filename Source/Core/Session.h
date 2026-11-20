@@ -150,23 +150,44 @@ struct Audio {
     // its budget reservation instead of duplicating peak payload.
     std::shared_ptr<WaveformPeakCache> peakCache = std::make_shared<WaveformPeakCache>();
     std::shared_ptr<MappedPcm> mapped;
+    bool onDiscPlaceholder = false;
+    int placeholderChannels = 0;
+    int placeholderFrames = 0;
+
+    bool hasPcm() const noexcept {
+        return !onDiscPlaceholder &&
+               (mapped ? mapped->channels > 0 && mapped->frames > 0
+                       : samples.getNumChannels() > 0 && samples.getNumSamples() > 0);
+    }
 
     int numChannels() const noexcept {
-        return mapped ? mapped->channels : samples.getNumChannels();
+        return onDiscPlaceholder ? placeholderChannels
+                                 : (mapped ? mapped->channels : samples.getNumChannels());
     }
-    int numSamples() const noexcept { return mapped ? mapped->frames : samples.getNumSamples(); }
+    int numSamples() const noexcept {
+        return onDiscPlaceholder ? placeholderFrames
+                                 : (mapped ? mapped->frames : samples.getNumSamples());
+    }
 
     const float* channelData(int channel) const noexcept {
+        if (onDiscPlaceholder) {
+            return nullptr;
+        }
         return mapped ? static_cast<const float*>(mapped->mapping->getData()) +
                             static_cast<size_t>(channel) * static_cast<size_t>(mapped->frames)
                       : samples.getReadPointer(channel);
     }
 
     juce::Range<float> minMax(int channel, int start, int count) const noexcept {
-        return juce::FloatVectorOperations::findMinAndMax(channelData(channel) + start, count);
+        if (onDiscPlaceholder || count <= 0) {
+            return {};
+        }
+        const auto* data = channelData(channel);
+        return data ? juce::FloatVectorOperations::findMinAndMax(data + start, count)
+                    : juce::Range<float>{};
     }
 
-    double length() const { return numSamples() / sampleRate; }
+    double length() const { return sampleRate > 0 ? numSamples() / sampleRate : 0.0; }
 };
 
 /**
@@ -216,6 +237,8 @@ struct Clip {
     juce::String groupId{}; // Empty means ungrouped; otherwise 32 lowercase hexadecimal digits.
     FadeShape fadeInShape = FadeShape::linear;
     FadeShape fadeOutShape = FadeShape::linear;
+    bool lockedOnDisc = false;
+    std::string onDiscRegionId{};
 };
 
 inline bool validClipGroupId(const juce::String& id) noexcept {

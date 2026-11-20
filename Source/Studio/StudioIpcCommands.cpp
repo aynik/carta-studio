@@ -58,8 +58,10 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
     carta::UtocDiscState utoc;
     std::string utocErr;
     const bool utocOk = carta::compileMdDiscToUtoc(d, utoc, utocErr);
-    const auto budget = utocOk ? carta::computeUtocBudget(utoc, carta::mdMediumToString(d.medium))
-                               : carta::UtocBudget{};
+    const int physTotal = d.loadedDisc.active ? d.loadedDisc.physicalTotalClusters() : 0;
+    const auto budget =
+        utocOk ? carta::computeUtocBudget(utoc, carta::mdMediumToString(d.medium), physTotal)
+               : carta::UtocBudget{};
 
     auto* b = buildUtocBudgetObject(budget);
 
@@ -101,6 +103,11 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
     planObj->setProperty("uncoalesced_clusters", plan.uncoalescedClusters);
     planObj->setProperty("saved_clusters", plan.savedClusters);
     planObj->setProperty("total_clusters", plan.totalClusters);
+    planObj->setProperty("on_disc_clusters", plan.onDiscClusters);
+    planObj->setProperty("new_upload_clusters", plan.newUploadClusters);
+    planObj->setProperty("reclaimed_clusters", plan.reclaimedClusters);
+    planObj->setProperty("initial_free_clusters", plan.initialFreeClusters);
+    planObj->setProperty("free_clusters_after_reclaim", plan.freeClustersAfterReclaim);
     planObj->setProperty("logical_play_samples", static_cast<juce::int64>(plan.logicalPlaySamples));
     planObj->setProperty("unique_physical_samples",
                          static_cast<juce::int64>(plan.uniquePhysicalSamples));
@@ -164,8 +171,26 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
     root->setProperty("plan_error", juce::String::fromUTF8(planErr.c_str()));
     root->setProperty("utoc_valid", utocOk);
     root->setProperty("utoc_error", juce::String::fromUTF8(utocErr.c_str()));
+    auto* loadedObj = new juce::DynamicObject();
+    loadedObj->setProperty("active", d.loadedDisc.active);
+    loadedObj->setProperty("source_device_id",
+                           juce::String::fromUTF8(d.loadedDisc.sourceDeviceId.c_str()));
+    loadedObj->setProperty("baseline_sector0_hash",
+                           juce::String::fromUTF8(d.loadedDisc.baselineSector0Hash.c_str()));
+    loadedObj->setProperty("physical_start_cluster",
+                           static_cast<int>(d.loadedDisc.physicalStartCluster));
+    loadedObj->setProperty("physical_last_cluster",
+                           static_cast<int>(d.loadedDisc.physicalLastCluster));
+    loadedObj->setProperty("physical_total_clusters", d.loadedDisc.physicalTotalClusters());
+    loadedObj->setProperty("region_count", static_cast<int>(d.loadedDisc.regions.size()));
+    loadedObj->setProperty("initial_free_range_count",
+                           static_cast<int>(d.loadedDisc.initialFreeRanges.size()));
+    loadedObj->setProperty("defective_range_count",
+                           static_cast<int>(d.loadedDisc.defectiveRanges.size()));
+
     root->setProperty("budget", juce::var(b));
     root->setProperty("physical_plan", juce::var(planObj));
+    root->setProperty("loaded_disc", juce::var(loadedObj));
     root->setProperty("tracks", juce::var(tracksArr));
     root->setProperty("groups", juce::var(groupsArr));
     return juce::var(root);
@@ -346,6 +371,7 @@ juce::var handleSchemaCommand(const juce::StringArray& args) {
     domains->setProperty("netmd",
                          makeDomain("USB NetMD & Type-S / Hi-MD hardware bridge",
                                     {"netmd devices", "netmd status", "netmd preflight [DEVICE_ID]",
+                                     "netmd load-disc [DEVICE_ID]",
                                      "netmd read-utoc [DEVICE_ID] [--out FILE]",
                                      "netmd erase [DEVICE_ID] [confirm-hardware]",
                                      "netmd write-utoc [DEVICE_ID] [confirm-hardware]",
@@ -596,15 +622,40 @@ struct Studio::IpcRouter {
                 return fail("MD track index out of range.");
             }
             auto nextTr = d.tracks[static_cast<size_t>(idx)];
-            if (args[4] == "clear") {
-                nextTr.codecOverride.reset();
-            } else if (args[4] != "keep") {
-                carta::MdCodecMode m = d.defaultCodec;
-                if (!carta::parseMdCodecMode(args[4].toStdString(), m)) {
-                    return fail(
-                        "Track codec must be sp-stereo, sp-mono, lp2, lp4, clear, or keep.");
+            const bool isOnDisc = carta::mdTrackUsesOnDiscAudio(d, nextTr);
+            const auto currentEffCodec = carta::effectiveTrackCodec(d, nextTr);
+            if (isOnDisc) {
+                if (args[4] == "clear") {
+                    if (d.defaultCodec != currentEffCodec) {
+                        return fail(
+                            "Cannot change encoding codec of an on-disc track without "
+                            "re-encoding.");
+                    }
+                    nextTr.codecOverride = currentEffCodec;
+                } else if (args[4] != "keep") {
+                    carta::MdCodecMode m = d.defaultCodec;
+                    if (!carta::parseMdCodecMode(args[4].toStdString(), m)) {
+                        return fail(
+                            "Track codec must be sp-stereo, sp-mono, lp2, lp4, clear, or keep.");
+                    }
+                    if (m != currentEffCodec) {
+                        return fail(
+                            "Cannot change encoding codec of an on-disc track without "
+                            "re-encoding.");
+                    }
+                    nextTr.codecOverride = currentEffCodec;
                 }
-                nextTr.codecOverride = m;
+            } else {
+                if (args[4] == "clear") {
+                    nextTr.codecOverride.reset();
+                } else if (args[4] != "keep") {
+                    carta::MdCodecMode m = d.defaultCodec;
+                    if (!carta::parseMdCodecMode(args[4].toStdString(), m)) {
+                        return fail(
+                            "Track codec must be sp-stereo, sp-mono, lp2, lp4, clear, or keep.");
+                    }
+                    nextTr.codecOverride = m;
+                }
             }
             auto parseBoolOpt = [](const juce::String& tok, bool& target, std::string& errOut,
                                    const char* label) {
@@ -4489,9 +4540,9 @@ struct Studio::IpcRouter {
 
     static juce::var handleNetMd(Studio& studio, const juce::StringArray& args) {
         if (args.size() < 2) {
-            return ipcReply(
-                false,
-                "Usage: netmd devices|status|preflight|read-utoc|erase|write-utoc|record ...");
+            return ipcReply(false,
+                            "Usage: netmd devices|status|preflight|load-disc|read-utoc|erase|"
+                            "write-utoc|record ...");
         }
         const auto sub = args[1];
         if (sub == "devices") {
@@ -4587,12 +4638,38 @@ struct Studio::IpcRouter {
             root->setProperty("can_record", report.canRecord);
             root->setProperty("unique_upload_segments", report.uniqueUploadSegments);
             root->setProperty("logical_tracks", report.logicalTracks);
+            root->setProperty("has_loaded_disc", report.hasLoadedDisc);
+            root->setProperty("preserved_on_disc_tracks", report.preservedOnDiscTracks);
+            root->setProperty("on_disc_clusters", report.onDiscClusters);
+            root->setProperty("new_upload_clusters", report.newUploadClusters);
+            root->setProperty("reclaimed_clusters", report.reclaimedClusters);
+            root->setProperty("needs_pre_upload_reclaim", report.needsPreUploadReclaim);
             root->setProperty("exploit_badge", juce::String::fromUTF8(report.exploitBadge.c_str()));
             root->setProperty("status", juce::String::fromUTF8(report.statusText.c_str()));
             root->setProperty("blocker", juce::String::fromUTF8(report.blocker.c_str()));
             root->setProperty("summary", juce::String::fromUTF8(report.summary.c_str()));
             root->setProperty("device", juce::var(devObj));
             root->setProperty("budget", juce::var(budgetObj));
+            return ipcReply(true, juce::var(root));
+        }
+        if (sub == "load-disc") {
+            if (args.size() > 3) {
+                return ipcReply(false, "Usage: netmd load-disc [DEVICE_ID]");
+            }
+            if (studio.netMdBusy.load()) {
+                return ipcReply(false, "Wait for the active NetMD hardware operation to finish.");
+            }
+            std::string resolveErr;
+            const std::string devId = studio.resolveActiveNetMdDeviceId(
+                args.size() == 3 ? args[2] : juce::String(), resolveErr);
+            if (devId.empty()) {
+                return ipcReply(false, juce::String::fromUTF8(resolveErr.c_str()));
+            }
+            studio.startNetMdLoadDiscJob(devId, false);
+            auto* root = new juce::DynamicObject();
+            root->setProperty("started", true);
+            root->setProperty("operation", "load-disc");
+            root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
             return ipcReply(true, juce::var(root));
         }
         if (sub == "read-utoc") {
@@ -4701,6 +4778,11 @@ struct Studio::IpcRouter {
                     const auto masterSamples = carta::projectEndSample(snapshot);
                     for (size_t ti = 0; ti < snapshot.mdDisc.tracks.size(); ++ti) {
                         for (const auto& part : snapshot.mdDisc.tracks[ti].parts) {
+                            if (snapshot.mdDisc.loadedDisc.active &&
+                                carta::findMdOnDiscRegionForPart(snapshot.mdDisc.loadedDisc, part) >=
+                                    0) {
+                                continue;
+                            }
                             if (part.startSample < 0 || part.endSample <= part.startSample ||
                                 part.endSample > masterSamples) {
                                 return ipcReply(false,
@@ -4718,8 +4800,9 @@ struct Studio::IpcRouter {
             root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
             return ipcReply(true, juce::var(root));
         }
-        return ipcReply(
-            false, "Usage: netmd devices|status|preflight|read-utoc|erase|write-utoc|record ...");
+        return ipcReply(false,
+                        "Usage: netmd devices|status|preflight|load-disc|read-utoc|erase|"
+                        "write-utoc|record ...");
     }
 
     static juce::var handleStatus(Studio& studio) {

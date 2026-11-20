@@ -2653,15 +2653,42 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
     const bool selected = clipAppearsSelected(t, index);
     const int trackZoom =
         carta::trackWaveformZoom(session.tracks[static_cast<size_t>(t)], waveformVerticalZoom);
-    g.setColour((dark ? (selected ? juce::Colour(0xff8b8b8b) : juce::Colour(0xff666666))
-                      : (selected ? juce::Colour(0xff888888) : juce::Colour(0xffaaaaaa)))
-                    .withAlpha(0.56f));
-    g.fillRect(rect);
+    if (c.lockedOnDisc) {
+        g.setColour((dark ? (selected ? juce::Colour(0xff2b5968) : juce::Colour(0xff1e414d))
+                          : (selected ? juce::Colour(0xff6b9aa8) : juce::Colour(0xff89b2bf)))
+                        .withAlpha(0.65f));
+        g.fillRect(rect);
+        g.setColour(dark ? juce::Colour(0xff4dd0e1).withAlpha(0.80f)
+                         : juce::Colour(0xff00796b).withAlpha(0.85f));
+        g.fillRect(rect.getX(), rect.getY(), rect.getWidth(), 2);
+    } else {
+        g.setColour((dark ? (selected ? juce::Colour(0xff8b8b8b) : juce::Colour(0xff666666))
+                          : (selected ? juce::Colour(0xff888888) : juce::Colour(0xffaaaaaa)))
+                        .withAlpha(0.56f));
+        g.fillRect(rect);
+    }
 
     const int header = std::min(titleHeight, std::max(0, rect.getHeight() - 8));
     const auto content = rect.withTrimmedTop(header);
     if (session.tracks[static_cast<size_t>(t)].collapsed) {
         // Keep the clip title and selection outline without drawing its lanes.
+    } else if (c.audio && c.audio->onDiscPlaceholder) {
+        if (content.getHeight() > 6 && visible.getWidth() > 24) {
+            const int midY = content.getCentreY();
+            g.setColour(
+                (dark ? juce::Colour(0xff4dd0e1) : juce::Colour(0xff00695c)).withAlpha(0.28f));
+            g.drawHorizontalLine(midY, static_cast<float>(visible.getX()),
+                                 static_cast<float>(visible.getRight()));
+            if (visible.getWidth() > 54 && content.getHeight() > 14) {
+                g.setColour(
+                    (dark ? juce::Colour(0xffb2ebf2) : juce::Colour(0xff004d40)).withAlpha(0.85f));
+                g.setFont(juce::FontOptions(10.5f));
+                const juce::String label =
+                    visible.getWidth() >= 150 ? "On-Disc Audio (UTOC loaded)" : "On-Disc";
+                g.drawText(label, content.getIntersection(visible).reduced(6, 0),
+                           juce::Justification::centredLeft, true);
+            }
+        }
     } else {
         const auto layout = carta::trackViewLayout(
             content.getHeight(), session.tracks[static_cast<size_t>(t)].view, spectrumView);
@@ -2883,7 +2910,8 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
         }
     }
 
-    if (!session.tracks[static_cast<size_t>(t)].collapsed && content.getHeight() > 4) {
+    if (!c.lockedOnDisc && !session.tracks[static_cast<size_t>(t)].collapsed &&
+        content.getHeight() > 4) {
         const float topY = static_cast<float>(content.getY());
         const float bottomY = static_cast<float>(content.getBottom());
         const auto drawFadeOverlay = [&](double segStart, double segDuration,
@@ -2948,7 +2976,7 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
         g.setColour((dark ? juce::Colours::white : juce::Colours::black).withAlpha(0.8f));
         g.drawRect(rect, 1);
     }
-    if (t == selectedTrack && index == selectedClip &&
+    if (!c.lockedOnDisc && t == selectedTrack && index == selectedClip &&
         !session.tracks[static_cast<size_t>(t)].collapsed) {
         const auto grips = clipTrimGripBounds(rect);
         g.setColour((dark ? juce::Colours::white : juce::Colours::black).withAlpha(0.85f));
@@ -2992,7 +3020,8 @@ void Studio::drawTitle(juce::Graphics& g, const carta::Clip& c, int track,
         g.drawRect(title.reduced(2), 1);
     }
     g.setFont(juce::FontOptions(11.0f));
-    g.drawText((c.groupId.isNotEmpty() ? juce::String::fromUTF8("◇ ") : juce::String()) +
+    g.drawText((c.lockedOnDisc ? juce::String("[MD] ") : juce::String()) +
+                   (c.groupId.isNotEmpty() ? juce::String::fromUTF8("◇ ") : juce::String()) +
                    carta::clipDisplayName(c),
                title.reduced(5, 0), juce::Justification::centredLeft, true);
 }

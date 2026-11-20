@@ -910,7 +910,7 @@ bool listNetMdDevicesUnlocked(std::vector<NetMdDeviceEntry>& out, std::string& e
 }
 
 bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& out,
-                              std::string& error) {
+                              std::string& error, bool includeTracks = true) {
     out = {};
     error.clear();
     if (deviceId.empty()) {
@@ -918,9 +918,15 @@ bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& ou
         return false;
     }
 
+    std::vector<std::string> cli = {"probe", deviceId};
+    if (!includeTracks) {
+        cli.push_back("--no-tracks");
+    }
+    const std::string sess =
+        "probe\t" + percentEncode(deviceId) + (includeTracks ? "\t1" : "\t0");
+
     juce::var resObj;
-    if (!invokeNetMdHelperUnlocked({"probe", deviceId}, "probe\t" + percentEncode(deviceId),
-                                   HelperProgressWindow{}, resObj, error)) {
+    if (!invokeNetMdHelperUnlocked(cli, sess, HelperProgressWindow{}, resObj, error)) {
         return false;
     }
     const auto* root = resObj.getDynamicObject();
@@ -1047,7 +1053,7 @@ bool validatePhysicalUtocClusters(const UtocDiscState& utoc, std::string& error)
                 frag.end.cluster < frag.start.cluster) {
                 error = "Refusing to write virtual/invalid UTOC cluster address (cluster " +
                         std::to_string(frag.start.cluster) +
-                        " < 50) to physical MiniDisc. Use Erase & Record MiniDisc or import UTOC "
+                        " < 50) to physical MiniDisc. Use Record MiniDisc or import UTOC "
                         "directly from the disc.";
                 return false;
             }
@@ -1057,40 +1063,54 @@ bool validatePhysicalUtocClusters(const UtocDiscState& utoc, std::string& error)
     return true;
 }
 
+bool prepareWriteSectorBundle(
+    const UtocDiscState& utocState,
+    const std::array<std::uint8_t, kUtocSectorBytes>* preservedSector3,
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& outRawSectors, int& outSectorMask,
+    std::string& outSector0Hash, std::string& error) {
+    for (auto& s : outRawSectors) {
+        s.fill(0);
+    }
+    if (!compileUtocSectors(utocState, outRawSectors[0], outRawSectors[1], outRawSectors[2],
+                            outRawSectors[4], error)) {
+        return false;
+    }
+    const bool hasFullWidth =
+        std::any_of(utocState.fullTitleMap.begin(), utocState.fullTitleMap.end(),
+                    [](std::uint8_t s) { return s != 0; });
+    outRawSectors[0][0x23] = static_cast<std::uint8_t>(outRawSectors[0][0x23] | 0x07u |
+                                                       (hasFullWidth ? 0x10u : 0x00u));
+    outSectorMask = (hasFullWidth || (outRawSectors[0][0x23] & 0x10u) != 0) ? 23 : 7;
+    if (preservedSector3 != nullptr) {
+        outRawSectors[3] = *preservedSector3;
+    }
+    outSector0Hash = computeUtocSectorSha256Hex(outRawSectors[0].data());
+    return true;
+}
+
 bool writeDeviceUtocSectorsUnlocked(
     const std::string& deviceId, const UtocDiscState& utocState,
     const std::array<std::uint8_t, kUtocSectorBytes>* preservedSector3, bool confirmHardware,
-    const HelperProgressWindow& win, std::string& error) {
+    const HelperProgressWindow& win, std::string& error,
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>* outCommittedRaw = nullptr,
+    std::string* outCommittedSec0Hash = nullptr) {
     if (!isNetMdMockDeviceId(deviceId) && !validatePhysicalUtocClusters(utocState, error)) {
         return false;
     }
 
-    std::array<std::uint8_t, kUtocSectorBytes> sec0{};
-    std::array<std::uint8_t, kUtocSectorBytes> sec1{};
-    std::array<std::uint8_t, kUtocSectorBytes> sec2{};
-    std::array<std::uint8_t, kUtocSectorBytes> sec4{};
-    if (!compileUtocSectors(utocState, sec0, sec1, sec2, sec4, error)) {
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawBundle{};
+    int sectorMask = 7;
+    std::string sec0Hash;
+    if (!prepareWriteSectorBundle(utocState, preservedSector3, rawBundle, sectorMask, sec0Hash,
+                                  error)) {
         return false;
     }
-
-    const bool hasFullWidth = std::any_of(utocState.fullTitleMap.begin(),
-                                          utocState.fullTitleMap.end(),
-                                          [](std::uint8_t s) { return s != 0; });
-    // Ensure Sector 0 used-sectors bitmask (byte 0x23) flags Sectors 0, 1, 2
-    // (and Sector 4 when full-width titles exist) so players read titles cleanly.
-    sec0[0x23] = static_cast<std::uint8_t>(sec0[0x23] | 0x07u | (hasFullWidth ? 0x10u : 0x00u));
-    const int sectorMask = (hasFullWidth || (sec0[0x23] & 0x10u) != 0) ? 23 : 7;
     const std::string maskStr = std::to_string(sectorMask);
 
     std::vector<std::uint8_t> packed(5 * kUtocSectorBytes, 0);
-    std::memcpy(packed.data() + 0 * kUtocSectorBytes, sec0.data(), kUtocSectorBytes);
-    std::memcpy(packed.data() + 1 * kUtocSectorBytes, sec1.data(), kUtocSectorBytes);
-    std::memcpy(packed.data() + 2 * kUtocSectorBytes, sec2.data(), kUtocSectorBytes);
-    if (preservedSector3 != nullptr) {
-        std::memcpy(packed.data() + 3 * kUtocSectorBytes, preservedSector3->data(),
-                    kUtocSectorBytes);
+    for (std::size_t s = 0; s < 5; ++s) {
+        std::memcpy(packed.data() + s * kUtocSectorBytes, rawBundle[s].data(), kUtocSectorBytes);
     }
-    std::memcpy(packed.data() + 4 * kUtocSectorBytes, sec4.data(), kUtocSectorBytes);
 
     juce::TemporaryFile tmp(".utoc.bin");
     if (!tmp.getFile().replaceWithData(packed.data(), packed.size())) {
@@ -1114,7 +1134,7 @@ bool writeDeviceUtocSectorsUnlocked(
                               " tracks=" + std::to_string(utocState.trackCount) +
                               " mask=" + maskStr +
                               " usedSectors=0x" +
-                              juce::String::toHexString(sec0[0x23]).toStdString());
+                              juce::String::toHexString(rawBundle[0][0x23]).toStdString());
 
     if (!isNetMdMockDeviceId(deviceId)) {
         std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> verifyRaw{};
@@ -1131,6 +1151,12 @@ bool writeDeviceUtocSectorsUnlocked(
         }
         logDiagnostic("utoc", "DRAM UTOC readback verified: trackCount=" +
                                   std::to_string(verifyUtoc.trackCount));
+    }
+    if (outCommittedRaw != nullptr) {
+        *outCommittedRaw = rawBundle;
+    }
+    if (outCommittedSec0Hash != nullptr) {
+        *outCommittedSec0Hash = sec0Hash;
     }
     return true;
 }
@@ -1205,6 +1231,10 @@ bool validateTracksAgainstTimeline(const MdDisc& disc, const Session& session, s
     for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
         const auto& trk = disc.tracks[t];
         for (const auto& part : trk.parts) {
+            if (disc.loadedDisc.active &&
+                findMdOnDiscRegionForPart(disc.loadedDisc, part) >= 0) {
+                continue;
+            }
             if (part.startSample < 0 || part.endSample <= part.startSample ||
                 part.endSample > masterSamples) {
                 error = "Track " + std::to_string(t + 1) + " part [" +
@@ -1732,40 +1762,423 @@ bool tryPreserveDeviceSector0Topology(const MdDisc& disc, const UtocDiscState& d
     return true;
 }
 
-} // namespace
-
-// ============================================================================
-// Public NetMD Bridge Operations
-// ============================================================================
-
-bool listNetMdDevices(std::vector<NetMdDeviceEntry>& out, std::string& error) {
-    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
-    return listNetMdDevicesUnlocked(out, error);
+std::vector<MdPhysRange> readUtocFreeRangesUnlocked(const UtocDiscState& utoc) {
+    std::vector<MdPhysRange> ranges;
+    std::uint8_t slot = utoc.trackMap[0];
+    std::set<std::uint8_t> visited;
+    while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+        const auto& f = utoc.fragments[slot];
+        if (f.isValid() && f.end.toLinearGroup() >= f.start.toLinearGroup()) {
+            ranges.push_back({{f.start.cluster, f.start.sector, f.start.group},
+                              {f.end.cluster, f.end.sector, f.end.group}});
+        }
+        slot = f.link;
+    }
+    return ranges;
 }
 
-bool probeNetMdDevice(const std::string& deviceId, NetMdDeviceStatus& out, std::string& error) {
-    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
-    return probeNetMdDeviceUnlocked(deviceId, out, error);
+int countUnusedUtocFragSlots(const UtocDiscState& utoc) {
+    std::array<bool, kUtocSlots> used{};
+    used[0] = true;
+    auto markChain = [&](std::uint8_t head) {
+        std::uint8_t slot = head;
+        std::set<std::uint8_t> visited;
+        while (slot != 0 && visited.insert(slot).second) {
+            used[slot] = true;
+            slot = utoc.fragments[slot].link;
+        }
+    };
+    markChain(utoc.trackMap[0]);
+    markChain(utoc.sec0aPadding[14]);
+    const int n = std::min<int>(utoc.trackCount, kUtocMaxTracks);
+    for (int t = 1; t <= n; ++t) {
+        markChain(utoc.trackMap[static_cast<std::size_t>(t)]);
+    }
+    int unused = 0;
+    for (std::size_t i = 1; i < kUtocSlots; ++i) {
+        if (!used[i]) {
+            ++unused;
+        }
+    }
+    return unused;
 }
 
-NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDisc& disc,
-                                             const std::string& preferredDeviceId) {
+MdDisc buildReclaimOnlyDisc(const MdDisc& disc) {
+    MdDisc rd = disc;
+    rd.tracks.clear();
+    rd.groups.clear();
+
+    std::vector<int> oldToNewTrack1(disc.tracks.size() + 1, 0);
+    for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
+        MdTrack tr = disc.tracks[t];
+        tr.parts.clear();
+        for (const auto& p : disc.tracks[t].parts) {
+            if (findMdOnDiscRegionForPart(disc.loadedDisc, p) >= 0) {
+                tr.parts.push_back(p);
+            }
+        }
+        if (!tr.parts.empty()) {
+            rd.tracks.push_back(std::move(tr));
+            oldToNewTrack1[t + 1] = static_cast<int>(rd.tracks.size());
+        }
+    }
+
+    for (const auto& g : disc.groups) {
+        int newStart = 0;
+        int newEnd = 0;
+        for (int oldT = g.startTrack; oldT <= g.endTrack && oldT <= static_cast<int>(disc.tracks.size());
+             ++oldT) {
+            const int mapped = oldToNewTrack1[static_cast<std::size_t>(oldT)];
+            if (mapped > 0) {
+                if (newStart == 0) {
+                    newStart = mapped;
+                }
+                newEnd = mapped;
+            }
+        }
+        if (newStart > 0 && newEnd >= newStart) {
+            MdGroup ng = g;
+            ng.startTrack = newStart;
+            ng.endTrack = newEnd;
+            rd.groups.push_back(std::move(ng));
+        }
+    }
+    return rd;
+}
+
+bool buildCombinedLoadedAndUploadedUtoc(const MdDisc& disc, const MdPhysicalPlan& physPlan,
+                                        const UtocDiscState& logicalUtoc,
+                                        const UtocDiscState& postUploadDeviceUtoc,
+                                        const std::vector<SpanUploadPlan>& plans,
+                                        int physTotalClusters, UtocDiscState& finalUtoc,
+                                        std::string& error) {
+    finalUtoc = logicalUtoc;
+    finalUtoc.trackMap.fill(0);
+    finalUtoc.sec0aPadding[14] = 0;
+    for (std::size_t i = 0; i < kUtocSlots; ++i) {
+        finalUtoc.fragments[i] = {};
+    }
+    for (std::uint8_t i = 1; i < 255; ++i) {
+        finalUtoc.fragments[i].link = static_cast<std::uint8_t>(i + 1);
+    }
+    finalUtoc.fragments[255].link = 0;
+    finalUtoc.nextFreeTrackSlot = 1;
+
+    struct FragKey {
+        std::uint16_t sc;
+        std::uint8_t ss;
+        std::uint8_t sg;
+        std::uint8_t mode;
+        std::uint16_t ec;
+        std::uint8_t es;
+        std::uint8_t eg;
+        std::uint8_t link;
+        bool operator<(const FragKey& o) const noexcept {
+            return std::tie(sc, ss, sg, mode, ec, es, eg, link) <
+                   std::tie(o.sc, o.ss, o.sg, o.mode, o.ec, o.es, o.eg, o.link);
+        }
+    };
+    std::map<FragKey, std::uint8_t> fragPool;
+
+    auto allocSlot = [&](const UtocFragment& frag, bool deduplicate,
+                         std::uint8_t& outSlot) -> bool {
+        if (deduplicate) {
+            const FragKey k{frag.start.cluster, frag.start.sector, frag.start.group, frag.mode,
+                            frag.end.cluster,   frag.end.sector,   frag.end.group,   frag.link};
+            if (const auto it = fragPool.find(k); it != fragPool.end()) {
+                outSlot = it->second;
+                return true;
+            }
+        }
+        if (finalUtoc.nextFreeTrackSlot == 0) {
+            error = "UTOC Sector 0 fragment table exceeded 255 slots combining on-disc and new "
+                    "tracks.";
+            return false;
+        }
+        const std::uint8_t slot = finalUtoc.nextFreeTrackSlot;
+        finalUtoc.nextFreeTrackSlot = finalUtoc.fragments[slot].link;
+        finalUtoc.fragments[slot] = frag;
+        if (deduplicate) {
+            const FragKey k{frag.start.cluster, frag.start.sector, frag.start.group, frag.mode,
+                            frag.end.cluster,   frag.end.sector,   frag.end.group,   frag.link};
+            fragPool.emplace(k, slot);
+        }
+        outSlot = slot;
+        return true;
+    };
+
+    // Preserve exact on-disc part mode bytes compiled into `logicalUtoc`.
+    std::map<std::pair<int, int>, std::uint8_t> logicalModeByTrackPart;
+    for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
+        std::uint8_t lSlot = logicalUtoc.trackMap[t + 1];
+        std::set<std::uint8_t> guard;
+        int pIdx = 0;
+        while (lSlot != 0 && guard.insert(lSlot).second) {
+            logicalModeByTrackPart.emplace(std::make_pair(static_cast<int>(t), pIdx),
+                                           logicalUtoc.fragments[lSlot].mode);
+            lSlot = logicalUtoc.fragments[lSlot].link;
+            ++pIdx;
+        }
+    }
+
+    std::map<std::pair<int, int>, const MdPartPlacement*> placeByTrackPart;
+    for (const auto& pl : physPlan.placements) {
+        placeByTrackPart.emplace(std::make_pair(pl.trackIndex, pl.partIndex), &pl);
+    }
+
+    std::set<std::uint16_t> occupiedNowClusters;
+    for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
+        const auto& trk = disc.tracks[t];
+        const auto codec = effectiveTrackCodec(disc, trk);
+        const std::uint8_t defaultMode = utocModeFromTrack(
+            mdCodecModeToString(codec), trk.writeProtected, trk.scmsCopyProtected, trk.emphasis);
+
+        struct TrackFragSpec {
+            UtocAddress start{};
+            UtocAddress end{};
+            std::uint8_t mode = 0;
+        };
+        std::vector<TrackFragSpec> specs;
+
+        for (std::size_t pIdx = 0; pIdx < trk.parts.size(); ++pIdx) {
+            const auto plIt = placeByTrackPart.find({static_cast<int>(t), static_cast<int>(pIdx)});
+            if (plIt == placeByTrackPart.end()) {
+                error = "Missing physical placement for track " + std::to_string(t + 1) +
+                        " part " + std::to_string(pIdx + 1) + ".";
+                return false;
+            }
+            const auto* pl = plIt->second;
+            if (pl->isOnDisc) {
+                std::uint8_t modeByte = defaultMode;
+                if (const auto mIt = logicalModeByTrackPart.find(
+                        {static_cast<int>(t), static_cast<int>(pIdx)});
+                    mIt != logicalModeByTrackPart.end()) {
+                    modeByte = mIt->second;
+                }
+                const UtocAddress s{pl->startAddr.cluster, pl->startAddr.sector,
+                                    pl->startAddr.group};
+                const UtocAddress e{pl->endAddr.cluster, pl->endAddr.sector, pl->endAddr.group};
+                specs.push_back({s, e, modeByte});
+                for (std::uint16_t c = s.cluster; c <= e.cluster; ++c) {
+                    occupiedNowClusters.insert(c);
+                }
+            } else {
+                if (pl->spanIndex < 0 || pl->spanIndex >= static_cast<int>(plans.size())) {
+                    error = "Physical span index out of range during UTOC combination.";
+                    return false;
+                }
+                std::vector<std::pair<UtocAddress, UtocAddress>> partRanges;
+                if (!sliceUnitSubrange(plans[static_cast<std::size_t>(pl->spanIndex)].physRanges,
+                                       pl->unitOffsetInSpan, pl->unitCount, partRanges, error)) {
+                    return false;
+                }
+                for (const auto& pr : partRanges) {
+                    for (std::uint16_t c = pr.first.cluster; c <= pr.second.cluster; ++c) {
+                        occupiedNowClusters.insert(c);
+                    }
+                    if (!specs.empty() && specs.back().mode == defaultMode &&
+                        specs.back().end.toLinearGroup() + 1 == pr.first.toLinearGroup()) {
+                        specs.back().end = pr.second;
+                    } else {
+                        specs.push_back({pr.first, pr.second, defaultMode});
+                    }
+                }
+            }
+        }
+
+        std::uint8_t nextLink = 0;
+        for (auto it = specs.rbegin(); it != specs.rend(); ++it) {
+            UtocFragment frag;
+            frag.start = it->start;
+            frag.end = it->end;
+            frag.mode = it->mode;
+            frag.link = nextLink;
+            std::uint8_t assigned = 0;
+            if (!allocSlot(frag, true, assigned)) {
+                return false;
+            }
+            nextLink = assigned;
+        }
+        finalUtoc.trackMap[t + 1] = nextLink;
+    }
+
+    auto countFreeSlots = [&]() {
+        int cnt = 0;
+        std::set<std::uint8_t> seen;
+        for (std::uint8_t s = finalUtoc.nextFreeTrackSlot; s != 0 && seen.insert(s).second;
+             s = finalUtoc.fragments[s].link) {
+            ++cnt;
+        }
+        return cnt;
+    };
+
+    // Restore P-DFA defective cluster ranges verbatim.
+    std::set<std::uint16_t> defectiveClusters;
+    for (const auto& d : disc.loadedDisc.defectiveRanges) {
+        for (std::uint16_t c = d.start.cluster; c <= d.end.cluster; ++c) {
+            defectiveClusters.insert(c);
+            occupiedNowClusters.insert(c);
+        }
+    }
+    if (!disc.loadedDisc.defectiveRanges.empty()) {
+        if (countFreeSlots() < static_cast<int>(disc.loadedDisc.defectiveRanges.size())) {
+            error = "UTOC Sector 0 fragment table exceeded 255 slots (insufficient space for "
+                    "defective area P-DFA).";
+            return false;
+        }
+        std::uint8_t prev = 0;
+        for (const auto& d : disc.loadedDisc.defectiveRanges) {
+            UtocFragment f;
+            f.start = {d.start.cluster, d.start.sector, d.start.group};
+            f.end = {d.end.cluster, d.end.sector, d.end.group};
+            f.mode = 0;
+            f.link = 0;
+            std::uint8_t assigned = 0;
+            if (!allocSlot(f, false, assigned)) {
+                return false;
+            }
+            if (prev == 0) {
+                finalUtoc.sec0aPadding[14] = assigned;
+            } else {
+                finalUtoc.fragments[prev].link = assigned;
+            }
+            prev = assigned;
+        }
+    }
+
+    // Build final P-FRA (trackMap[0]): post-upload device P-FRA + whole reclaimed clusters not
+    // occupied by kept on-disc tracks, newly uploaded tracks, or P-DFA.
+    std::set<std::uint16_t> initiallyUsedClusters;
+    for (const auto& reg : disc.loadedDisc.regions) {
+        for (std::uint16_t c = reg.physStart.cluster; c <= reg.physEnd.cluster; ++c) {
+            initiallyUsedClusters.insert(c);
+        }
+    }
+    std::vector<std::pair<std::int64_t, std::int64_t>> freeIntervals;
+    for (const auto& fr : readUtocFreeRangesUnlocked(postUploadDeviceUtoc)) {
+        const UtocAddress s{fr.start.cluster, fr.start.sector, fr.start.group};
+        const UtocAddress e{fr.end.cluster, fr.end.sector, fr.end.group};
+        freeIntervals.emplace_back(s.toLinearGroup(), e.toLinearGroup());
+    }
+    std::set<std::uint16_t> reclaimedOnlyClusters;
+    for (std::uint16_t c : initiallyUsedClusters) {
+        if (!occupiedNowClusters.count(c) && !defectiveClusters.count(c)) {
+            reclaimedOnlyClusters.insert(c);
+        }
+    }
+    if (!reclaimedOnlyClusters.empty()) {
+        auto it = reclaimedOnlyClusters.begin();
+        std::uint16_t runStart = *it;
+        std::uint16_t runEnd = *it;
+        auto pushWholeRun = [&](std::uint16_t c0, std::uint16_t c1) {
+            const UtocAddress a{c0, 0, 0};
+            const UtocAddress b{c1, static_cast<std::uint8_t>(kMdSectorsPerCluster - 1),
+                                static_cast<std::uint8_t>(kMdUnitsPerSector - 1)};
+            freeIntervals.emplace_back(a.toLinearGroup(), b.toLinearGroup());
+        };
+        for (++it; it != reclaimedOnlyClusters.end(); ++it) {
+            if (*it == runEnd + 1) {
+                runEnd = *it;
+            } else {
+                pushWholeRun(runStart, runEnd);
+                runStart = *it;
+                runEnd = *it;
+            }
+        }
+        pushWholeRun(runStart, runEnd);
+    }
+
+    std::sort(freeIntervals.begin(), freeIntervals.end());
+    std::vector<MdPhysRange> mergedFree;
+    for (const auto& iv : freeIntervals) {
+        if (mergedFree.empty() || iv.first > mergedFree.back().end.toLinearUnits() + 1) {
+            mergedFree.push_back(
+                {MdPhysAddr::fromLinearUnits(iv.first), MdPhysAddr::fromLinearUnits(iv.second)});
+        } else if (iv.second > mergedFree.back().end.toLinearUnits()) {
+            mergedFree.back().end = MdPhysAddr::fromLinearUnits(iv.second);
+        }
+    }
+
+    const int freeSlots = countFreeSlots();
+    if (freeSlots > 0 && !mergedFree.empty()) {
+        if (static_cast<int>(mergedFree.size()) > freeSlots) {
+            std::sort(mergedFree.begin(), mergedFree.end(),
+                      [](const MdPhysRange& a, const MdPhysRange& b) {
+                          return (a.end.toLinearUnits() - a.start.toLinearUnits()) >
+                                 (b.end.toLinearUnits() - b.start.toLinearUnits());
+                      });
+            mergedFree.resize(static_cast<std::size_t>(freeSlots));
+            std::sort(mergedFree.begin(), mergedFree.end(),
+                      [](const MdPhysRange& a, const MdPhysRange& b) { return a.start < b.start; });
+        }
+        std::uint8_t prev = 0;
+        for (const auto& r : mergedFree) {
+            UtocFragment f;
+            f.start = {r.start.cluster, r.start.sector, r.start.group};
+            f.end = {r.end.cluster, r.end.sector, r.end.group};
+            f.mode = 0;
+            f.link = 0;
+            std::uint8_t assigned = 0;
+            if (!allocSlot(f, false, assigned)) {
+                return false;
+            }
+            if (prev == 0) {
+                finalUtoc.trackMap[0] = assigned;
+            } else {
+                finalUtoc.fragments[prev].link = assigned;
+            }
+            prev = assigned;
+        }
+    }
+
+    const auto budget =
+        computeUtocBudget(finalUtoc, mdMediumToString(disc.medium), physTotalClusters);
+    if (!budget.fits()) {
+        error = "Combined physical UTOC exceeds disc cluster or 255-slot limits.";
+        return false;
+    }
+    return true;
+}
+
+NetMdPreflightReport evaluateNetMdPreflightReport(const Session& session, const MdDisc& disc,
+                                                   bool deviceConnected,
+                                                   const NetMdDeviceStatus& deviceStatus,
+                                                   const std::string& devErr) {
     NetMdPreflightReport report;
     report.requiresForceTocEdit = true;
     report.logicalTracks = static_cast<int>(disc.tracks.size());
+    report.hasLoadedDisc = disc.loadedDisc.active;
+    report.deviceConnected = deviceConnected;
+    report.device = deviceStatus;
+    const int physTotal = disc.loadedDisc.active ? disc.loadedDisc.physicalTotalClusters() : 0;
 
     const auto medium = mdMediumToString(disc.medium);
     UtocDiscState utoc{};
     std::string compileErr;
     report.utocCompiled = compileMdDiscToUtoc(disc, utoc, compileErr);
     if (report.utocCompiled) {
-        report.budget = computeUtocBudget(utoc, medium);
+        report.budget = computeUtocBudget(utoc, medium, physTotal);
     }
 
     MdPhysicalPlan physPlan{};
     std::string planErr;
     if (planMdPhysicalAudio(disc, physPlan, planErr)) {
         report.uniqueUploadSegments = static_cast<int>(physPlan.spans.size());
+        report.onDiscClusters = physPlan.onDiscClusters;
+        report.newUploadClusters = physPlan.newUploadClusters;
+        report.reclaimedClusters = physPlan.reclaimedClusters;
+        if (disc.loadedDisc.active) {
+            for (const auto& tr : disc.tracks) {
+                if (mdTrackUsesOnDiscAudio(disc, tr)) {
+                    ++report.preservedOnDiscTracks;
+                }
+            }
+            if (!physPlan.spans.empty() &&
+                physPlan.initialFreeClusters < physPlan.newUploadClusters &&
+                physPlan.freeClustersAfterReclaim >= physPlan.newUploadClusters) {
+                report.needsPreUploadReclaim = true;
+            }
+        }
         for (const auto& s : physPlan.spans) {
             if (s.codec == MdCodecMode::spStereo || s.codec == MdCodecMode::spMono) {
                 report.requiresSpUpload = true;
@@ -1774,29 +2187,24 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
         validateTracksAgainstTimeline(disc, session, planErr);
     }
 
-    std::string targetId;
-    std::string devErr;
-    {
-        const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
-        if (resolveTargetDeviceIdUnlocked(preferredDeviceId, targetId, devErr)) {
-            if (probeNetMdDeviceUnlocked(targetId, report.device, devErr)) {
-                report.deviceConnected = true;
-            }
-        }
-    }
-
     std::vector<std::string> blockers;
     if (!report.utocCompiled) {
         blockers.push_back(compileErr.empty() ? "UTOC compilation failed" : compileErr);
     } else if (!report.budget.fits()) {
         blockers.push_back("Disc exceeds UTOC cluster or 255-slot table limits");
     }
+    if (disc.loadedDisc.active && !physPlan.spans.empty() &&
+        physPlan.freeClustersAfterReclaim < physPlan.newUploadClusters) {
+        blockers.push_back("Not enough whole free clusters on disc after reclaiming deleted audio (" +
+                           std::to_string(physPlan.freeClustersAfterReclaim) + " available, " +
+                           std::to_string(physPlan.newUploadClusters) + " needed)");
+    }
     if (!planErr.empty()) {
         blockers.push_back(planErr);
     }
 
     std::vector<std::string> recBlockers = blockers;
-    if (disc.tracks.empty()) {
+    if (!disc.loadedDisc.active && disc.tracks.empty()) {
         recBlockers.push_back("MD disc contains 0 tracks");
     }
 
@@ -1805,6 +2213,9 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
         utocBlockers.push_back(compileErr.empty() ? "UTOC compilation failed" : compileErr);
     } else if (!report.budget.fits()) {
         utocBlockers.push_back("UTOC exceeds 255-slot table limits");
+    }
+    if (disc.loadedDisc.active && !physPlan.spans.empty()) {
+        utocBlockers.push_back("Added local audio spans require Record MiniDisc to upload audio");
     }
 
     if (!report.deviceConnected) {
@@ -1827,8 +2238,16 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
                 utocBlockers.push_back("Inserted MiniDisc write-protect tab is locked");
             }
             if (report.device.hiMdFormatted) {
+                recBlockers.push_back(
+                    "Inserted disc is Hi-MD formatted; click Erase Disc... first to reformat for "
+                    "standard MiniDisc");
                 utocBlockers.push_back(
-                    "Inserted disc is Hi-MD formatted; erase or record audio first");
+                    "Inserted disc is Hi-MD formatted; erase or load after reformat");
+            } else if (!disc.loadedDisc.active && report.device.trackCount > 0) {
+                recBlockers.push_back(
+                    "Inserted MiniDisc is not empty (" +
+                    std::to_string(report.device.trackCount) +
+                    " track(s)). Click Load Disc to edit non-destructively, or Erase Disc... first");
             }
         }
         if (!report.device.supportsForceTocEdit) {
@@ -1865,10 +2284,14 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
     if (!recBlockers.empty()) {
         report.blocker = recBlockers.front();
         report.statusText = "Blocked: " + report.blocker;
+    } else if (disc.loadedDisc.active) {
+        report.statusText =
+            "Ready (preserve " + std::to_string(report.preservedOnDiscTracks) +
+            " on-disc track(s), upload " + std::to_string(report.uniqueUploadSegments) +
+            " new span(s), reclaim " + std::to_string(report.reclaimedClusters) + " cluster(s))";
     } else {
         report.statusText =
-            std::string(report.device.hiMdFormatted ? "Ready (reformats Hi-MD disc; " : "Ready (") +
-            std::to_string(report.uniqueUploadSegments) + " physical upload" +
+            "Ready (" + std::to_string(report.uniqueUploadSegments) + " physical upload" +
             (report.uniqueUploadSegments == 1 ? "" : "s") + " -> " +
             std::to_string(report.logicalTracks) + " UTOC track" +
             (report.logicalTracks == 1 ? "" : "s") + ")";
@@ -1925,6 +2348,45 @@ NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDis
     return report;
 }
 
+} // namespace
+
+// ============================================================================
+// Public NetMD Bridge Operations
+// ============================================================================
+
+bool listNetMdDevices(std::vector<NetMdDeviceEntry>& out, std::string& error) {
+    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
+    return listNetMdDevicesUnlocked(out, error);
+}
+
+bool probeNetMdDevice(const std::string& deviceId, NetMdDeviceStatus& out, std::string& error) {
+    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
+    return probeNetMdDeviceUnlocked(deviceId, out, error);
+}
+
+NetMdPreflightReport preflightNetMdRecording(const Session& session, const MdDisc& disc,
+                                             const std::string& preferredDeviceId) {
+    std::string targetId;
+    std::string devErr;
+    NetMdDeviceStatus deviceStatus{};
+    bool deviceConnected = false;
+    {
+        const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
+        if (resolveTargetDeviceIdUnlocked(preferredDeviceId, targetId, devErr)) {
+            if (probeNetMdDeviceUnlocked(targetId, deviceStatus, devErr)) {
+                deviceConnected = true;
+            }
+        }
+    }
+    return evaluateNetMdPreflightReport(session, disc, deviceConnected, deviceStatus, devErr);
+}
+
+NetMdPreflightReport preflightNetMdRecordingWithStatus(const Session& session, const MdDisc& disc,
+                                                       const NetMdDeviceStatus& deviceStatus) {
+    return evaluateNetMdPreflightReport(session, disc, !deviceStatus.deviceId.empty(), deviceStatus,
+                                        {});
+}
+
 bool eraseNetMdDisc(const std::string& deviceId, bool confirmHardware,
                     NetMdDeviceStatus& outAfterStatus, std::string& error) {
     outAfterStatus = {};
@@ -1947,7 +2409,7 @@ bool eraseNetMdDisc(const std::string& deviceId, bool confirmHardware,
     setNetMdProgress("erase", "Probing NetMD device...", 0.08);
 
     NetMdDeviceStatus status;
-    if (!probeNetMdDeviceUnlocked(resolvedId, status, error)) {
+    if (!probeNetMdDeviceUnlocked(resolvedId, status, error, /*includeTracks=*/false)) {
         return false;
     }
     if (!status.discPresent) {
@@ -2001,7 +2463,7 @@ bool readNetMdDiscUtoc(const std::string& deviceId,
     setNetMdProgress("read-utoc", "Probing NetMD device...", 0.04);
 
     NetMdDeviceStatus status;
-    if (!probeNetMdDeviceUnlocked(resolvedId, status, error)) {
+    if (!probeNetMdDeviceUnlocked(resolvedId, status, error, /*includeTracks=*/false)) {
         return false;
     }
     if (!status.discPresent) {
@@ -2019,10 +2481,105 @@ bool readNetMdDiscUtoc(const std::string& deviceId,
     return readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, outState, readWin, error);
 }
 
-bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confirmHardware,
-                    UtocBudget& outBudget, std::string& error) {
+bool loadNetMdDisc(const std::string& deviceId, MdDisc& outDisc, NetMdDeviceStatus* outStatus,
+                   std::string& error) {
+    outDisc = {};
+    if (outStatus != nullptr) {
+        *outStatus = {};
+    }
+    error.clear();
+
+    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
+
+    std::string resolvedId;
+    if (!resolveTargetDeviceIdUnlocked(deviceId, resolvedId, error)) {
+        return false;
+    }
+
+    ScopedNetMdProgress progressScope;
+    setNetMdProgress("load-disc", "Probing NetMD device...", 0.04);
+
+    NetMdDeviceStatus status;
+    if (!probeNetMdDeviceUnlocked(resolvedId, status, error, /*includeTracks=*/false)) {
+        return false;
+    }
+    if (!status.discPresent) {
+        error = "No MiniDisc inserted in device '" + resolvedId + "'.";
+        return false;
+    }
+    if (status.hiMdFormatted) {
+        error = "Inserted disc is Hi-MD formatted; click Erase Disc... first to reformat for "
+                "standard MiniDisc.";
+        return false;
+    }
+
+    setNetMdProgress("load-disc", "Reading UTOC Sectors 0/1/2/3/4 from MiniDisc...", 0.12);
+    HelperProgressWindow readWin;
+    readWin.active = true;
+    readWin.operation = "load-disc";
+    readWin.fallbackPhase = "Reading UTOC Sectors 0/1/2/3/4 from MiniDisc...";
+    readWin.baseProgress = 0.12;
+    readWin.spanProgress = 0.80;
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawSectors{};
+    UtocDiscState deviceUtoc{};
+    if (!readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, deviceUtoc, readWin, error)) {
+        return false;
+    }
+
+    setNetMdProgress("load-disc", "Decoding MiniDisc UTOC & timeline layout...", 0.94);
+    if (!loadMdDiscFromDeviceUtoc(rawSectors, resolvedId, outDisc, error)) {
+        return false;
+    }
+    if (outStatus != nullptr) {
+        status.trackCount = static_cast<int>(outDisc.tracks.size());
+        status.discTitle = outDisc.halfWidthTitle;
+        status.fullWidthTitle = outDisc.fullWidthTitle;
+        status.tracks.clear();
+        status.tracks.reserve(outDisc.tracks.size());
+        for (std::size_t i = 0; i < outDisc.tracks.size(); ++i) {
+            const auto& trk = outDisc.tracks[i];
+            NetMdDeviceTrack row;
+            row.index = static_cast<int>(i);
+            row.title = trk.halfWidthTitle;
+            row.fullWidthTitle = trk.fullWidthTitle;
+            switch (effectiveTrackCodec(outDisc, trk)) {
+            case MdCodecMode::spStereo:
+                row.codec = "SP";
+                break;
+            case MdCodecMode::spMono:
+                row.codec = "Mono";
+                break;
+            case MdCodecMode::lp2:
+                row.codec = "LP2";
+                break;
+            case MdCodecMode::lp4:
+                row.codec = "LP4";
+                break;
+            }
+            row.durationSeconds =
+                static_cast<int>(std::llround(static_cast<double>(trk.totalSamples()) /
+                                              static_cast<double>(kMdSampleRate)));
+            status.tracks.push_back(std::move(row));
+        }
+        *outStatus = status;
+    }
+    return true;
+}
+
+bool writeNetMdUtoc(
+    const MdDisc& disc, const std::string& deviceId, bool confirmHardware, UtocBudget& outBudget,
+    std::string& error, std::string* outCommittedSector0Hash,
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>* outCommittedRawSectors) {
     outBudget = {};
     error.clear();
+    if (outCommittedSector0Hash != nullptr) {
+        outCommittedSector0Hash->clear();
+    }
+    if (outCommittedRawSectors != nullptr) {
+        for (auto& s : *outCommittedRawSectors) {
+            s.fill(0);
+        }
+    }
 
     const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
 
@@ -2041,18 +2598,31 @@ bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confir
     setNetMdProgress("write-utoc", "Validating UTOC & probing NetMD device...", 0.08);
 
     const auto medium = mdMediumToString(disc.medium);
+    const int physTotal = disc.loadedDisc.active ? disc.loadedDisc.physicalTotalClusters() : 0;
+    if (disc.loadedDisc.active) {
+        MdPhysicalPlan physPlan{};
+        if (!planMdPhysicalAudio(disc, physPlan, error)) {
+            return false;
+        }
+        if (!physPlan.spans.empty()) {
+            error = "Disc contains newly added local audio spans; use Record MiniDisc... to "
+                    "upload audio before updating UTOC.";
+            return false;
+        }
+    }
+
     UtocDiscState logicalUtoc{};
     if (!compileMdDiscToUtoc(disc, logicalUtoc, error)) {
         return false;
     }
-    outBudget = computeUtocBudget(logicalUtoc, medium);
+    outBudget = computeUtocBudget(logicalUtoc, medium, physTotal);
     if (!outBudget.fits()) {
         error = "Compiled UTOC exceeds disc cluster or 255-slot table limits.";
         return false;
     }
 
     NetMdDeviceStatus status;
-    if (!probeNetMdDeviceUnlocked(resolvedId, status, error)) {
+    if (!probeNetMdDeviceUnlocked(resolvedId, status, error, /*includeTracks=*/false)) {
         return false;
     }
     if (!status.discPresent) {
@@ -2061,6 +2631,11 @@ bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confir
     }
     if (!status.writable || status.writeProtected) {
         error = "MiniDisc in device '" + resolvedId + "' is read-only or write-protected.";
+        return false;
+    }
+    if (status.hiMdFormatted) {
+        error = "Inserted disc is Hi-MD formatted; click Erase Disc... first to reformat for "
+                "standard MiniDisc.";
         return false;
     }
     if (!status.supportsForceTocEdit) {
@@ -2081,29 +2656,51 @@ bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confir
         return false;
     }
 
-    const bool hasImportedHeaders =
-        std::all_of(disc.importedUtocSectors.begin(), disc.importedUtocSectors.end(),
-                    [](const auto& s) { return s.size() == kUtocSectorBytes; });
-    if (!hasImportedHeaders) {
-        copyDeviceHeadersToUtoc(deviceUtoc, logicalUtoc);
+    if (disc.loadedDisc.active && !disc.loadedDisc.baselineSector0Hash.empty()) {
+        const auto liveHash = computeUtocSectorSha256Hex(rawSectors[0].data());
+        if (liveHash != disc.loadedDisc.baselineSector0Hash) {
+            error = "Inserted MiniDisc UTOC changed on hardware since Load Disc; click Load Disc "
+                    "again before writing UTOC.";
+            return false;
+        }
     }
 
     bool remappedFromHardware = false;
-    if (!tryRemapUtocFromCachedSpans(disc, resolvedId, deviceUtoc, logicalUtoc,
-                                     remappedFromHardware, error)) {
-        return false;
-    }
-    if (!remappedFromHardware) {
-        remappedFromHardware = tryPreserveDeviceSector0Topology(disc, deviceUtoc, logicalUtoc);
-    }
+    bool importedHasPhysicalLayout = false;
+    if (disc.loadedDisc.active) {
+        std::string physCheckErr;
+        importedHasPhysicalLayout = validatePhysicalUtocClusters(logicalUtoc, physCheckErr);
+        if (!importedHasPhysicalLayout) {
+            error = physCheckErr.empty()
+                        ? "Compiled UTOC physical cluster layout failed verification."
+                        : physCheckErr;
+            return false;
+        }
+    } else {
+        const bool hasImportedHeaders =
+            std::all_of(disc.importedUtocSectors.begin(), disc.importedUtocSectors.end(),
+                        [](const auto& s) { return s.size() == kUtocSectorBytes; });
+        if (!hasImportedHeaders) {
+            copyDeviceHeadersToUtoc(deviceUtoc, logicalUtoc);
+        }
 
-    std::string physCheckErr;
-    const bool importedHasPhysicalLayout =
-        hasImportedHeaders && validatePhysicalUtocClusters(logicalUtoc, physCheckErr);
-    if (!remappedFromHardware && !isNetMdMockDeviceId(resolvedId) && !importedHasPhysicalLayout) {
-        error = "Physical audio layout on MiniDisc does not match the current track spans; use "
-                "Erase & Record MiniDisc to upload audio first.";
-        return false;
+        if (!tryRemapUtocFromCachedSpans(disc, resolvedId, deviceUtoc, logicalUtoc,
+                                         remappedFromHardware, error)) {
+            return false;
+        }
+        if (!remappedFromHardware) {
+            remappedFromHardware = tryPreserveDeviceSector0Topology(disc, deviceUtoc, logicalUtoc);
+        }
+
+        std::string physCheckErr;
+        importedHasPhysicalLayout =
+            hasImportedHeaders && validatePhysicalUtocClusters(logicalUtoc, physCheckErr);
+        if (!remappedFromHardware && !isNetMdMockDeviceId(resolvedId) &&
+            !importedHasPhysicalLayout) {
+            error = "Physical audio layout on MiniDisc does not match the current track spans; "
+                    "use Record MiniDisc to upload audio first.";
+            return false;
+        }
     }
 
     setNetMdProgress("write-utoc", "Writing UTOC Sectors 0/1/2/4 & running TOCWRT...", 0.28);
@@ -2113,11 +2710,19 @@ bool writeNetMdUtoc(const MdDisc& disc, const std::string& deviceId, bool confir
     writeWin.fallbackPhase = "Writing UTOC Sectors 0/1/2/4 & running TOCWRT...";
     writeWin.baseProgress = 0.28;
     writeWin.spanProgress = 0.70;
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
+    std::string committedHash;
     if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors[3], confirmHardware,
-                                        writeWin, error)) {
+                                        writeWin, error, &committedRaw, &committedHash)) {
         return false;
     }
-    outBudget = computeUtocBudget(logicalUtoc, medium);
+    if (outCommittedSector0Hash != nullptr) {
+        *outCommittedSector0Hash = committedHash;
+    }
+    if (outCommittedRawSectors != nullptr) {
+        *outCommittedRawSectors = committedRaw;
+    }
+    outBudget = computeUtocBudget(logicalUtoc, medium, physTotal);
     return true;
 }
 
@@ -2126,17 +2731,18 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     outResult = {};
     error.clear();
 
-    if (disc.tracks.empty()) {
+    if (!disc.loadedDisc.active && disc.tracks.empty()) {
         error = "MD disc has no tracks to record.";
         return false;
     }
 
     const auto medium = mdMediumToString(disc.medium);
+    const int physTotal = disc.loadedDisc.active ? disc.loadedDisc.physicalTotalClusters() : 0;
     UtocDiscState logicalUtoc{};
     if (!compileMdDiscToUtoc(disc, logicalUtoc, error)) {
         return false;
     }
-    const auto initialBudget = computeUtocBudget(logicalUtoc, medium);
+    const auto initialBudget = computeUtocBudget(logicalUtoc, medium, physTotal);
     if (!initialBudget.fits()) {
         error = "MD disc exceeds UTOC cluster or 255-slot limits.";
         return false;
@@ -2144,6 +2750,13 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
 
     MdPhysicalPlan physPlan{};
     if (!planMdPhysicalAudio(disc, physPlan, error)) {
+        return false;
+    }
+    if (disc.loadedDisc.active && !physPlan.spans.empty() &&
+        physPlan.freeClustersAfterReclaim < physPlan.newUploadClusters) {
+        error = "Not enough whole free clusters on disc after reclaiming deleted tracks (need " +
+                std::to_string(physPlan.newUploadClusters) + ", available " +
+                std::to_string(physPlan.freeClustersAfterReclaim) + ").";
         return false;
     }
 
@@ -2157,7 +2770,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
 
     const bool needsConfirm = !isNetMdMockDeviceId(resolvedId) || isNetMdTestMockGuardEnabled();
     if (needsConfirm && !confirmHardware) {
-        error = "Refusing to erase/record real NetMD hardware without explicit confirmation (pass "
+        error = "Refusing to modify real NetMD hardware without explicit confirmation (pass "
                 "confirm-hardware or confirm in the dialog).";
         return false;
     }
@@ -2166,10 +2779,12 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     setNetMdProgress("record", "Preparing ATRAC encoders...", 0.02);
 
     std::vector<SpanUploadPlan> plans;
-    if (!buildSpanUploadPlans(disc, physPlan, &session, plans, error)) {
-        return false;
+    if (!physPlan.spans.empty()) {
+        if (!buildSpanUploadPlans(disc, physPlan, &session, plans, error)) {
+            return false;
+        }
     }
-    if (plans.empty()) {
+    if (!disc.loadedDisc.active && plans.empty()) {
         error = "MD disc contains no audio spans to upload.";
         return false;
     }
@@ -2185,9 +2800,9 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
 
     const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
 
-    setNetMdProgress("record", "Probing NetMD device...", 0.30);
+    setNetMdProgress("record", "Probing NetMD device...", 0.25);
     NetMdDeviceStatus status;
-    if (!probeNetMdDeviceUnlocked(resolvedId, status, error)) {
+    if (!probeNetMdDeviceUnlocked(resolvedId, status, error, /*includeTracks=*/false)) {
         return false;
     }
     if (!status.discPresent) {
@@ -2196,6 +2811,11 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     }
     if (!status.writable || status.writeProtected) {
         error = "MiniDisc in device '" + resolvedId + "' is read-only or write-protected.";
+        return false;
+    }
+    if (status.hiMdFormatted) {
+        error = "Inserted disc is Hi-MD formatted; click Erase Disc... first to reformat for "
+                "standard MiniDisc.";
         return false;
     }
     if (!status.supportsForceTocEdit) {
@@ -2209,18 +2829,273 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         return false;
     }
 
-    setNetMdProgress("record", "Erasing MiniDisc before recording...", 0.32);
-    HelperProgressWindow eraseWin;
-    eraseWin.active = true;
-    eraseWin.operation = "record";
-    eraseWin.fallbackPhase = "Erasing MiniDisc before recording...";
-    eraseWin.preferFallbackPhase = true;
-    eraseWin.baseProgress = 0.31;
-    eraseWin.spanProgress = 0.03;
-    if (!eraseDeviceUnlocked(resolvedId, confirmHardware, eraseWin, error)) {
+    // Path 1: Session was NOT loaded from an existing hardware disc.
+    // Never silently erase non-empty hardware discs; require Load Disc or explicit Erase Disc.
+    if (!disc.loadedDisc.active) {
+        if (status.trackCount > 0) {
+            error = "Inserted MiniDisc is not empty (" + std::to_string(status.trackCount) +
+                    " track(s)). Click Load Disc to edit non-destructively, or click Erase "
+                    "Disc... first to wipe the disc.";
+            return false;
+        }
+        clearCachedPhysicalSpanMap(resolvedId);
+
+        const std::int64_t totalBytesDenom = std::max<std::int64_t>(1, totalEncodedBytes);
+        std::int64_t sentSoFar = 0;
+        for (std::size_t idx = 0; idx < plans.size(); ++idx) {
+            auto& p = plans[idx];
+            const auto spanWireBytes = static_cast<std::int64_t>(p.wireBytes.size());
+            const double spanStartFrac =
+                static_cast<double>(sentSoFar) / static_cast<double>(totalBytesDenom);
+            const double spanWidthFrac =
+                static_cast<double>(spanWireBytes) / static_cast<double>(totalBytesDenom);
+
+            const std::string phaseLabel = "Uploading " + p.modeName + " span " +
+                                           std::to_string(idx + 1) + "/" +
+                                           std::to_string(plans.size()) + " (" + p.hwTitle + ")...";
+            setNetMdProgress("record", phaseLabel, 0.30 + 0.50 * spanStartFrac, sentSoFar,
+                             totalBytesDenom);
+
+            HelperProgressWindow uploadWin;
+            uploadWin.active = true;
+            uploadWin.operation = "record";
+            uploadWin.fallbackPhase = phaseLabel;
+            uploadWin.preferFallbackPhase = true;
+            uploadWin.baseProgress = 0.30 + 0.50 * spanStartFrac;
+            uploadWin.spanProgress = 0.50 * spanWidthFrac;
+            uploadWin.bytesOffset = sentSoFar;
+            uploadWin.bytesSpan = spanWireBytes;
+            uploadWin.bytesTotal = totalBytesDenom;
+
+            int trkIdx = -1;
+            if (!uploadSpanUnlocked(resolvedId, p.modeCode, p.wireBytes, p.hwTitle, p.fwTitle,
+                                    confirmHardware, uploadWin, trkIdx, error)) {
+                return false;
+            }
+            p.uploadedTrackIndex = trkIdx;
+            sentSoFar += spanWireBytes;
+        }
+
+        setNetMdProgress("record", "Reading physical UTOC allocation from disc...", 0.82);
+        HelperProgressWindow readWin;
+        readWin.active = true;
+        readWin.operation = "record";
+        readWin.fallbackPhase = "Reading physical UTOC allocation from disc...";
+        readWin.baseProgress = 0.82;
+        readWin.spanProgress = 0.06;
+        std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawSectors{};
+        UtocDiscState deviceUtoc{};
+        if (!readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, deviceUtoc, readWin, error)) {
+            return false;
+        }
+
+        for (auto& p : plans) {
+            if (!extractTrackFragmentRanges(deviceUtoc, p.uploadedTrackIndex, p.physRanges,
+                                            error)) {
+                return false;
+            }
+        }
+
+        UtocDiscState finalUtoc = logicalUtoc;
+        if (!remapSector0WithPhysicalUploads(disc, physPlan, deviceUtoc, plans, finalUtoc, error)) {
+            return false;
+        }
+        const auto finalBudget = computeUtocBudget(finalUtoc, medium);
+        if (!finalBudget.fits()) {
+            error = "Remapped physical UTOC exceeds disc cluster or 255-slot limits.";
+            return false;
+        }
+
+        setNetMdProgress("record", "Writing final UTOC Sectors 0/1/2/4 & running TOCWRT...", 0.88);
+        HelperProgressWindow writeWin;
+        writeWin.active = true;
+        writeWin.operation = "record";
+        writeWin.fallbackPhase = "Writing final UTOC Sectors 0/1/2/4 & running TOCWRT...";
+        writeWin.baseProgress = 0.88;
+        writeWin.spanProgress = 0.11;
+        std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
+        std::string committedHash;
+        if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &rawSectors[3], confirmHardware,
+                                            writeWin, error, &committedRaw, &committedHash)) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(cachedSpanMutex());
+            auto& cache = cachedSpanMap();
+            cache.deviceId = resolvedId;
+            cache.spans.clear();
+            cache.spans.reserve(plans.size());
+            for (std::size_t i = 0; i < physPlan.spans.size() && i < plans.size(); ++i) {
+                CachedSpanEntry entry;
+                entry.codec = physPlan.spans[i].codec;
+                entry.startSample = physPlan.spans[i].startSample;
+                entry.endSample = physPlan.spans[i].endSample;
+                entry.unitCount = physPlan.spans[i].unitCount;
+                entry.physRanges = plans[i].physRanges;
+                cache.spans.push_back(std::move(entry));
+            }
+        }
+
+        outResult.deviceId = resolvedId;
+        outResult.uploadedPhysicalSegments = static_cast<int>(plans.size());
+        outResult.logicalTracks = static_cast<int>(disc.tracks.size());
+        outResult.groups = static_cast<int>(disc.groups.size());
+        outResult.encodedBytes = totalEncodedBytes;
+        outResult.committedUtoc = true;
+        outResult.committedRawSectors = committedRaw;
+        outResult.hasCommittedRawSectors = true;
+        outResult.committedSector0Hash = committedHash;
+        outResult.budget = finalBudget;
+        return true;
+    }
+
+    // Path 2: Non-destructive synchronization of a loaded hardware MiniDisc.
+    setNetMdProgress("record", "Reading current device UTOC & verifying disc identity...", 0.27);
+    HelperProgressWindow readInitialWin;
+    readInitialWin.active = true;
+    readInitialWin.operation = "record";
+    readInitialWin.fallbackPhase = "Reading current device UTOC & verifying disc identity...";
+    readInitialWin.baseProgress = 0.27;
+    readInitialWin.spanProgress = 0.06;
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawSectors{};
+    UtocDiscState deviceUtoc{};
+    if (!readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, deviceUtoc, readInitialWin, error)) {
         return false;
     }
-    clearCachedPhysicalSpanMap(resolvedId);
+
+    if (!disc.loadedDisc.baselineSector0Hash.empty()) {
+        const auto liveHash = computeUtocSectorSha256Hex(rawSectors[0].data());
+        if (liveHash != disc.loadedDisc.baselineSector0Hash) {
+            error = "Inserted MiniDisc UTOC changed on hardware since Load Disc; click Load Disc "
+                    "again to reload before recording.";
+            return false;
+        }
+    }
+
+    int preservedTracks = 0;
+    for (const auto& tr : disc.tracks) {
+        if (mdTrackUsesOnDiscAudio(disc, tr)) {
+            ++preservedTracks;
+        }
+    }
+
+    // Subpath 2A: UTOC-only edits (no newly added local audio spans).
+    if (plans.empty()) {
+        if (!validatePhysicalUtocClusters(logicalUtoc, error)) {
+            return false;
+        }
+        setNetMdProgress("record", "Writing updated UTOC Sectors 0/1/2/4 & running TOCWRT...",
+                         0.45);
+        HelperProgressWindow writeWin;
+        writeWin.active = true;
+        writeWin.operation = "record";
+        writeWin.fallbackPhase = "Writing updated UTOC Sectors 0/1/2/4 & running TOCWRT...";
+        writeWin.baseProgress = 0.45;
+        writeWin.spanProgress = 0.52;
+        std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
+        std::string committedHash;
+        if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors[3],
+                                            confirmHardware, writeWin, error, &committedRaw,
+                                            &committedHash)) {
+            return false;
+        }
+        outResult.deviceId = resolvedId;
+        outResult.uploadedPhysicalSegments = 0;
+        outResult.logicalTracks = static_cast<int>(disc.tracks.size());
+        outResult.groups = static_cast<int>(disc.groups.size());
+        outResult.encodedBytes = 0;
+        outResult.committedUtoc = true;
+        outResult.preservedOnDiscTracks = preservedTracks;
+        outResult.reclaimedClusters = physPlan.reclaimedClusters;
+        outResult.needsReloadToFinishUpload = false;
+        outResult.committedRawSectors = committedRaw;
+        outResult.hasCommittedRawSectors = true;
+        outResult.committedSector0Hash = committedHash;
+        outResult.budget = initialBudget;
+        return true;
+    }
+
+    // Subpath 2B: Mixed preserved on-disc audio + new local audio uploads.
+    const auto liveFreeRanges = readUtocFreeRangesUnlocked(deviceUtoc);
+    const int liveWholeFreeClusters = countWholeFreeClusters(liveFreeRanges);
+    const int liveFreeTrackSlots = std::max(0, 255 - static_cast<int>(deviceUtoc.trackCount));
+    const int liveFreeFragSlots = countUnusedUtocFragSlots(deviceUtoc);
+    const int spansCount = static_cast<int>(plans.size());
+
+    const bool needPreUploadReclaim = (liveWholeFreeClusters < physPlan.newUploadClusters) ||
+                                      (liveFreeTrackSlots < spansCount) ||
+                                      (liveFreeFragSlots < spansCount);
+    if (needPreUploadReclaim) {
+        const MdDisc reclaimDisc = buildReclaimOnlyDisc(disc);
+        UtocDiscState reclaimUtoc{};
+        if (!compileMdDiscToUtoc(reclaimDisc, reclaimUtoc, error)) {
+            return false;
+        }
+        const int reclaimWholeFreeClusters =
+            countWholeFreeClusters(readUtocFreeRangesUnlocked(reclaimUtoc));
+        const int reclaimFreeTrackSlots =
+            std::max(0, 255 - static_cast<int>(reclaimUtoc.trackCount));
+        const int reclaimFreeFragSlots = countUnusedUtocFragSlots(reclaimUtoc);
+        if (reclaimWholeFreeClusters < physPlan.newUploadClusters) {
+            error = "Not enough whole free clusters after reclaiming deleted tracks (need " +
+                    std::to_string(physPlan.newUploadClusters) + ", available " +
+                    std::to_string(reclaimWholeFreeClusters) + ").";
+            return false;
+        }
+        if (reclaimFreeTrackSlots < spansCount || reclaimFreeFragSlots < spansCount) {
+            error = "Not enough UTOC track or fragment slots after reclaiming deleted tracks to "
+                    "upload " +
+                    std::to_string(spansCount) + " new span(s).";
+            return false;
+        }
+
+        setNetMdProgress("record",
+                         "Reclaiming deleted audio into P-FRA via UTOC write (Step 1 of 2)...",
+                         0.40);
+        HelperProgressWindow reclaimWin;
+        reclaimWin.active = true;
+        reclaimWin.operation = "record";
+        reclaimWin.fallbackPhase =
+            "Reclaiming deleted audio into P-FRA via UTOC write (Step 1 of 2)...";
+        reclaimWin.baseProgress = 0.40;
+        reclaimWin.spanProgress = 0.56;
+        std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
+        std::string committedHash;
+        if (!writeDeviceUtocSectorsUnlocked(resolvedId, reclaimUtoc, &rawSectors[3],
+                                            confirmHardware, reclaimWin, error, &committedRaw,
+                                            &committedHash)) {
+            return false;
+        }
+
+        outResult.deviceId = resolvedId;
+        outResult.uploadedPhysicalSegments = 0;
+        outResult.logicalTracks = static_cast<int>(reclaimDisc.tracks.size());
+        outResult.groups = static_cast<int>(reclaimDisc.groups.size());
+        outResult.encodedBytes = 0;
+        outResult.committedUtoc = true;
+        outResult.preservedOnDiscTracks = preservedTracks;
+        outResult.reclaimedClusters = physPlan.reclaimedClusters;
+        outResult.needsReloadToFinishUpload = true;
+        outResult.nextActionHint =
+            "Reclaimed " + std::to_string(physPlan.reclaimedClusters) +
+            " deleted cluster(s) into disc free space (P-FRA). Please eject and reinsert the "
+            "MiniDisc so the recorder refreshes its allocation table, then click Record "
+            "MiniDisc... again to upload your new audio.";
+        outResult.committedRawSectors = committedRaw;
+        outResult.hasCommittedRawSectors = true;
+        outResult.committedSector0Hash = committedHash;
+        outResult.budget = computeUtocBudget(reclaimUtoc, medium, physTotal);
+        return true;
+    }
+
+    if (status.trackCount != static_cast<int>(deviceUtoc.trackCount)) {
+        error = "Device SRAM track count (" + std::to_string(status.trackCount) +
+                ") differs from UTOC (" + std::to_string(deviceUtoc.trackCount) +
+                "). Eject and reinsert the MiniDisc so the recorder refreshes its allocation table "
+                "before uploading new audio.";
+        return false;
+    }
 
     const std::int64_t totalBytesDenom = std::max<std::int64_t>(1, totalEncodedBytes);
     std::int64_t sentSoFar = 0;
@@ -2232,7 +3107,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         const double spanWidthFrac =
             static_cast<double>(spanWireBytes) / static_cast<double>(totalBytesDenom);
 
-        const std::string phaseLabel = "Uploading " + p.modeName + " span " +
+        const std::string phaseLabel = "Uploading new " + p.modeName + " span " +
                                        std::to_string(idx + 1) + "/" +
                                        std::to_string(plans.size()) + " (" + p.hwTitle + ")...";
         setNetMdProgress("record", phaseLabel, 0.34 + 0.48 * spanStartFrac, sentSoFar,
@@ -2258,62 +3133,50 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         sentSoFar += spanWireBytes;
     }
 
-    setNetMdProgress("record", "Reading physical UTOC allocation from disc...", 0.82);
-    HelperProgressWindow readWin;
-    readWin.active = true;
-    readWin.operation = "record";
-    readWin.fallbackPhase = "Reading physical UTOC allocation from disc...";
-    readWin.baseProgress = 0.82;
-    readWin.spanProgress = 0.06;
-    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawSectors{};
-    UtocDiscState deviceUtoc{};
-    if (!readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, deviceUtoc, readWin, error)) {
+    setNetMdProgress("record", "Reading post-upload UTOC allocation from disc...", 0.82);
+    HelperProgressWindow readPostWin;
+    readPostWin.active = true;
+    readPostWin.operation = "record";
+    readPostWin.fallbackPhase = "Reading post-upload UTOC allocation from disc...";
+    readPostWin.baseProgress = 0.82;
+    readPostWin.spanProgress = 0.06;
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> postSectors{};
+    UtocDiscState postDeviceUtoc{};
+    if (!readDeviceUtocSectorsUnlocked(resolvedId, postSectors, postDeviceUtoc, readPostWin,
+                                       error)) {
         return false;
     }
 
     for (auto& p : plans) {
-        if (!extractTrackFragmentRanges(deviceUtoc, p.uploadedTrackIndex, p.physRanges, error)) {
+        if (!extractTrackFragmentRanges(postDeviceUtoc, p.uploadedTrackIndex, p.physRanges,
+                                        error)) {
             return false;
         }
     }
 
     UtocDiscState finalUtoc = logicalUtoc;
-    if (!remapSector0WithPhysicalUploads(disc, physPlan, deviceUtoc, plans, finalUtoc, error)) {
+    if (!buildCombinedLoadedAndUploadedUtoc(disc, physPlan, logicalUtoc, postDeviceUtoc, plans,
+                                            physTotal, finalUtoc, error)) {
         return false;
     }
-    const auto finalBudget = computeUtocBudget(finalUtoc, medium);
+    const auto finalBudget = computeUtocBudget(finalUtoc, medium, physTotal);
     if (!finalBudget.fits()) {
-        error = "Remapped physical UTOC exceeds disc cluster or 255-slot limits.";
+        error = "Combined loaded/uploaded UTOC exceeds disc cluster or 255-slot limits.";
         return false;
     }
 
-    setNetMdProgress("record", "Writing final UTOC Sectors 0/1/2/4 & running TOCWRT...", 0.88);
+    setNetMdProgress("record", "Writing combined UTOC Sectors 0/1/2/4 & running TOCWRT...", 0.88);
     HelperProgressWindow writeWin;
     writeWin.active = true;
     writeWin.operation = "record";
-    writeWin.fallbackPhase = "Writing final UTOC Sectors 0/1/2/4 & running TOCWRT...";
+    writeWin.fallbackPhase = "Writing combined UTOC Sectors 0/1/2/4 & running TOCWRT...";
     writeWin.baseProgress = 0.88;
     writeWin.spanProgress = 0.11;
-    if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &rawSectors[3], confirmHardware,
-                                        writeWin, error)) {
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
+    std::string committedHash;
+    if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &postSectors[3], confirmHardware,
+                                        writeWin, error, &committedRaw, &committedHash)) {
         return false;
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(cachedSpanMutex());
-        auto& cache = cachedSpanMap();
-        cache.deviceId = resolvedId;
-        cache.spans.clear();
-        cache.spans.reserve(plans.size());
-        for (std::size_t i = 0; i < physPlan.spans.size() && i < plans.size(); ++i) {
-            CachedSpanEntry entry;
-            entry.codec = physPlan.spans[i].codec;
-            entry.startSample = physPlan.spans[i].startSample;
-            entry.endSample = physPlan.spans[i].endSample;
-            entry.unitCount = physPlan.spans[i].unitCount;
-            entry.physRanges = plans[i].physRanges;
-            cache.spans.push_back(std::move(entry));
-        }
     }
 
     outResult.deviceId = resolvedId;
@@ -2322,6 +3185,12 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     outResult.groups = static_cast<int>(disc.groups.size());
     outResult.encodedBytes = totalEncodedBytes;
     outResult.committedUtoc = true;
+    outResult.preservedOnDiscTracks = preservedTracks;
+    outResult.reclaimedClusters = physPlan.reclaimedClusters;
+    outResult.needsReloadToFinishUpload = false;
+    outResult.committedRawSectors = committedRaw;
+    outResult.hasCommittedRawSectors = true;
+    outResult.committedSector0Hash = committedHash;
     outResult.budget = finalBudget;
     return true;
 }
@@ -2347,6 +3216,32 @@ bool resetNetMdTestMockSession(std::string& error) {
     juce::var resObj;
     std::string raw;
     if (!runSessionHelperCommand("mock-reset", HelperProgressWindow{}, resObj, raw, error)) {
+        return false;
+    }
+    clearCachedPhysicalSpanMap({});
+    return true;
+}
+
+bool seedNetMdTestMockUtoc(
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors,
+    std::string& error) {
+    error.clear();
+    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
+
+    std::vector<std::uint8_t> packed(5 * kUtocSectorBytes, 0);
+    for (std::size_t s = 0; s < 5; ++s) {
+        std::memcpy(packed.data() + s * kUtocSectorBytes, rawSectors[s].data(), kUtocSectorBytes);
+    }
+    juce::TemporaryFile tmp(".seed.utoc.bin");
+    if (!tmp.getFile().replaceWithData(packed.data(), packed.size())) {
+        error = "Failed writing temporary mock UTOC seed file";
+        return false;
+    }
+    const std::string inPath = tmp.getFile().getFullPathName().toStdString();
+    juce::var resObj;
+    std::string raw;
+    if (!runSessionHelperCommand("mock-seed-utoc\t" + percentEncode(inPath),
+                                 HelperProgressWindow{}, resObj, raw, error)) {
         return false;
     }
     clearCachedPhysicalSpanMap({});

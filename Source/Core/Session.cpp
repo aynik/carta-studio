@@ -882,6 +882,9 @@ void Session::render(juce::AudioBuffer<float>& out, int begin, int count, double
             }
 
             const auto& src = *clip.audio;
+            if (src.onDiscPlaceholder) {
+                return;
+            }
             const int channels = src.numChannels();
             const int samples = src.numSamples();
             if (channels == 0 || samples == 0) {
@@ -1335,6 +1338,9 @@ bool waveformPointRange(const Clip& clip, double timelineStart, double timelineE
 }
 
 juce::Range<float> waveformRange(const Audio& audio, int channel, int begin, int end) {
+    if (audio.onDiscPlaceholder) {
+        return {};
+    }
     const int size = audio.numSamples();
     if (channel < 0 || channel >= audio.numChannels()) {
         return {};
@@ -1466,8 +1472,9 @@ juce::Range<float> clipWaveformRange(const Clip& clip, int channel, int begin, i
     if (exact) {
         *exact = false;
     }
-    if (!clip.audio || channel < 0 || channel >= clip.audio->numChannels() ||
-        !std::isfinite(clip.audio->sampleRate) || clip.audio->sampleRate <= 0) {
+    if (!clip.audio || clip.audio->onDiscPlaceholder || channel < 0 ||
+        channel >= clip.audio->numChannels() || !std::isfinite(clip.audio->sampleRate) ||
+        clip.audio->sampleRate <= 0) {
         return {};
     }
 
@@ -1526,8 +1533,9 @@ bool exactWaveformColumns(const Clip& clip, int channel, double viewStart, doubl
                           int timelineLeft, int timelineWidth, int firstX, int columns,
                           std::vector<WaveformColumn>& output, std::function<bool()> cancelled,
                           bool includeRms) {
-    if (!clip.audio || channel < 0 || channel >= clip.audio->numChannels() ||
-        !std::isfinite(clip.audio->sampleRate) || clip.audio->sampleRate <= 0 ||
+    if (!clip.audio || clip.audio->onDiscPlaceholder || channel < 0 ||
+        channel >= clip.audio->numChannels() || !std::isfinite(clip.audio->sampleRate) ||
+        clip.audio->sampleRate <= 0 ||
         !std::isfinite(viewStart) || viewStart < 0 || !std::isfinite(viewSpan) || viewSpan <= 0 ||
         !std::isfinite(viewStart + viewSpan) || timelineWidth <= 0 || columns <= 0 ||
         columns > 8192 || !std::isfinite(clip.start) || !std::isfinite(clip.offset) ||
@@ -2502,7 +2510,8 @@ std::shared_ptr<Audio> loadVerifiedReplacement(juce::AudioFormatManager& formats
         return {};
     }
 
-    if (replacement->sourceHash != original->sourceHash ||
+    if (original->onDiscPlaceholder || replacement->onDiscPlaceholder ||
+        replacement->sourceHash != original->sourceHash ||
         replacement->numChannels() != original->numChannels() ||
         replacement->numSamples() != original->numSamples() ||
         std::memcmp(&replacement->sampleRate, &original->sampleRate, sizeof(double)) != 0) {

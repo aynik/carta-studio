@@ -36,7 +36,7 @@
 
 extern "C" {
 int netmd_pf_list_devices(void);
-int netmd_pf_probe_device(const char* device_id_ptr, int device_id_len);
+int netmd_pf_probe_device(const char* device_id_ptr, int device_id_len, int include_tracks);
 int netmd_pf_erase_disc(const char* device_id_ptr, int device_id_len);
 int netmd_pf_upload_track(const char* device_id_ptr, int device_id_len, int mode_code,
                           const unsigned char* wire_ptr, int wire_len, const char* hw_title_ptr,
@@ -217,12 +217,13 @@ int cmdList() {
     return 0;
 }
 
-int cmdProbe(const std::string& deviceId) {
+int cmdProbe(const std::string& deviceId, bool includeTracks = true) {
     if (deviceId.empty()) {
         emitErrorResult("NetMD device ID is empty");
         return 1;
     }
-    if (netmd_pf_probe_device(deviceId.c_str(), static_cast<int>(deviceId.size())) < 0) {
+    if (netmd_pf_probe_device(deviceId.c_str(), static_cast<int>(deviceId.size()),
+                              includeTracks ? 1 : 0) < 0) {
         emitErrorResult(porfforErrorString("Failed to probe NetMD device"));
         return 1;
     }
@@ -534,7 +535,8 @@ int runSessionLoop(bool enableMock) {
         if (op == "list") {
             cmdList();
         } else if (op == "probe" && tok.size() >= 2) {
-            cmdProbe(percentDecode(tok[1]));
+            const bool includeTracks = (tok.size() >= 3) ? (tok[2] != "0") : true;
+            cmdProbe(percentDecode(tok[1]), includeTracks);
         } else if (op == "erase" && tok.size() >= 3) {
             cmdErase(percentDecode(tok[1]), tok[2] == "1");
         } else if (op == "read-utoc" && tok.size() >= 3) {
@@ -547,6 +549,25 @@ int runSessionLoop(bool enableMock) {
                       percentDecode(tok[4]), percentDecode(tok[5]), tok[6] == "1");
         } else if (op == "mock-reset" && enableMock) {
             carta::resetMockNetMdState();
+            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        } else if (op == "mock-seed-utoc" && enableMock && tok.size() >= 2) {
+            std::vector<std::uint8_t> raw;
+            std::string ioErr;
+            const std::string inPath = percentDecode(tok[1]);
+            if (!readBinaryFile(inPath, raw, ioErr)) {
+                emitErrorResult(ioErr);
+                continue;
+            }
+            if (raw.size() != 5 * carta::kUtocSectorBytes) {
+                emitErrorResult("Expected 11760-byte (5-sector) UTOC binary for mock-seed-utoc");
+                continue;
+            }
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> secs{};
+            for (std::size_t s = 0; s < 5; ++s) {
+                std::memcpy(secs[s].data(), raw.data() + s * carta::kUtocSectorBytes,
+                            carta::kUtocSectorBytes);
+            }
+            carta::seedMockNetMdUtoc(secs);
             emitJsonLine("{\"event\":\"result\",\"ok\":true}");
         } else if (op == "mock-guard" && enableMock && tok.size() >= 2) {
             carta::setSimulateRealHardwareGuardOnMock(tok[1] == "1");
@@ -565,7 +586,7 @@ void printUsage() {
               << "Built with netmd-js & netmd-exploits (GPL-2.0) and libusb-1.0 (LGPL-2.1).\n"
               << "Usage:\n"
               << "  carta-netmd list\n"
-              << "  carta-netmd probe <device-id>\n"
+              << "  carta-netmd probe <device-id> [--no-tracks]\n"
               << "  carta-netmd erase <device-id> [--confirm-hardware]\n"
               << "  carta-netmd read-utoc <device-id> --out <sectors5.bin>\n"
               << "  carta-netmd write-utoc <device-id> --in <sectors5.bin> [--mask 23] "
@@ -598,10 +619,16 @@ int main(int argc, char** argv) {
     }
     if (cmd == "probe") {
         if (argc < 3) {
-            emitErrorResult("Usage: carta-netmd probe <device-id>");
+            emitErrorResult("Usage: carta-netmd probe <device-id> [--no-tracks]");
             return 2;
         }
-        return cmdProbe(argv[2]);
+        bool noTracks = false;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--no-tracks") == 0) {
+                noTracks = true;
+            }
+        }
+        return cmdProbe(argv[2], !noTracks);
     }
     if (cmd == "erase") {
         if (argc < 3) {

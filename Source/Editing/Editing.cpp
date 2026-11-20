@@ -6588,6 +6588,132 @@ bool preservesMarkerBounds(const Session& before, const Session& after, juce::St
     return true;
 }
 
+bool preservesOnDiscAudio(const Session& before, const Session& after, juce::String& error) {
+    struct LockedRef {
+        int trackIndex = 0;
+        const Clip* clip = nullptr;
+    };
+    auto collectLocked = [](const Session& s) {
+        std::vector<LockedRef> refs;
+        for (int ti = 0; ti < static_cast<int>(s.tracks.size()); ++ti) {
+            for (const auto& clip : s.tracks[static_cast<size_t>(ti)].clips) {
+                if (clip.lockedOnDisc) {
+                    refs.push_back({ti, &clip});
+                }
+            }
+        }
+        std::sort(refs.begin(), refs.end(), [](const LockedRef& a, const LockedRef& b) {
+            return std::tie(a.trackIndex, a.clip->start, a.clip->onDiscRegionId) <
+                   std::tie(b.trackIndex, b.clip->start, b.clip->onDiscRegionId);
+        });
+        return refs;
+    };
+
+    const auto beforeLocked = collectLocked(before);
+    const auto afterLocked = collectLocked(after);
+    if (beforeLocked.empty() && afterLocked.empty()) {
+        return true;
+    }
+
+    auto sameVal = [](const auto& a, const auto& b) noexcept {
+        return std::memcmp(&a, &b, sizeof(a)) == 0;
+    };
+
+    if (beforeLocked.size() != afterLocked.size()) {
+        error = "On-disc MiniDisc audio is locked (no re-encoding). Edit tracks, splits, order, "
+                "titles, or flags in the MiniDisc workspace instead.";
+        return false;
+    }
+    for (std::size_t i = 0; i < beforeLocked.size(); ++i) {
+        const auto& bRef = beforeLocked[i];
+        const auto& aRef = afterLocked[i];
+        const auto& bClip = *bRef.clip;
+        const auto& aClip = *aRef.clip;
+        if (bRef.trackIndex != aRef.trackIndex || bClip.onDiscRegionId != aClip.onDiscRegionId ||
+            bClip.lockedOnDisc != aClip.lockedOnDisc || !sameVal(bClip.start, aClip.start) ||
+            !sameVal(bClip.offset, aClip.offset) || !sameVal(bClip.duration, aClip.duration) ||
+            !sameVal(bClip.gain, aClip.gain) || !sameVal(bClip.fadeIn, aClip.fadeIn) ||
+            !sameVal(bClip.fadeOut, aClip.fadeOut) ||
+            !sameVal(bClip.fadeInStart, aClip.fadeInStart) ||
+            !sameVal(bClip.fadeOutEnd, aClip.fadeOutEnd) ||
+            bClip.fadeInShape != aClip.fadeInShape || bClip.fadeOutShape != aClip.fadeOutShape) {
+            error = "On-disc MiniDisc audio is locked (no re-encoding). Edit tracks, splits, "
+                    "order, titles, or flags in the MiniDisc workspace instead.";
+            return false;
+        }
+    }
+
+    for (const auto& track : after.tracks) {
+        for (const auto& clip : track.clips) {
+            if (clip.lockedOnDisc) {
+                continue;
+            }
+            const double clipStart = clip.start;
+            const double clipEnd = clip.start + clip.duration;
+            for (const auto& lRef : afterLocked) {
+                const double lockedStart = lRef.clip->start;
+                const double lockedEnd = lRef.clip->start + lRef.clip->duration;
+                if (clipStart < lockedEnd - 1e-9 && clipEnd > lockedStart + 1e-9) {
+                    error = "Cannot overlap local audio with locked on-disc MiniDisc audio. Place "
+                            "new audio after the on-disc regions.";
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+void populateLoadedDiscSession(const MdDisc& loadedDisc, Session& session) {
+    session = {};
+    session.mdDisc = loadedDisc;
+
+    Track track;
+    track.name = "MiniDisc";
+
+    std::vector<std::string> regionLabels(loadedDisc.loadedDisc.regions.size());
+    for (const auto& tr : loadedDisc.tracks) {
+        for (const auto& part : tr.parts) {
+            const int rIdx = findMdOnDiscRegionForPart(loadedDisc.loadedDisc, part);
+            if (rIdx >= 0 && regionLabels[static_cast<std::size_t>(rIdx)].empty()) {
+                const auto title = tr.displayTitle();
+                if (!title.empty()) {
+                    regionLabels[static_cast<std::size_t>(rIdx)] = title;
+                }
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < loadedDisc.loadedDisc.regions.size(); ++i) {
+        const auto& reg = loadedDisc.loadedDisc.regions[i];
+        const std::int64_t frames64 =
+            std::max<std::int64_t>(0, reg.timelineEndSample - reg.timelineStartSample);
+        if (frames64 <= 0 || frames64 > std::numeric_limits<int>::max()) {
+            continue;
+        }
+        auto audio = std::make_shared<Audio>();
+        audio->onDiscPlaceholder = true;
+        audio->placeholderChannels = mdChannelsForCodec(reg.codec);
+        audio->placeholderFrames = static_cast<int>(frames64);
+        audio->sampleRate = sessionRate;
+
+        Clip clip;
+        clip.audio = std::move(audio);
+        clip.start = static_cast<double>(reg.timelineStartSample) / sessionRate;
+        clip.offset = 0.0;
+        clip.duration = static_cast<double>(frames64) / sessionRate;
+        clip.lockedOnDisc = true;
+        clip.onDiscRegionId = reg.id;
+        const auto& lbl = regionLabels[i];
+        clip.name = lbl.empty() ? ("On-Disc Region " + juce::String(static_cast<int>(i + 1)))
+                                : juce::String::fromUTF8(lbl.c_str());
+        track.clips.push_back(std::move(clip));
+    }
+
+    session.tracks.push_back(std::move(track));
+}
+
 namespace {
 
 bool applyRemoveRange(Session& session, const TimeSelection& selection) {

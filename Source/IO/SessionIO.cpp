@@ -1578,6 +1578,26 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
         props->setProperty("groups", groups);
     }
 
+    auto encodeAddrVar = [](const MdPhysAddr& a) {
+        auto v = object();
+        auto* o = v.getDynamicObject();
+        o->setProperty("cluster", static_cast<int>(a.cluster));
+        o->setProperty("sector", static_cast<int>(a.sector));
+        o->setProperty("group", static_cast<int>(a.group));
+        return v;
+    };
+    auto encodeRangeArray = [&encodeAddrVar](const std::vector<MdPhysRange>& ranges) {
+        juce::Array<juce::var> arr;
+        for (const auto& r : ranges) {
+            auto v = object();
+            auto* o = v.getDynamicObject();
+            o->setProperty("start", encodeAddrVar(r.start));
+            o->setProperty("end", encodeAddrVar(r.end));
+            arr.add(v);
+        }
+        return arr;
+    };
+
     const bool hasUtoc =
         std::any_of(disc.importedUtocSectors.begin(), disc.importedUtocSectors.end(),
                     [](const auto& s) { return !s.empty(); });
@@ -1588,6 +1608,51 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
                                        : juce::Base64::toBase64(sector.data(), sector.size()));
         }
         props->setProperty("importedUtocSectors", sectors);
+    }
+
+    if (disc.loadedDisc.active) {
+        const auto& ld = disc.loadedDisc;
+        if (!validDiscText(ld.sourceDeviceId) || !validDiscText(ld.baselineSector0Hash)) {
+            error = "Loaded MiniDisc metadata contains invalid UTF-8 text.";
+            return false;
+        }
+        auto loadedVar = object();
+        auto* lo = loadedVar.getDynamicObject();
+        lo->setProperty("active", true);
+        lo->setProperty("sourceDeviceId", juce::String::fromUTF8(ld.sourceDeviceId.c_str()));
+        lo->setProperty("baselineSector0Hash",
+                        juce::String::fromUTF8(ld.baselineSector0Hash.c_str()));
+        lo->setProperty("deviceSignature", static_cast<int>(ld.deviceSignature));
+        lo->setProperty("physicalStartCluster", static_cast<int>(ld.physicalStartCluster));
+        lo->setProperty("physicalLastCluster", static_cast<int>(ld.physicalLastCluster));
+
+        juce::Array<juce::var> regs;
+        for (const auto& r : ld.regions) {
+            if (!validDiscText(r.id)) {
+                error = "Loaded MiniDisc region ID contains invalid UTF-8 text.";
+                return false;
+            }
+            auto rv = object();
+            auto* ro = rv.getDynamicObject();
+            ro->setProperty("id", juce::String::fromUTF8(r.id.c_str()));
+            ro->setProperty("codec", juce::String(mdCodecModeToString(r.codec)));
+            ro->setProperty("rawModeByte", static_cast<int>(r.rawModeByte));
+            ro->setProperty("physStart", encodeAddrVar(r.physStart));
+            ro->setProperty("physEnd", encodeAddrVar(r.physEnd));
+            ro->setProperty("unitCount", r.unitCount);
+            ro->setProperty("timelineStartSample", static_cast<juce::int64>(r.timelineStartSample));
+            ro->setProperty("timelineEndSample", static_cast<juce::int64>(r.timelineEndSample));
+            ro->setProperty("audioDownloaded", r.audioDownloaded);
+            regs.add(rv);
+        }
+        lo->setProperty("regions", regs);
+        lo->setProperty("initialFreeRanges", encodeRangeArray(ld.initialFreeRanges));
+        lo->setProperty("defectiveRanges", encodeRangeArray(ld.defectiveRanges));
+        if (ld.rawSector3.size() == kUtocSectorBytes) {
+            lo->setProperty("rawSector3",
+                            juce::Base64::toBase64(ld.rawSector3.data(), ld.rawSector3.size()));
+        }
+        props->setProperty("loadedDisc", loadedVar);
     }
 
     output = std::move(value);
@@ -1781,6 +1846,138 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
             }
             const auto* raw = static_cast<const std::uint8_t*>(decoded.getData());
             next.importedUtocSectors[static_cast<size_t>(i)].assign(raw, raw + kUtocSectorBytes);
+        }
+    }
+
+    if (props->hasProperty("loadedDisc")) {
+        const auto ldv = value["loadedDisc"];
+        if (!ldv.isObject() || !ldv["active"].isBool()) {
+            error = "Invalid loadedDisc state.";
+            return false;
+        }
+        if (static_cast<bool>(ldv["active"])) {
+            const auto* lo = ldv.getDynamicObject();
+            auto parseAddrVar = [&](const juce::var& v, MdPhysAddr& out) -> bool {
+                juce::int64 cl = 0, sec = 0, grp = 0;
+                if (!v.isObject() || !integerValue(v["cluster"], cl) ||
+                    !integerValue(v["sector"], sec) || !integerValue(v["group"], grp) ||
+                    cl < 0 || cl > 16383 || sec < 0 || sec >= kMdSectorsPerCluster || grp < 0 ||
+                    grp >= kMdUnitsPerSector) {
+                    error = "Invalid MD physical address in loadedDisc.";
+                    return false;
+                }
+                out = {static_cast<std::uint16_t>(cl), static_cast<std::uint8_t>(sec),
+                       static_cast<std::uint8_t>(grp)};
+                return true;
+            };
+            auto parseRangeList = [&](const char* prop, std::vector<MdPhysRange>& out) -> bool {
+                if (!lo->hasProperty(prop)) {
+                    return true;
+                }
+                if (!ldv[prop].isArray()) {
+                    error = "Invalid range list in loadedDisc.";
+                    return false;
+                }
+                for (const auto& rv : *ldv[prop].getArray()) {
+                    MdPhysRange r;
+                    if (!rv.isObject() || !parseAddrVar(rv["start"], r.start) ||
+                        !parseAddrVar(rv["end"], r.end)) {
+                        return false;
+                    }
+                    out.push_back(r);
+                }
+                return true;
+            };
+
+            auto& ld = next.loadedDisc;
+            ld.active = true;
+            if (lo->hasProperty("sourceDeviceId")) {
+                if (!ldv["sourceDeviceId"].isString()) {
+                    error = "Invalid loadedDisc sourceDeviceId.";
+                    return false;
+                }
+                ld.sourceDeviceId = ldv["sourceDeviceId"].toString().toStdString();
+            }
+            if (lo->hasProperty("baselineSector0Hash")) {
+                if (!ldv["baselineSector0Hash"].isString()) {
+                    error = "Invalid loadedDisc baselineSector0Hash.";
+                    return false;
+                }
+                ld.baselineSector0Hash = ldv["baselineSector0Hash"].toString().toStdString();
+            }
+            juce::int64 sig = 0, pStart = 50, pLast = 2251;
+            if ((lo->hasProperty("deviceSignature") &&
+                 (!integerValue(ldv["deviceSignature"], sig) || sig < 0 || sig > 65535)) ||
+                !integerValue(ldv["physicalStartCluster"], pStart) || pStart < 1 ||
+                pStart > 16383 || !integerValue(ldv["physicalLastCluster"], pLast) ||
+                pLast < pStart || pLast > 16383) {
+                error = "Invalid loadedDisc geometry or signature.";
+                return false;
+            }
+            ld.deviceSignature = static_cast<std::uint16_t>(sig);
+            ld.physicalStartCluster = static_cast<std::uint16_t>(pStart);
+            ld.physicalLastCluster = static_cast<std::uint16_t>(pLast);
+
+            if (!ldv["regions"].isArray()) {
+                error = "Invalid loadedDisc regions array.";
+                return false;
+            }
+            for (const auto& rv : *ldv["regions"].getArray()) {
+                if (!rv.isObject() || !rv["id"].isString() || !rv["codec"].isString()) {
+                    error = "Invalid loadedDisc region entry.";
+                    return false;
+                }
+                MdOnDiscRegion reg;
+                reg.id = rv["id"].toString().toStdString();
+                if (!parseMdCodecMode(rv["codec"].toString().toStdString(), reg.codec)) {
+                    error = "Invalid codec in loadedDisc region.";
+                    return false;
+                }
+                juce::int64 rawMode = 0, units = 0, ts = 0, te = 0;
+                if (!integerValue(rv["rawModeByte"], rawMode) || rawMode < 0 || rawMode > 255 ||
+                    !parseAddrVar(rv["physStart"], reg.physStart) ||
+                    !parseAddrVar(rv["physEnd"], reg.physEnd) ||
+                    !integerValue(rv["unitCount"], units) || units <= 0 ||
+                    !integerValue(rv["timelineStartSample"], ts) || ts < 0 ||
+                    !integerValue(rv["timelineEndSample"], te) || te <= ts ||
+                    te >= 9007199254740992LL) {
+                    error = "Invalid numeric bounds in loadedDisc region.";
+                    return false;
+                }
+                reg.rawModeByte = static_cast<std::uint8_t>(rawMode);
+                reg.unitCount = static_cast<int>(units);
+                reg.timelineStartSample = ts;
+                reg.timelineEndSample = te;
+                if (rv.getDynamicObject()->hasProperty("audioDownloaded")) {
+                    if (!rv["audioDownloaded"].isBool()) {
+                        error = "Invalid audioDownloaded flag in loadedDisc region.";
+                        return false;
+                    }
+                    reg.audioDownloaded = static_cast<bool>(rv["audioDownloaded"]);
+                }
+                ld.regions.push_back(std::move(reg));
+            }
+            if (!parseRangeList("initialFreeRanges", ld.initialFreeRanges) ||
+                !parseRangeList("defectiveRanges", ld.defectiveRanges)) {
+                return false;
+            }
+            if (lo->hasProperty("rawSector3")) {
+                if (!ldv["rawSector3"].isString()) {
+                    error = "Invalid loadedDisc rawSector3.";
+                    return false;
+                }
+                const auto s = ldv["rawSector3"].toString();
+                if (s.isNotEmpty()) {
+                    juce::MemoryOutputStream decoded;
+                    if (!juce::Base64::convertFromBase64(decoded, s) ||
+                        decoded.getDataSize() != kUtocSectorBytes) {
+                        error = "Invalid loadedDisc rawSector3 size.";
+                        return false;
+                    }
+                    const auto* raw = static_cast<const std::uint8_t*>(decoded.getData());
+                    ld.rawSector3.assign(raw, raw + kUtocSectorBytes);
+                }
+            }
         }
     }
 
@@ -2159,7 +2356,15 @@ bool determineProjectVersion(const Session& session, WavRange savedLoop, bool& h
         std::any_of(session.tracks.begin(), session.tracks.end(),
                     [](const auto& track) { return !track.channelHeightWeights.empty(); });
 
-    hasMdDisc = !isDefaultMdDisc(session.mdDisc);
+    const bool hasLoadedOnDisc =
+        session.mdDisc.loadedDisc.active ||
+        std::any_of(session.tracks.begin(), session.tracks.end(), [](const auto& track) {
+            return std::any_of(track.clips.begin(), track.clips.end(), [](const auto& clip) {
+                return clip.lockedOnDisc || (clip.audio && clip.audio->onDiscPlaceholder);
+            });
+        });
+
+    hasMdDisc = !isDefaultMdDisc(session.mdDisc) || hasLoadedOnDisc;
     if (hasMdDisc && !encodeMdDisc(session.mdDisc, mdDiscValue, error)) {
         return false;
     }
@@ -2179,26 +2384,29 @@ bool determineProjectVersion(const Session& session, WavRange savedLoop, bool& h
         });
 
     projectVersion =
-        hasMdDisc
-            ? 25
-            : ((hasHighGain || hasFadeShapes)
-                   ? 24
-                   : (savedLoop.end > savedLoop.start
-                          ? 14
-                          : (!session.markers.empty()
-                                 ? 13
-                                 : (hasChannelHeights
-                                        ? 12
-                                        : (hasWaveformZoom
-                                               ? 11
-                                               : (hasGroups
-                                                      ? 10
-                                                      : (session.minimumEndSample > 0
-                                                             ? 9
-                                                             : (hasChannelView
-                                                                    ? 8
-                                                                    : (hasCombinedView ? 7
-                                                                                       : 6)))))))));
+        hasLoadedOnDisc
+            ? 26
+            : (hasMdDisc
+                   ? 25
+                   : ((hasHighGain || hasFadeShapes)
+                          ? 24
+                          : (savedLoop.end > savedLoop.start
+                                 ? 14
+                                 : (!session.markers.empty()
+                                        ? 13
+                                        : (hasChannelHeights
+                                               ? 12
+                                               : (hasWaveformZoom
+                                                      ? 11
+                                                      : (hasGroups
+                                                             ? 10
+                                                             : (session.minimumEndSample > 0
+                                                                    ? 9
+                                                                    : (hasChannelView
+                                                                           ? 8
+                                                                           : (hasCombinedView
+                                                                                  ? 7
+                                                                                  : 6))))))))));
     return true;
 }
 
@@ -2221,6 +2429,9 @@ bool collectAndVerifySaveSources(
             }
             if (!validProjectClip(clip, error)) {
                 return false;
+            }
+            if (clip.audio->onDiscPlaceholder) {
+                continue;
             }
             const auto path = resolveSaveSourceFile(clip.audio.get(), sourcePaths);
             if (path == juce::File{}) {
@@ -2346,16 +2557,30 @@ bool serializeProjectTracks(const Session& session, const juce::File& projectFil
             if (!keepGoing(0.9)) {
                 return false;
             }
-            const auto path = resolveSaveSourceFile(clip.audio.get(), sourcePaths);
-            if (path == juce::File{} || sameFile(path, projectFile)) {
-                error = "Project file cannot replace an audio source.";
-                return false;
-            }
             auto c = object();
             auto* o = c.getDynamicObject();
-            const auto relative = path.getRelativePathFrom(projectFile.getParentDirectory());
-            o->setProperty("source", sourcePaths ? relative.replaceCharacter('\\', '/') : relative);
-            o->setProperty("sourceSha256", clip.audio->sourceHash);
+            if (clip.audio->onDiscPlaceholder) {
+                o->setProperty("source", juce::String());
+                o->setProperty("sourceSha256", juce::String());
+                o->setProperty("onDiscPlaceholder", true);
+                o->setProperty("placeholderChannels", clip.audio->placeholderChannels);
+                o->setProperty("placeholderFrames", clip.audio->placeholderFrames);
+            } else {
+                const auto path = resolveSaveSourceFile(clip.audio.get(), sourcePaths);
+                if (path == juce::File{} || sameFile(path, projectFile)) {
+                    error = "Project file cannot replace an audio source.";
+                    return false;
+                }
+                const auto relative = path.getRelativePathFrom(projectFile.getParentDirectory());
+                o->setProperty("source",
+                               sourcePaths ? relative.replaceCharacter('\\', '/') : relative);
+                o->setProperty("sourceSha256", clip.audio->sourceHash);
+            }
+            if (projectVersion >= 26 && clip.lockedOnDisc) {
+                o->setProperty("lockedOnDisc", true);
+                o->setProperty("onDiscRegionId",
+                               juce::String::fromUTF8(clip.onDiscRegionId.c_str()));
+            }
             o->setProperty("clipName",
                            sourcePaths && clip.name.isEmpty() ? clipDisplayName(clip) : clip.name);
             if (projectVersion >= 10) {
@@ -2657,82 +2882,123 @@ bool loadProjectClip(ProjectLoadContext& ctx, const juce::var& cv, Track& track,
         return false;
     }
 
-    const auto name = cv["source"].toString();
-    if (name.isEmpty()) {
-        error = "Missing audio source path.";
-        return false;
-    }
-    const auto original = juce::File::isAbsolutePath(name)
-                              ? juce::File(name)
-                              : ctx.projectFile.getParentDirectory().getChildFile(name);
-    const auto key = original.getFullPathName();
-    auto source = original;
+    const auto* clipProps = cv.getDynamicObject();
+    const bool isPlaceholder = ctx.version >= 26 && clipProps->hasProperty("onDiscPlaceholder") &&
+                               cv["onDiscPlaceholder"].isBool() &&
+                               static_cast<bool>(cv["onDiscPlaceholder"]);
 
-    const bool hasHash = cv.getDynamicObject()->hasProperty("sourceSha256");
-    const auto expected = cv["sourceSha256"].toString();
-    if (hasHash && (!cv["sourceSha256"].isString() || expected.length() != 64 ||
-                    !expected.containsOnly("0123456789abcdef"))) {
-        error = "Invalid audio source checksum in project.";
-        return false;
-    }
-
-    if (ctx.relinks) {
-        const auto replacement = ctx.relinks->find(key);
-        if (replacement != ctx.relinks->end()) {
-            if (!hasHash) {
-                error = "Cannot verify a replacement for a project without source checksums.";
-                return false;
-            }
-            source = replacement->second;
-            ctx.usedRelink = true;
-            ctx.appliedRelinks.insert(key);
-        }
-    }
-
-    const auto offerRelink = [&] {
-        if (ctx.request && hasHash) {
-            *ctx.request = {original, expected};
-        }
-    };
-
-    auto it = ctx.sources.find(key);
-    if (it == ctx.sources.end()) {
-        auto audio = loadAudio(ctx.formats, source, error, [&](double value) {
-            return ctx.keepGoing(0.95 * (static_cast<double>(ctx.completed) + value) / ctx.total);
-        });
-        if (!audio) {
-            if (error == "Import cancelled.") {
-                error = "Project opening cancelled.";
-            } else if (!source.existsAsFile() ||
-                       error.startsWith("Unsupported or empty audio file:") ||
-                       error.startsWith("Could not read audio:") ||
-                       error.startsWith("Could not read audio source:") ||
-                       error.startsWith("Audio source changed while it was being imported:") ||
-                       error.startsWith("Audio contains a non-finite sample:")) {
-                if (hasHash) {
-                    offerRelink();
-                } else {
-                    error += " This project has no source checksum; restore the original file at "
-                             "its saved path.";
-                }
-            }
+    std::shared_ptr<Audio> clipAudio;
+    if (isPlaceholder) {
+        juce::int64 phChannels = 0;
+        juce::int64 phFrames = 0;
+        if (!integerValue(cv["placeholderChannels"], phChannels) || phChannels < 1 ||
+            phChannels > 8 || !integerValue(cv["placeholderFrames"], phFrames) ||
+            phFrames <= 0 || phFrames > std::numeric_limits<int>::max()) {
+            error = "Invalid on-disc placeholder audio dimensions.";
             return false;
         }
-        it = ctx.sources.emplace(key, std::move(audio)).first;
+        clipAudio = std::make_shared<Audio>();
+        clipAudio->onDiscPlaceholder = true;
+        clipAudio->placeholderChannels = static_cast<int>(phChannels);
+        clipAudio->placeholderFrames = static_cast<int>(phFrames);
+        clipAudio->sampleRate = sessionRate;
+    } else {
+        const auto name = cv["source"].toString();
+        if (name.isEmpty()) {
+            error = "Missing audio source path.";
+            return false;
+        }
+        const auto original = juce::File::isAbsolutePath(name)
+                                  ? juce::File(name)
+                                  : ctx.projectFile.getParentDirectory().getChildFile(name);
+        const auto key = original.getFullPathName();
+        auto source = original;
+
+        const bool hasHash = clipProps->hasProperty("sourceSha256");
+        const auto expected = cv["sourceSha256"].toString();
+        if (hasHash && (!cv["sourceSha256"].isString() || expected.length() != 64 ||
+                        !expected.containsOnly("0123456789abcdef"))) {
+            error = "Invalid audio source checksum in project.";
+            return false;
+        }
+
+        if (ctx.relinks) {
+            const auto replacement = ctx.relinks->find(key);
+            if (replacement != ctx.relinks->end()) {
+                if (!hasHash) {
+                    error = "Cannot verify a replacement for a project without source checksums.";
+                    return false;
+                }
+                source = replacement->second;
+                ctx.usedRelink = true;
+                ctx.appliedRelinks.insert(key);
+            }
+        }
+
+        const auto offerRelink = [&] {
+            if (ctx.request && hasHash) {
+                *ctx.request = {original, expected};
+            }
+        };
+
+        auto it = ctx.sources.find(key);
+        if (it == ctx.sources.end()) {
+            auto audio = loadAudio(ctx.formats, source, error, [&](double value) {
+                return ctx.keepGoing(0.95 * (static_cast<double>(ctx.completed) + value) /
+                                     ctx.total);
+            });
+            if (!audio) {
+                if (error == "Import cancelled.") {
+                    error = "Project opening cancelled.";
+                } else if (!source.existsAsFile() ||
+                           error.startsWith("Unsupported or empty audio file:") ||
+                           error.startsWith("Could not read audio:") ||
+                           error.startsWith("Could not read audio source:") ||
+                           error.startsWith("Audio source changed while it was being imported:") ||
+                           error.startsWith("Audio contains a non-finite sample:")) {
+                    if (hasHash) {
+                        offerRelink();
+                    } else {
+                        error += " This project has no source checksum; restore the original file "
+                                 "at its saved path.";
+                    }
+                }
+                return false;
+            }
+            it = ctx.sources.emplace(key, std::move(audio)).first;
+        }
+
+        if (hasHash && expected != it->second->sourceHash) {
+            error = "Audio source does not match the saved project: " + source.getFileName();
+            offerRelink();
+            return false;
+        }
+        clipAudio = it->second;
     }
 
-    if (hasHash && expected != it->second->sourceHash) {
-        error = "Audio source does not match the saved project: " + source.getFileName();
-        offerRelink();
-        return false;
-    }
-    if (offset + duration > it->second->length() + 1e-8) {
+    if (offset + duration > clipAudio->length() + 1e-8) {
         error = "Invalid project clip bounds.";
         return false;
     }
 
-    Clip clip{it->second, start, offset, duration};
-    const auto* props = cv.getDynamicObject();
+    Clip clip{clipAudio, start, offset, duration};
+    const auto* props = clipProps;
+    if (ctx.version >= 26) {
+        if (props->hasProperty("lockedOnDisc")) {
+            if (!cv["lockedOnDisc"].isBool()) {
+                error = "Invalid lockedOnDisc clip flag.";
+                return false;
+            }
+            clip.lockedOnDisc = static_cast<bool>(cv["lockedOnDisc"]);
+        }
+        if (props->hasProperty("onDiscRegionId")) {
+            if (!cv["onDiscRegionId"].isString()) {
+                error = "Invalid onDiscRegionId clip property.";
+                return false;
+            }
+            clip.onDiscRegionId = cv["onDiscRegionId"].toString().toStdString();
+        }
+    }
     if (ctx.version >= 10) {
         if (!cv["groupId"].isString() || !validClipGroupId(cv["groupId"].toString())) {
             error = "Invalid clip group identity.";
@@ -2791,9 +3057,9 @@ bool loadProjectClip(ProjectLoadContext& ctx, const juce::var& cv, Track& track,
         clip.fadeOutEnd = exact[6];
     }
     if (clip.fadeIn < 0 || clip.fadeOut < 0 || clip.fadeInStart < 0 || clip.fadeOutEnd < 0 ||
-        clip.fadeIn > it->second->length() + 1e-8 || clip.fadeOut > it->second->length() + 1e-8 ||
-        clip.fadeInStart + clip.fadeIn > it->second->length() + 1e-8 ||
-        clip.fadeOutEnd > it->second->length() + 1e-8 || clip.fadeOut > clip.fadeOutEnd + 1e-8) {
+        clip.fadeIn > clipAudio->length() + 1e-8 || clip.fadeOut > clipAudio->length() + 1e-8 ||
+        clip.fadeInStart + clip.fadeIn > clipAudio->length() + 1e-8 ||
+        clip.fadeOutEnd > clipAudio->length() + 1e-8 || clip.fadeOut > clip.fadeOutEnd + 1e-8) {
         error = "Invalid clip fade.";
         return false;
     }
@@ -3066,6 +3332,9 @@ bool exportPortableSession(const Session& session, int channels, const juce::Fil
             if (!validProjectClip(clip, error)) {
                 return false;
             }
+            if (clip.audio->onDiscPlaceholder) {
+                continue;
+            }
             if (seen.insert(clip.audio.get()).second) {
                 if (clip.audio->sourceHash.length() != 64 ||
                     !clip.audio->sourceHash.containsOnly("0123456789abcdef") ||
@@ -3239,7 +3508,7 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
     juce::int64 version = 0;
     juce::int64 masterValue = 0;
     if (!root.isObject() || !integerValue(root["version"], version) || version < 1 ||
-        version > 25 || !root["tracks"].isArray() || !root["markers"].isArray()) {
+        version > 26 || !root["tracks"].isArray() || !root["markers"].isArray()) {
         error = "Invalid or unsupported Carta Studio project.";
         return false;
     }
@@ -3273,12 +3542,13 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
         return false;
     }
     if (version < 25 && root.getDynamicObject()->hasProperty("mdDisc")) {
-        error = "MD disc authoring data requires project version 25.";
+        error = "MD disc authoring data requires project version 25 or later.";
         return false;
     }
-    if (version == 25) {
+    if (version >= 25) {
         if (!root.getDynamicObject()->hasProperty("mdDisc")) {
-            error = "Missing MD disc authoring data for version 25 project.";
+            error = "Missing MD disc authoring data for version " + juce::String(version) +
+                    " project.";
             return false;
         }
         if (!decodeMdDisc(root["mdDisc"], next.mdDisc, error)) {
@@ -3430,12 +3700,21 @@ bool packageProjectPathsValid(const juce::File& project, const std::set<juce::St
         return false;
     }
 
+    juce::int64 pkgVersion = 0;
+    integerValue(root["version"], pkgVersion);
+
     for (const auto& track : *root["tracks"].getArray()) {
         if (!track.isObject() || !track["clips"].isArray()) {
             error = "Invalid package track.";
             return false;
         }
         for (const auto& clip : *track["clips"].getArray()) {
+            if (pkgVersion >= 26 && clip.isObject() &&
+                clip.getDynamicObject()->hasProperty("onDiscPlaceholder") &&
+                clip["onDiscPlaceholder"].isBool() &&
+                static_cast<bool>(clip["onDiscPlaceholder"])) {
+                continue;
+            }
             const auto name = clip["source"].toString().replaceCharacter('\\', '/');
             const auto hash = clip["sourceSha256"].toString();
             if (!clip.isObject() || !clip["source"].isString() ||

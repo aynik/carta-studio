@@ -3986,6 +3986,7 @@ bool Studio::adjustSelectedClipEdges(const std::vector<carta::ClipReference>& cl
 #endif
                 candidate = session;
                 changed = carta::nudgeClipGroupEdges(candidate, clips, endEdge, samples, error) &&
+                          carta::preservesOnDiscAudio(session, candidate, error) &&
                           carta::preservesMarkerBounds(session, candidate, error);
                 if (changed) {
                     candidateRange = carta::fullMasterPlaybackRange(candidate);
@@ -5561,7 +5562,8 @@ bool Studio::startSelectedTrackRender(const juce::File& target, bool ipc, juce::
                                 }
                                 candidate.tracks.back().muted = true;
                             }
-                            if (!carta::preservesMarkerBounds(safe->session, candidate, problem)) {
+                            if (!carta::preservesOnDiscAudio(safe->session, candidate, problem) ||
+                                !carta::preservesMarkerBounds(safe->session, candidate, problem)) {
                                 return false;
                             }
                             const auto selected =

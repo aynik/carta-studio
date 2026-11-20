@@ -260,7 +260,11 @@ bool compileUtocSectors(const UtocDiscState& state,
                         std::array<std::uint8_t, kUtocSectorBytes>& sector4, std::string& error);
 
 /** Computes cluster, track, fragment DAG, and title-cell usage for `state`. */
-UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medium = "md80");
+UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medium = "md80",
+                             int totalClustersOverride = 0);
+
+/** Returns lowercase 64-char hex SHA-256 of a raw 2,352-byte UTOC sector. */
+std::string computeUtocSectorSha256Hex(const std::uint8_t* sector2352);
 
 /**
  * Compiles an authored `MdDisc` into `UtocDiscState` (merging identical DAG fragment tails).
@@ -273,6 +277,15 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
  * Requires Sector 0. Resets `out` and populates `error` on failure.
  */
 bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error);
+
+/**
+ * Reconstructs an authored `MdDisc` and `MdLoadedDiscState` from 5 raw 2,352-byte UTOC sectors
+ * read from physical NetMD hardware (preserving exact regions, odd-unit fragments, P-FRA, P-DFA,
+ * and Sector 3 verbatim).
+ */
+bool loadMdDiscFromDeviceUtoc(
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors,
+    const std::string& sourceDeviceId, MdDisc& out, std::string& error);
 
 /** Returns true if any reachable fragment carries `kUtocNonAudio` (e.g., Hi-MD data track). */
 bool utocHasNonAudioTrack(const UtocDiscState& state) noexcept;

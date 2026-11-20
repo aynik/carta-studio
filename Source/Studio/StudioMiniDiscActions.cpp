@@ -24,6 +24,8 @@
 
 #include "Studio/Studio.h"
 
+#include <set>
+
 // ============================================================================
 // Track Focus & UTOC Title / Flag Editing
 // ============================================================================
@@ -185,23 +187,29 @@ void Studio::editSelectedTrackMdFlags() {
 
     const auto revision = editGeneration;
     const auto& track = session.mdDisc.tracks[static_cast<size_t>(idx0)];
-    const juce::String codecVal =
-        track.codecOverride ? juce::String(carta::mdCodecModeToString(*track.codecOverride))
-                            : juce::String();
+    const bool onDiscTrack = carta::mdTrackUsesOnDiscAudio(session.mdDisc, track);
+    const auto effCodec = carta::effectiveTrackCodec(session.mdDisc, track);
+    const juce::String codecVal = juce::String(carta::mdCodecModeToString(
+        track.codecOverride ? *track.codecOverride : effCodec));
     showTextFieldsPrompt(
         "Track MiniDisc UTOC flags",
-        "Per-track UTOC flags: codec override (sp-stereo, sp-mono, lp2, lp4, or empty for disc "
-        "default), write-protect (on/off), SCMS (on/off), emphasis (on/off), and Sector 2 "
-        "timestamp (YYYY-MM-DD HH:MM:SS or empty).",
-        {{"codec", "Codec override (or empty)", codecVal},
+        onDiscTrack
+            ? "Per-track UTOC flags (encoding codec is locked for existing on-disc audio): "
+              "write-protect (on/off), SCMS (on/off), emphasis (on/off), and Sector 2 "
+              "timestamp (YYYY-MM-DD HH:MM:SS or empty)."
+            : "Per-track UTOC flags: codec override (sp-stereo, sp-mono, lp2, lp4, or empty for "
+              "disc default), write-protect (on/off), SCMS (on/off), emphasis (on/off), and "
+              "Sector 2 timestamp (YYYY-MM-DD HH:MM:SS or empty).",
+        {{"codec", onDiscTrack ? "Codec (locked on disc)" : "Codec override (or empty)",
+          track.codecOverride || onDiscTrack ? codecVal : juce::String()},
          {"wp", "Write-protect (on/off)", track.writeProtected ? "on" : "off"},
          {"scms", "SCMS restricted (on/off)", track.scmsCopyProtected ? "on" : "off"},
          {"emph", "Emphasis (on/off)", track.emphasis ? "on" : "off"},
          {"ts", "Timestamp (YYYY-MM-DD HH:MM:SS or empty)",
           juce::String::fromUTF8(track.timestamp.c_str())}},
         "Apply",
-        [safe = juce::Component::SafePointer<Studio>(this), revision,
-         idx0](bool accepted, const juce::StringArray& values) {
+        [safe = juce::Component::SafePointer<Studio>(this), revision, idx0, onDiscTrack,
+         codecVal](bool accepted, const juce::StringArray& values) {
             if (safe == nullptr || !accepted || values.size() != 5) {
                 return;
             }
@@ -210,8 +218,11 @@ void Studio::editSelectedTrackMdFlags() {
             const auto scms = values[2].trim();
             const auto emph = values[3].trim();
             const auto ts = values[4].trim();
-            safe->discWorkspace.onCommand({"disc", "track", "flags", juce::String(idx0),
-                                           c.isEmpty() ? juce::String("clear") : c,
+            const juce::String codecArg =
+                (onDiscTrack && c == codecVal) ? juce::String("keep")
+                : c.isEmpty()                  ? juce::String("clear")
+                                               : c;
+            safe->discWorkspace.onCommand({"disc", "track", "flags", juce::String(idx0), codecArg,
                                            wp.isEmpty() ? juce::String("keep") : wp,
                                            scms.isEmpty() ? juce::String("keep") : scms,
                                            emph.isEmpty() ? juce::String("keep") : emph,
@@ -475,6 +486,92 @@ void Studio::startNetMdReadUtocJob(const std::string& devId, const juce::File& o
         });
 }
 
+void Studio::startNetMdLoadDiscJob(const std::string& devId, bool showAlerts) {
+    launchNetMdWorker(
+        "load-disc", devId, "Reading MiniDisc UTOC...",
+        [this, devId, showAlerts](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
+            juce::String&, std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
+            carta::MdDisc loadedDisc{};
+            carta::NetMdDeviceStatus devStatus{};
+            if (!carta::loadNetMdDisc(devId, loadedDisc, &devStatus, err)) {
+                uiStatus = juce::String::fromUTF8(err.c_str());
+                return false;
+            }
+
+            carta::Session previewSession;
+            carta::populateLoadedDiscSession(loadedDisc, previewSession);
+            afterPreflight = carta::preflightNetMdRecordingWithStatus(
+                previewSession, previewSession.mdDisc, devStatus);
+
+            {
+                std::lock_guard<std::mutex> lk(netMdMutex);
+                netMdPendingLoadedDisc = loadedDisc;
+                netMdPendingShowLoadAlerts = showAlerts;
+            }
+
+            auto* o = new juce::DynamicObject();
+            o->setProperty("loaded", true);
+            o->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+            o->setProperty("medium",
+                           juce::String(carta::mdMediumToString(loadedDisc.medium)));
+            o->setProperty("half_width_title",
+                           juce::String::fromUTF8(loadedDisc.halfWidthTitle.c_str()));
+            o->setProperty("full_width_title",
+                           juce::String::fromUTF8(loadedDisc.fullWidthTitle.c_str()));
+            o->setProperty("track_count", static_cast<int>(loadedDisc.tracks.size()));
+            o->setProperty("group_count", static_cast<int>(loadedDisc.groups.size()));
+            o->setProperty("region_count",
+                           static_cast<int>(loadedDisc.loadedDisc.regions.size()));
+            o->setProperty(
+                "baseline_sector0_hash",
+                juce::String::fromUTF8(loadedDisc.loadedDisc.baselineSector0Hash.c_str()));
+            o->setProperty("physical_start_cluster",
+                           static_cast<int>(loadedDisc.loadedDisc.physicalStartCluster));
+            o->setProperty("physical_last_cluster",
+                           static_cast<int>(loadedDisc.loadedDisc.physicalLastCluster));
+            result = juce::var(o);
+
+            const auto discName = !loadedDisc.halfWidthTitle.empty() ? loadedDisc.halfWidthTitle
+                                                                     : loadedDisc.fullWidthTitle;
+            uiStatus =
+                "Loaded MiniDisc " +
+                (discName.empty() ? juce::String::fromUTF8(devId.c_str())
+                                  : ("'" + juce::String::fromUTF8(discName.c_str()) + "'")) +
+                " (" + juce::String(static_cast<int>(loadedDisc.tracks.size())) + " track(s), " +
+                juce::String(static_cast<int>(loadedDisc.loadedDisc.regions.size())) +
+                " on-disc region(s)).";
+            return true;
+        });
+}
+
+bool Studio::applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& error) {
+    const bool applied = mutate(
+        [&]() {
+            carta::populateLoadedDiscSession(loaded, session);
+            selectedTrack = session.tracks.empty() ? -1 : 0;
+            selectedClip = -1;
+            selectedMarker = -1;
+            timeSelection = {};
+            timelineClipSelection.clear();
+            position = 0.0;
+            firstTrack = 0;
+            return true;
+        },
+        &error, "Load MiniDisc UTOC", false, false, true);
+    if (!applied) {
+        return false;
+    }
+
+    zoom = 1.0;
+    viewStart = 0.0;
+    setDiscWorkspaceVisible(true);
+    refreshDiscWorkspace(true);
+    menuItemsChanged();
+    repaint();
+    return true;
+}
+
 void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware) {
     carta::Session snapshot;
     {
@@ -493,7 +590,10 @@ void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware) 
                 return false;
             }
 
-            afterPreflight = carta::preflightNetMdRecording(snapshot, snapshot.mdDisc, devId);
+            afterPreflight = !afterStatus.deviceId.empty()
+                                 ? carta::preflightNetMdRecordingWithStatus(
+                                       snapshot, snapshot.mdDisc, afterStatus)
+                                 : carta::preflightNetMdRecording(snapshot, snapshot.mdDisc, devId);
             const auto& st = afterPreflight->deviceConnected ? afterPreflight->device : afterStatus;
             auto* o = new juce::DynamicObject();
             o->setProperty("erased", true);
@@ -514,21 +614,37 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
                                     bool confirmHardware) {
     launchNetMdWorker(
         "write-utoc", devId, "Writing UTOC Sectors 0/1/2/4...",
-        [snapshot, devId, confirmHardware](
+        [this, snapCopy = snapshot, devId, confirmHardware](
             std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
             juce::String&, std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
             carta::UtocBudget budget{};
-            if (!carta::writeNetMdUtoc(snapshot.mdDisc, devId, confirmHardware, budget, err)) {
+            std::string committedHash;
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committedRaw{};
+            if (!carta::writeNetMdUtoc(snapCopy.mdDisc, devId, confirmHardware, budget, err,
+                                       &committedHash, &committedRaw)) {
                 uiStatus = juce::String::fromUTF8(err.c_str());
                 return false;
             }
 
-            afterPreflight = carta::preflightNetMdRecording(snapshot, snapshot.mdDisc, devId);
+            if (snapCopy.mdDisc.loadedDisc.active) {
+                snapCopy.mdDisc.loadedDisc.baselineSector0Hash = committedHash;
+                snapCopy.mdDisc.loadedDisc.rawSector3.assign(committedRaw[3].begin(),
+                                                             committedRaw[3].end());
+            }
+            {
+                std::lock_guard<std::mutex> lk(netMdMutex);
+                netMdPendingCommittedRawSectors = committedRaw;
+                netMdPendingHasCommittedRaw = true;
+                netMdPendingCommittedHash = committedHash;
+                netMdPendingNeedsReload = false;
+            }
+
+            afterPreflight = carta::preflightNetMdRecording(snapCopy, snapCopy.mdDisc, devId);
             if (afterPreflight->deviceConnected) {
                 applyCommittedDiscIdentity(afterPreflight->device,
-                                           static_cast<int>(snapshot.mdDisc.tracks.size()),
-                                           snapshot.mdDisc.halfWidthTitle,
-                                           snapshot.mdDisc.fullWidthTitle, false, &snapshot.mdDisc);
+                                           static_cast<int>(snapCopy.mdDisc.tracks.size()),
+                                           snapCopy.mdDisc.halfWidthTitle,
+                                           snapCopy.mdDisc.fullWidthTitle, false, &snapCopy.mdDisc);
             }
 
             auto* o = new juce::DynamicObject();
@@ -539,6 +655,8 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
             o->setProperty("used_tracks", budget.usedTracks);
             o->setProperty("used_fragments", budget.usedFragments);
             o->setProperty("shared_fragments", budget.sharedFragmentCount);
+            o->setProperty("committed_sector0_hash",
+                           juce::String::fromUTF8(committedHash.c_str()));
             result = juce::var(o);
             uiStatus = "Committed UTOC (" + juce::String(budget.usedTracks) + " tracks, " +
                        juce::String(budget.usedFragments) +
@@ -551,9 +669,10 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
                                  bool confirmHardware) {
     launchNetMdWorker(
         "record", devId, "Preparing ATRAC spans...",
-        [snapshot = std::move(snapshotIn), devId, confirmHardware](
-            std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
-            juce::String&, std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
+        [this, snapshot = std::move(snapshotIn), devId, confirmHardware](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody,
+            std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
             carta::NetMdRecordResult rec{};
             if (!carta::recordNetMdDisc(snapshot, snapshot.mdDisc, devId, confirmHardware, rec,
                                         err)) {
@@ -561,8 +680,21 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
                 return false;
             }
 
+            if (rec.hasCommittedRawSectors) {
+                if (snapshot.mdDisc.loadedDisc.active) {
+                    snapshot.mdDisc.loadedDisc.baselineSector0Hash = rec.committedSector0Hash;
+                    snapshot.mdDisc.loadedDisc.rawSector3.assign(
+                        rec.committedRawSectors[3].begin(), rec.committedRawSectors[3].end());
+                }
+                std::lock_guard<std::mutex> lk(netMdMutex);
+                netMdPendingCommittedRawSectors = rec.committedRawSectors;
+                netMdPendingHasCommittedRaw = true;
+                netMdPendingCommittedHash = rec.committedSector0Hash;
+                netMdPendingNeedsReload = rec.needsReloadToFinishUpload;
+            }
+
             afterPreflight = carta::preflightNetMdRecording(snapshot, snapshot.mdDisc, devId);
-            if (afterPreflight->deviceConnected) {
+            if (afterPreflight->deviceConnected && !rec.needsReloadToFinishUpload) {
                 applyCommittedDiscIdentity(afterPreflight->device,
                                            static_cast<int>(snapshot.mdDisc.tracks.size()),
                                            snapshot.mdDisc.halfWidthTitle,
@@ -576,15 +708,35 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
             o->setProperty("groups", rec.groups);
             o->setProperty("encoded_bytes", static_cast<juce::int64>(rec.encodedBytes));
             o->setProperty("committed_utoc", rec.committedUtoc);
+            o->setProperty("preserved_on_disc_tracks", rec.preservedOnDiscTracks);
+            o->setProperty("reclaimed_clusters", rec.reclaimedClusters);
+            o->setProperty("needs_reload_to_finish_upload", rec.needsReloadToFinishUpload);
+            o->setProperty("next_action_hint", juce::String::fromUTF8(rec.nextActionHint.c_str()));
+            o->setProperty("committed_sector0_hash",
+                           juce::String::fromUTF8(rec.committedSector0Hash.c_str()));
             o->setProperty("used_clusters", rec.budget.usedClusters);
             o->setProperty("total_clusters", rec.budget.totalClusters);
             o->setProperty("used_tracks", rec.budget.usedTracks);
             o->setProperty("used_fragments", rec.budget.usedFragments);
             o->setProperty("shared_fragments", rec.budget.sharedFragmentCount);
             result = juce::var(o);
-            uiStatus = "Recorded " + juce::String(rec.uploadedPhysicalSegments) +
-                       " physical segment(s) -> " + juce::String(rec.logicalTracks) +
-                       " UTOC track(s). Eject & re-insert disc for player display to refresh.";
+
+            if (rec.needsReloadToFinishUpload) {
+                alertTitle = "Reload MiniDisc to finish recording";
+                alertBody = juce::String::fromUTF8(rec.nextActionHint.c_str());
+                uiStatus = alertBody;
+            } else if (snapshot.mdDisc.loadedDisc.active) {
+                uiStatus = "Synced MiniDisc: preserved " + juce::String(rec.preservedOnDiscTracks) +
+                           " on-disc track(s), uploaded " +
+                           juce::String(rec.uploadedPhysicalSegments) + " new span(s), reclaimed " +
+                           juce::String(rec.reclaimedClusters) + " cluster(s) -> " +
+                           juce::String(rec.logicalTracks) +
+                           " track(s). Eject & re-insert disc for player display to refresh.";
+            } else {
+                uiStatus = "Recorded " + juce::String(rec.uploadedPhysicalSegments) +
+                           " physical segment(s) -> " + juce::String(rec.logicalTracks) +
+                           " UTOC track(s). Eject & re-insert disc for player display to refresh.";
+            }
             return true;
         });
 }
@@ -603,15 +755,74 @@ void Studio::pollNetMdJobProgress() {
         juce::String alertTitle;
         juce::String alertBody;
         std::optional<carta::NetMdPreflightReport> afterPreflight;
+        std::optional<carta::MdDisc> pendingLoadedDisc;
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committedRaw{};
+        bool hasCommittedRaw = false;
+        std::string committedHash;
         {
             std::lock_guard<std::mutex> lk(netMdMutex);
             uiStatus = netMdPendingUiStatus;
             alertTitle = netMdPendingAlertTitle;
             alertBody = netMdPendingAlertBody;
             afterPreflight = netMdPendingPreflight;
+            pendingLoadedDisc = std::move(netMdPendingLoadedDisc);
+            netMdPendingLoadedDisc.reset();
+            hasCommittedRaw = netMdPendingHasCommittedRaw;
+            committedRaw = netMdPendingCommittedRawSectors;
+            committedHash = std::move(netMdPendingCommittedHash);
+            netMdPendingHasCommittedRaw = false;
+            netMdPendingCommittedHash.clear();
+            netMdPendingNeedsReload = false;
         }
-        if (afterPreflight.has_value()) {
-            cachedNetMdPreflight = afterPreflight;
+        if (pendingLoadedDisc.has_value()) {
+            juce::String applyErr;
+            if (applyLoadedMiniDisc(*pendingLoadedDisc, applyErr)) {
+                if (afterPreflight.has_value()) {
+                    cachedNetMdPreflight = afterPreflight;
+                }
+            } else {
+                uiStatus = applyErr;
+            }
+        } else {
+            if (hasCommittedRaw) {
+                bool refreshedLoaded = false;
+                {
+                    const juce::ScopedLock guard(lock);
+                    if (session.mdDisc.loadedDisc.active) {
+                        session.mdDisc.loadedDisc.baselineSector0Hash = committedHash;
+                        session.mdDisc.loadedDisc.rawSector3.assign(committedRaw[3].begin(),
+                                                                    committedRaw[3].end());
+                        carta::UtocDiscState parsedCommitted{};
+                        std::string parseErr;
+                        if (carta::parseUtocSectors(
+                                committedRaw[0].data(), committedRaw[1].data(),
+                                committedRaw[2].data(), committedRaw[4].data(), parsedCommitted,
+                                parseErr) &&
+                            parsedCommitted.hasSector0) {
+                            session.mdDisc.loadedDisc.initialFreeRanges.clear();
+                            std::uint8_t slot = parsedCommitted.trackMap[0];
+                            std::set<std::uint8_t> seen;
+                            while (slot != 0 && seen.insert(slot).second && seen.size() <= 255) {
+                                const auto& f = parsedCommitted.fragments[slot];
+                                if (f.isValid() &&
+                                    f.end.toLinearGroup() >= f.start.toLinearGroup()) {
+                                    session.mdDisc.loadedDisc.initialFreeRanges.push_back(
+                                        {{f.start.cluster, f.start.sector, f.start.group},
+                                         {f.end.cluster, f.end.sector, f.end.group}});
+                                }
+                                slot = f.link;
+                            }
+                        }
+                        refreshedLoaded = true;
+                    }
+                }
+                if (refreshedLoaded) {
+                    refreshDiscWorkspace(false);
+                }
+            }
+            if (afterPreflight.has_value()) {
+                cachedNetMdPreflight = afterPreflight;
+            }
         }
         if (uiStatus.isNotEmpty()) {
             status.setText(uiStatus, juce::dontSendNotification);
@@ -672,8 +883,12 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
     std::string reason;
     const bool compiled = carta::compileMdDiscToUtoc(session.mdDisc, utoc, reason);
     const std::string medium = carta::mdMediumToString(session.mdDisc.medium);
+    const int physTotal = session.mdDisc.loadedDisc.active
+                              ? session.mdDisc.loadedDisc.physicalTotalClusters()
+                              : 0;
     const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
-    const auto budget = compiled ? carta::computeUtocBudget(utoc, medium) : carta::UtocBudget{};
+    const auto budget =
+        compiled ? carta::computeUtocBudget(utoc, medium, physTotal) : carta::UtocBudget{};
     const juce::String utocSummary =
         compiled
             ? (juce::String(budget.usedTracks) + "/" + juce::String(budget.maxTracks) + " trk" +
@@ -713,14 +928,31 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
                     return s.codec == carta::MdCodecMode::spStereo ||
                            s.codec == carta::MdCodecMode::spMono;
                 });
+            const bool loadedActive = session.mdDisc.loadedDisc.active;
+            int preservedTracks = 0;
+            if (loadedActive) {
+                for (const auto& tr : session.mdDisc.tracks) {
+                    if (carta::mdTrackUsesOnDiscAudio(session.mdDisc, tr)) {
+                        ++preservedTracks;
+                    }
+                }
+            }
+            const bool insufficientAfterReclaim =
+                loadedActive && !plan.spans.empty() &&
+                plan.freeClustersAfterReclaim < plan.newUploadClusters;
+
+            snap.canLoadDisc = st.discPresent && !st.hiMdFormatted && st.supportsForceTocEdit;
             snap.canReadToc = st.discPresent && st.supportsForceTocEdit;
             snap.canErase = st.discPresent && !st.writeProtected;
             const bool baseWritable = compiled && budget.fits() && st.discPresent && st.writable &&
                                       !st.writeProtected && !st.hiMdFormatted &&
                                       st.supportsForceTocEdit;
-            snap.canWriteUtoc = baseWritable;
-            snap.canRecord = baseWritable && planOk && !session.mdDisc.tracks.empty() &&
-                             (!spNeeded || st.supportsSpUpload) && pendingImports.empty();
+            snap.canWriteUtoc = baseWritable && (!loadedActive || plan.spans.empty());
+            snap.canRecord = baseWritable && planOk &&
+                             (!session.mdDisc.tracks.empty() || loadedActive) &&
+                             (loadedActive || st.trackCount == 0) &&
+                             !insufficientAfterReclaim && (!spNeeded || st.supportsSpUpload) &&
+                             pendingImports.empty();
 
             if (!st.discPresent) {
                 snap.statusText = "Insert a MiniDisc into '" +
@@ -737,13 +969,29 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
             } else if (!budget.fits()) {
                 snap.statusText = "Target project exceeds UTOC capacity (" +
                                   juce::String::fromUTF8(medium.c_str()) + ").";
-            } else if (session.mdDisc.tracks.empty()) {
+            } else if (!loadedActive && st.trackCount > 0) {
+                snap.statusText = "Disc is not empty (" + juce::String(st.trackCount) +
+                                  " track(s)) — click Load Disc to edit non-destructively, or "
+                                  "Erase Disc... first.";
+            } else if (insufficientAfterReclaim) {
+                snap.statusText = "Not enough free clusters after reclaiming deleted tracks (" +
+                                  juce::String(plan.freeClustersAfterReclaim) + " free, " +
+                                  juce::String(plan.newUploadClusters) + " needed).";
+            } else if (session.mdDisc.tracks.empty() && !loadedActive) {
                 snap.statusText = "Device ready (" + juce::String::fromUTF8(st.deviceName.c_str()) +
-                                  "). Add tracks on Tracks & UTOC to record.";
+                                  "). Add tracks or click Load Disc.";
             } else if (spNeeded && !st.supportsSpUpload) {
                 snap.statusText =
                     "SP upload requires a Type-S, Type-R, or supported Hi-MD recorder (switch "
                     "tracks to LP2/LP4 or connect compatible hardware).";
+            } else if (loadedActive) {
+                const bool twoStep =
+                    !plan.spans.empty() && plan.initialFreeClusters < plan.newUploadClusters;
+                snap.statusText = "Ready (preserve " + juce::String(preservedTracks) +
+                                  " on-disc, upload " +
+                                  juce::String(static_cast<int>(plan.spans.size())) +
+                                  " new span(s), reclaim " + juce::String(plan.reclaimedClusters) +
+                                  " cl" + (twoStep ? "; 2-step reclaim + reload" : "") + ").";
             } else {
                 snap.statusText =
                     "Ready to record " + juce::String(static_cast<int>(plan.spans.size())) +
@@ -784,6 +1032,45 @@ void Studio::triggerReadDiscTocFromUi() {
         return;
     }
     startNetMdReadUtocJob(selectedId.toStdString(), juce::File(), {}, true);
+}
+
+void Studio::triggerLoadDiscFromUi() {
+    if (netMdBusy.load()) {
+        status.setText("Wait for the current NetMD operation to finish.",
+                       juce::dontSendNotification);
+        return;
+    }
+
+    const auto selectedId = discWorkspace.selectedRecordDeviceId();
+    if (selectedId.isEmpty()) {
+        status.setText("Select or refresh a NetMD device first.", juce::dontSendNotification);
+        return;
+    }
+
+    const std::string devId = selectedId.toStdString();
+    const bool hasExistingSession =
+        dirty || !session.tracks.empty() || !carta::isDefaultMdDisc(session.mdDisc);
+    if (!hasExistingSession) {
+        startNetMdLoadDiscJob(devId, true);
+        return;
+    }
+
+    showGuardedStudioAlert(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::QuestionIcon)
+            .withTitle("Load MiniDisc into editor")
+            .withMessage("Load MiniDisc UTOC from '" + selectedId +
+                         "' into the editor? This replaces the current timeline (Undo restores "
+                         "it).")
+            .withButton("Load Disc")
+            .withButton("Cancel")
+            .withAssociatedComponent(this),
+        [safe = juce::Component::SafePointer<Studio>(this), devId](int answer) {
+            if (safe == nullptr || answer != 0 || safe->netMdBusy.load()) {
+                return;
+            }
+            safe->startNetMdLoadDiscJob(devId, true);
+        });
 }
 
 void Studio::triggerEraseDiscFromUi() {
@@ -874,29 +1161,70 @@ void Studio::triggerRecordStartFromUi() {
     }
 
     const std::string devId = selectedId.toStdString();
-    showGuardedStudioAlert(
-        juce::MessageBoxOptions()
-            .withIconType(juce::MessageBoxIconType::WarningIcon)
-            .withTitle("Erase & record MiniDisc")
-            .withMessage(
-                "Erase the disc in '" + selectedId +
-                "', upload ATRAC tracks via NetMD / SPUpload, and commit full UTOC Sectors "
-                "0, 1, 2, and 4?")
-            .withButton("Erase & Record")
-            .withButton("Cancel")
-            .withAssociatedComponent(this),
-        [safe = juce::Component::SafePointer<Studio>(this), devId](int answer) {
-            if (safe == nullptr || answer != 0 || safe->netMdBusy.load() ||
-                !safe->pendingImports.empty()) {
-                return;
+    bool loadedActive = false;
+    carta::MdPhysicalPlan plan{};
+    int preservedTracks = 0;
+    int totalTracks = 0;
+    {
+        const juce::ScopedLock guard(lock);
+        loadedActive = session.mdDisc.loadedDisc.active;
+        totalTracks = static_cast<int>(session.mdDisc.tracks.size());
+        std::string planErr;
+        carta::planMdPhysicalAudio(session.mdDisc, plan, planErr);
+        if (loadedActive) {
+            for (const auto& tr : session.mdDisc.tracks) {
+                if (carta::mdTrackUsesOnDiscAudio(session.mdDisc, tr)) {
+                    ++preservedTracks;
+                }
             }
-            carta::Session snapshot;
-            {
-                const juce::ScopedLock guard(safe->lock);
-                safe->copyWorkerSnapshot(snapshot);
-            }
-            safe->startNetMdRecordJob(std::move(snapshot), devId, true);
-        });
+        }
+    }
+
+    juce::String promptMsg;
+    if (loadedActive) {
+        if (plan.spans.empty()) {
+            promptMsg = "Update UTOC on '" + selectedId + "' non-destructively (preserving " +
+                        juce::String(preservedTracks) + " on-disc track(s) and reclaiming " +
+                        juce::String(plan.reclaimedClusters) + " cluster(s)) without erasing?";
+        } else if (plan.initialFreeClusters < plan.newUploadClusters) {
+            promptMsg = "Step 1 of 2 on '" + selectedId + "': Reclaim " +
+                        juce::String(plan.reclaimedClusters) +
+                        " cluster(s) into P-FRA first without erasing existing audio. After "
+                        "confirming, eject and reinsert the disc, then click Record MiniDisc... "
+                        "again to upload " +
+                        juce::String(static_cast<int>(plan.spans.size())) + " new span(s).";
+        } else {
+            promptMsg = "Preserve " + juce::String(preservedTracks) +
+                        " existing on-disc track(s) on '" + selectedId + "', upload " +
+                        juce::String(static_cast<int>(plan.spans.size())) +
+                        " new ATRAC span(s), and commit combined UTOC for " +
+                        juce::String(totalTracks) + " total track(s) (no erase)?";
+        }
+    } else {
+        promptMsg = "Upload " + juce::String(static_cast<int>(plan.spans.size())) +
+                    " ATRAC span(s) to the blank disc in '" + selectedId +
+                    "' and commit full UTOC Sectors 0, 1, 2, and 4?";
+    }
+
+    showGuardedStudioAlert(juce::MessageBoxOptions()
+                               .withIconType(juce::MessageBoxIconType::WarningIcon)
+                               .withTitle("Record MiniDisc")
+                               .withMessage(promptMsg)
+                               .withButton("Record")
+                               .withButton("Cancel")
+                               .withAssociatedComponent(this),
+                           [safe = juce::Component::SafePointer<Studio>(this), devId](int answer) {
+                               if (safe == nullptr || answer != 0 || safe->netMdBusy.load() ||
+                                   !safe->pendingImports.empty()) {
+                                   return;
+                               }
+                               carta::Session snapshot;
+                               {
+                                   const juce::ScopedLock guard(safe->lock);
+                                   safe->copyWorkerSnapshot(snapshot);
+                               }
+                               safe->startNetMdRecordJob(std::move(snapshot), devId, true);
+                           });
 }
 
 // ============================================================================

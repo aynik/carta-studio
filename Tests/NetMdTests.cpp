@@ -9,6 +9,7 @@
  * USB hardware.
  */
 #include "MiniDisc/MdAuthoring.h"
+#include "Editing/Editing.h"
 #include "MiniDisc/NativeCodecs.h"
 #include "MiniDisc/NetMdBridge.h"
 #include "MiniDisc/Utoc.h"
@@ -561,6 +562,382 @@ int main() {
                 "Erased mock disc must be blank and writable");
         REQUIRE(carta::setNetMdTestMockGuard(false, mockErr),
                 "Failed disabling mock guard: " + mockErr);
+    }
+
+    // 3B. Non-destructive Load Disc -> Edit -> Write UTOC / Record / Pre-upload Reclaim + 2-step
+    {
+        REQUIRE(carta::resetNetMdTestMockSession(mockErr),
+                "Failed resetting mock session before Stage 1 loaded-disc tests: " + mockErr);
+
+        auto buildSeedUtoc = [&](std::uint16_t freeStartCluster, std::uint16_t freeEndCluster,
+                                 std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5>& outRaw) {
+            for (auto& s : outRaw) {
+                s.fill(0);
+            }
+            for (std::size_t i = 0; i < carta::kUtocSectorBytes; ++i) {
+                outRaw[3][i] = static_cast<std::uint8_t>((i * 19u + 7u) & 0xFFu);
+            }
+            carta::UtocDiscState st{};
+            st.hasSector0 = true;
+            st.hasSector1 = true;
+            st.hasSector2 = true;
+            st.hasSector4 = true;
+            st.deviceSignature = 0x534F;
+            st.discNonEmpty = 1;
+            st.trackCount = 2;
+            st.timestamps[1] = {26, 11, 20, 14, 0, 0, 0x534F};
+            st.timestampMap[0] = 1;
+            st.nextFreeTimestampSlot = 2;
+            for (std::uint8_t i = 1; i < 255; ++i) {
+                st.fragments[i].link = static_cast<std::uint8_t>(i + 1);
+            }
+            st.fragments[255].link = 0;
+            st.nextFreeTrackSlot = 1;
+
+            auto allocF = [&](carta::UtocAddress a, carta::UtocAddress b, std::uint8_t mode) {
+                const std::uint8_t slot = st.nextFreeTrackSlot;
+                st.nextFreeTrackSlot = st.fragments[slot].link;
+                st.fragments[slot].start = a;
+                st.fragments[slot].end = b;
+                st.fragments[slot].mode = mode;
+                st.fragments[slot].link = 0;
+                return slot;
+            };
+            const std::uint8_t spMode = static_cast<std::uint8_t>(
+                carta::kUtocSpMode | carta::kUtocStereo | carta::kUtocWritable |
+                carta::kUtocScmsUnrestricted | carta::kUtocReservedCodec);
+            const std::uint8_t lp2Mode = carta::utocModeFromTrack("lp2", false, false, false);
+
+            // Track 1: clusters 50..500 (large, so deleting frees 451 clusters!), Track 2: 501..600 (odd SP)
+            st.trackMap[1] = allocF({50, 0, 0}, {500, 31, 10}, lp2Mode);
+            st.trackMap[2] = allocF({501, 0, 0}, {600, 2, 0}, spMode);
+            if (freeEndCluster >= freeStartCluster) {
+                st.trackMap[0] = allocF({freeStartCluster, 0, 0}, {freeEndCluster, 31, 10}, 0);
+            }
+            st.sec0aPadding[14] = allocF({610, 0, 0}, {610, 31, 10}, 0); // P-DFA
+
+            auto setHw = [&](std::size_t idx, const std::string& txt) {
+                const std::uint8_t slot = static_cast<std::uint8_t>(idx + 1);
+                st.halfTitleCells[slot].bytes.fill(0);
+                for (std::size_t j = 0; j < 7 && j < txt.size(); ++j) {
+                    st.halfTitleCells[slot].bytes[j] = static_cast<std::uint8_t>(txt[j]);
+                }
+                st.halfTitleCells[slot].link = 0;
+                st.halfTitleMap[idx] = slot;
+            };
+            setHw(0, "ORIG MD");
+            setHw(1, "OrigT1");
+            setHw(2, "OrigT2");
+            st.nextFreeHalfTitleSlot = 4;
+
+            std::string compErr;
+            return carta::compileUtocSectors(st, outRaw[0], outRaw[1], outRaw[2], outRaw[4], compErr);
+        };
+
+        // 1) Unloaded non-empty disc refusal (never auto-erase)
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> seedRaw{};
+        REQUIRE(buildSeedUtoc(650, 2251, seedRaw), "failed building seed UTOC");
+        REQUIRE(carta::seedNetMdTestMockUtoc(seedRaw, mockErr),
+                "seedNetMdTestMockUtoc failed: " + mockErr);
+
+        constexpr std::int64_t kNewLen = 44100LL * 4;
+        carta::Session freshLocalSession = makeThreeRangeSession(kNewLen);
+        carta::MdDisc unloadedDisc;
+        unloadedDisc.medium = carta::MdMedium::md80;
+        unloadedDisc.tracks = {
+            {carta::makeMdTrackId(), "Local Only", {}, carta::MdCodecMode::lp2, false, false, false,
+             {}, {{0, kNewLen}}}};
+        carta::NetMdRecordResult refusedRes{};
+        std::string refuseErr;
+        REQUIRE(!carta::recordNetMdDisc(freshLocalSession, unloadedDisc, "mock:mz-n920", true,
+                                        refusedRes, refuseErr),
+                "recordNetMdDisc MUST refuse overwriting non-empty unloaded disc without erase");
+        REQUIRE(refuseErr.find("not empty") != std::string::npos,
+                "Expected non-empty refusal message, got: " + refuseErr);
+
+        // 2) Load + UTOC-only edit + Write UTOC + Record (Subpath 2A) preserving Sector 3
+        carta::MdDisc loadedDisc{};
+        carta::NetMdDeviceStatus loadStatus{};
+        REQUIRE(carta::loadNetMdDisc("mock:mz-n920", loadedDisc, &loadStatus, mockErr),
+                "loadNetMdDisc failed: " + mockErr);
+        REQUIRE(loadedDisc.loadedDisc.active && loadedDisc.tracks.size() == 2,
+                "Expected 2 loaded tracks");
+
+        loadedDisc.tracks[1].halfWidthTitle = "KeptT2";
+        loadedDisc.tracks[1].writeProtected = true;
+        loadedDisc.tracks.erase(loadedDisc.tracks.begin()); // delete OrigT1 -> reclaim 50..500
+
+        carta::UtocBudget writeBudget{};
+        std::string committedHash;
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committedRaw{};
+        REQUIRE(carta::writeNetMdUtoc(loadedDisc, "mock:mz-n920", true, writeBudget, mockErr,
+                                      &committedHash, &committedRaw),
+                "writeNetMdUtoc on loaded disc failed: " + mockErr);
+        REQUIRE(!committedHash.empty() && committedRaw[3] == seedRaw[3],
+                "writeNetMdUtoc must return hash and preserve Sector 3 verbatim");
+
+        // Update baseline hash + P-FRA after write, then also verify Subpath 2A in recordNetMdDisc
+        loadedDisc.loadedDisc.baselineSector0Hash = committedHash;
+        carta::Session loadedOnlySession;
+        carta::populateLoadedDiscSession(loadedDisc, loadedOnlySession);
+        carta::NetMdRecordResult utocOnlyRes{};
+        REQUIRE(carta::recordNetMdDisc(loadedOnlySession, loadedDisc, "mock:mz-n920", true,
+                                       utocOnlyRes, mockErr),
+                "recordNetMdDisc Subpath 2A failed: " + mockErr);
+        REQUIRE(utocOnlyRes.uploadedPhysicalSegments == 0 && utocOnlyRes.committedUtoc &&
+                    utocOnlyRes.preservedOnDiscTracks == 1 && utocOnlyRes.reclaimedClusters == 451 &&
+                    !utocOnlyRes.needsReloadToFinishUpload &&
+                    utocOnlyRes.committedRawSectors[3] == seedRaw[3],
+                "Subpath 2A must preserve Sector 3, report 0 uploads and 451 reclaimed clusters");
+
+        // 3) Disc-swap SHA-256 guard
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> swappedRaw{};
+        REQUIRE(buildSeedUtoc(700, 2251, swappedRaw), "failed building swapped UTOC");
+        REQUIRE(carta::seedNetMdTestMockUtoc(swappedRaw, mockErr),
+                "seedNetMdTestMockUtoc (swap) failed: " + mockErr);
+        std::string swapErr;
+        REQUIRE(!carta::writeNetMdUtoc(loadedDisc, "mock:mz-n920", true, writeBudget, swapErr),
+                "writeNetMdUtoc must block after disc-swap SHA-256 mismatch");
+        REQUIRE(swapErr.find("changed") != std::string::npos,
+                "Expected disc-swap SHA-256 mismatch diagnostic, got: " + swapErr);
+
+        // 4) Non-destructive single-step append (Subpath 2B when free P-FRA suffices)
+        REQUIRE(carta::seedNetMdTestMockUtoc(seedRaw, mockErr),
+                "re-seed for single-step append failed: " + mockErr);
+        carta::MdDisc appendDisc{};
+        REQUIRE(carta::loadNetMdDisc("mock:mz-n920", appendDisc, nullptr, mockErr),
+                "loadNetMdDisc for append failed: " + mockErr);
+        carta::Session appendSession;
+        carta::populateLoadedDiscSession(appendDisc, appendSession);
+        const std::int64_t appendStart = appendDisc.loadedDisc.regions.back().timelineEndSample;
+        auto appendAudio = std::make_shared<carta::Audio>();
+        appendAudio->sampleRate = carta::sessionRate;
+        appendAudio->samples.setSize(2, static_cast<int>(kNewLen));
+        appendAudio->samples.clear();
+        for (int i = 0; i < static_cast<int>(kNewLen); ++i) {
+            appendAudio->samples.setSample(0, i, static_cast<float>(0.25 * std::sin(0.05 * i)));
+            appendAudio->samples.setSample(1, i, static_cast<float>(0.25 * std::sin(0.07 * i)));
+        }
+        {
+            carta::Clip c;
+            c.audio = appendAudio;
+            c.start = static_cast<double>(appendStart) / carta::sessionRate;
+            c.offset = 0.0;
+            c.duration = static_cast<double>(kNewLen) / carta::sessionRate;
+            c.name = "BonusLP2";
+            carta::Track tr;
+            tr.name = "New Layer";
+            tr.clips.push_back(std::move(c));
+            appendSession.tracks.push_back(std::move(tr));
+        }
+        appendDisc.tracks.push_back({carta::makeMdTrackId(),
+                                     "Appended LP2",
+                                     {},
+                                     carta::MdCodecMode::lp2,
+                                     false,
+                                     false,
+                                     false,
+                                     {},
+                                     {{appendStart, appendStart + kNewLen}}});
+
+        carta::NetMdRecordResult appendRes{};
+        REQUIRE(carta::recordNetMdDisc(appendSession, appendDisc, "mock:mz-n920", true, appendRes,
+                                       mockErr),
+                "Subpath 2B single-step non-destructive append failed: " + mockErr);
+        REQUIRE(appendRes.uploadedPhysicalSegments == 1 && appendRes.preservedOnDiscTracks == 2 &&
+                    !appendRes.needsReloadToFinishUpload && appendRes.logicalTracks == 3 &&
+                    appendRes.committedRawSectors[3] == seedRaw[3],
+                "Single-step append must upload 1 new span, keep 2 on-disc tracks + Sector 3");
+
+        TestMockSnapshot appendSnap{};
+        REQUIRE(fetchMockSnapshot(appendSnap, mockErr), "fetchMockSnapshot failed: " + mockErr);
+        carta::UtocDiscState appendUtoc{};
+        REQUIRE(carta::parseUtocSectors(appendSnap.committedUtoc[0].data(),
+                                        appendSnap.committedUtoc[1].data(),
+                                        appendSnap.committedUtoc[2].data(),
+                                        appendSnap.committedUtoc[4].data(), appendUtoc, mockErr),
+                "parse committed appended UTOC failed: " + mockErr);
+        const bool combinedPreserved =
+            appendUtoc.trackCount == 3 &&
+            appendUtoc.fragments[appendUtoc.trackMap[1]].start == carta::UtocAddress{50, 0, 0} &&
+            appendUtoc.fragments[appendUtoc.trackMap[2]].end == carta::UtocAddress{600, 2, 0};
+        REQUIRE(combinedPreserved,
+                "Combined UTOC must preserve existing on-disc tracks verbatim alongside appended "
+                "track");
+
+        // 5) Pre-upload reclaim + 2-step reload (seed full disc: only 1 whole free cluster in P-FRA,
+        //    delete Track 1 freeing 451 clusters, append 2-cluster LP2 track)
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> tightRaw{};
+        REQUIRE(buildSeedUtoc(2250, 2250, tightRaw), "failed building tight free-space UTOC");
+        REQUIRE(carta::seedNetMdTestMockUtoc(tightRaw, mockErr),
+                "seed tight UTOC failed: " + mockErr);
+        carta::MdDisc twoStepDisc{};
+        REQUIRE(carta::loadNetMdDisc("mock:mz-n920", twoStepDisc, nullptr, mockErr),
+                "load tight UTOC failed: " + mockErr);
+        // Delete Track 1 (50..500 = 451 clusters) while keeping Track 2 (501..600), and append 1 LP2 track (~2 cl)
+        twoStepDisc.tracks.erase(twoStepDisc.tracks.begin());
+        carta::Session twoStepSession;
+        carta::populateLoadedDiscSession(twoStepDisc, twoStepSession);
+        const std::int64_t tsEnd = twoStepDisc.loadedDisc.regions.back().timelineEndSample;
+        constexpr std::int64_t kLongNewLen = 44100LL * 45; // > 1 cluster in LP2
+        auto longAudio = std::make_shared<carta::Audio>();
+        longAudio->sampleRate = carta::sessionRate;
+        longAudio->samples.setSize(2, static_cast<int>(kLongNewLen));
+        longAudio->samples.clear();
+        for (int i = 0; i < static_cast<int>(kLongNewLen); ++i) {
+            longAudio->samples.setSample(0, i, static_cast<float>(0.2 * std::sin(0.03 * i)));
+            longAudio->samples.setSample(1, i, static_cast<float>(0.2 * std::cos(0.03 * i)));
+        }
+        {
+            carta::Clip c;
+            c.audio = longAudio;
+            c.start = static_cast<double>(tsEnd) / carta::sessionRate;
+            c.offset = 0.0;
+            c.duration = static_cast<double>(kLongNewLen) / carta::sessionRate;
+            c.name = "TwoStepLP2";
+            carta::Track tr;
+            tr.name = "New Layer";
+            tr.clips.push_back(std::move(c));
+            twoStepSession.tracks.push_back(std::move(tr));
+        }
+        twoStepDisc.tracks.push_back({carta::makeMdTrackId(),
+                                      "TwoStep LP2",
+                                      {},
+                                      carta::MdCodecMode::lp2,
+                                      false,
+                                      false,
+                                      false,
+                                      {},
+                                      {{tsEnd, tsEnd + kLongNewLen}}});
+
+        // Pass 1: commits reclaimUtoc and returns needsReloadToFinishUpload=true
+        carta::NetMdRecordResult step1{};
+        REQUIRE(carta::recordNetMdDisc(twoStepSession, twoStepDisc, "mock:mz-n920", true, step1,
+                                       mockErr),
+                "2-step record Pass 1 failed: " + mockErr);
+        REQUIRE(step1.needsReloadToFinishUpload && step1.uploadedPhysicalSegments == 0 &&
+                    step1.committedUtoc && step1.reclaimedClusters == 451,
+                "Pass 1 must reclaim clusters into P-FRA and request disc reload");
+
+        // Simulate eject & reinsert with the reclaimed UTOC committed in Pass 1
+        REQUIRE(carta::seedNetMdTestMockUtoc(step1.committedRawSectors, mockErr),
+                "Mock disc reload after Pass 1 failed: " + mockErr);
+        twoStepDisc.loadedDisc.baselineSector0Hash = step1.committedSector0Hash;
+        carta::UtocDiscState reloadedUtoc{};
+        REQUIRE(carta::parseUtocSectors(step1.committedRawSectors[0].data(),
+                                        step1.committedRawSectors[1].data(),
+                                        step1.committedRawSectors[2].data(),
+                                        step1.committedRawSectors[4].data(), reloadedUtoc, mockErr),
+                "parse committed reclaim UTOC failed: " + mockErr);
+        twoStepDisc.loadedDisc.initialFreeRanges.clear();
+        for (std::uint8_t cur = reloadedUtoc.trackMap[0]; cur != 0;
+             cur = reloadedUtoc.fragments[cur].link) {
+            const auto& f = reloadedUtoc.fragments[cur];
+            twoStepDisc.loadedDisc.initialFreeRanges.push_back(
+                {{f.start.cluster, f.start.sector, f.start.group},
+                 {f.end.cluster, f.end.sector, f.end.group}});
+        }
+
+        // Pass 2: now succeeds in uploading into reclaimed space and commits final combined UTOC!
+        carta::NetMdRecordResult step2{};
+        REQUIRE(carta::recordNetMdDisc(twoStepSession, twoStepDisc, "mock:mz-n920", true, step2,
+                                       mockErr),
+                "2-step record Pass 2 failed: " + mockErr);
+        REQUIRE(!step2.needsReloadToFinishUpload && step2.uploadedPhysicalSegments == 1 &&
+                    step2.committedUtoc && step2.logicalTracks == 2 &&
+                    step2.committedRawSectors[3] == tightRaw[3],
+                "Pass 2 must upload new track into reclaimed space and preserve Track 2 + Sector 3");
+
+        // 6) Large-disc (>40 track) fast probe skips AVC track loop, while loadNetMdDisc
+        //    populates all 50 track metadata entries from UTOC and preflightWithStatus succeeds
+        //    with zero extra USB queries.
+        {
+            carta::UtocDiscState st50{};
+            st50.hasSector0 = true;
+            st50.hasSector1 = true;
+            st50.hasSector2 = true;
+            st50.hasSector4 = true;
+            st50.deviceSignature = 0x534F;
+            st50.discNonEmpty = 1;
+            st50.trackCount = 50;
+            st50.timestamps[1] = {26, 11, 20, 14, 0, 0, 0x534F};
+            st50.timestampMap[0] = 1;
+            st50.nextFreeTimestampSlot = 2;
+            for (std::uint8_t i = 1; i < 255; ++i) {
+                st50.fragments[i].link = static_cast<std::uint8_t>(i + 1);
+            }
+            st50.fragments[255].link = 0;
+            st50.nextFreeTrackSlot = 1;
+
+            auto allocFrag50 = [&](carta::UtocAddress a, carta::UtocAddress b, std::uint8_t mode) {
+                const std::uint8_t slot = st50.nextFreeTrackSlot;
+                st50.nextFreeTrackSlot = st50.fragments[slot].link;
+                st50.fragments[slot].start = a;
+                st50.fragments[slot].end = b;
+                st50.fragments[slot].mode = mode;
+                st50.fragments[slot].link = 0;
+                return slot;
+            };
+            const std::uint8_t spMode = static_cast<std::uint8_t>(
+                carta::kUtocSpMode | carta::kUtocStereo | carta::kUtocWritable |
+                carta::kUtocScmsUnrestricted | carta::kUtocReservedCodec);
+            for (int t = 0; t < 50; ++t) {
+                const auto cl = static_cast<std::uint16_t>(50 + t);
+                st50.trackMap[static_cast<std::size_t>(t + 1)] =
+                    allocFrag50({cl, 0, 0}, {cl, 31, 10}, spMode);
+            }
+            st50.trackMap[0] = allocFrag50({100, 0, 0}, {2251, 31, 10}, 0);
+
+            auto setHw50 = [&](std::size_t idx, const std::string& txt) {
+                const std::uint8_t slot = static_cast<std::uint8_t>(idx + 1);
+                st50.halfTitleCells[slot].bytes.fill(0);
+                for (std::size_t j = 0; j < 7 && j < txt.size(); ++j) {
+                    st50.halfTitleCells[slot].bytes[j] = static_cast<std::uint8_t>(txt[j]);
+                }
+                st50.halfTitleCells[slot].link = 0;
+                st50.halfTitleMap[idx] = slot;
+            };
+            setHw50(0, "50TRKMD");
+            for (int t = 0; t < 50; ++t) {
+                setHw50(static_cast<std::size_t>(t + 1), "T" + std::to_string(t + 1));
+            }
+            st50.nextFreeHalfTitleSlot = 52;
+
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw50{};
+            std::string compErr50;
+            REQUIRE(carta::compileUtocSectors(st50, raw50[0], raw50[1], raw50[2], raw50[4],
+                                              compErr50),
+                    "compile 50-track UTOC failed: " + compErr50);
+            REQUIRE(carta::seedNetMdTestMockUtoc(raw50, mockErr),
+                    "seed 50-track mock UTOC failed: " + mockErr);
+
+            carta::NetMdDeviceStatus largeProbe{};
+            REQUIRE(carta::probeNetMdDevice("mock:mz-n920", largeProbe, mockErr),
+                    "probeNetMdDevice 50-track failed: " + mockErr);
+            REQUIRE(largeProbe.trackCount == 50 && largeProbe.tracks.empty(),
+                    "probeNetMdDevice must skip per-track AVC polling when trackCount > 40");
+
+            carta::MdDisc largeLoaded{};
+            carta::NetMdDeviceStatus largeLoadedStatus{};
+            REQUIRE(carta::loadNetMdDisc("mock:mz-n920", largeLoaded, &largeLoadedStatus, mockErr),
+                    "loadNetMdDisc 50-track failed: " + mockErr);
+            REQUIRE(largeLoaded.tracks.size() == 50 && largeLoadedStatus.trackCount == 50 &&
+                        largeLoadedStatus.tracks.size() == 50,
+                    "loadNetMdDisc must populate all 50 track entries from UTOC");
+            REQUIRE(largeLoadedStatus.tracks[0].title == "T1" &&
+                        largeLoadedStatus.tracks[49].title == "T50" &&
+                        largeLoadedStatus.tracks[0].codec == "SP" &&
+                        largeLoadedStatus.tracks[0].durationSeconds > 0,
+                    "loadNetMdDisc must populate valid titles, codecs, and durations");
+
+            carta::Session largeSess;
+            carta::populateLoadedDiscSession(largeLoaded, largeSess);
+            const auto pre50 = carta::preflightNetMdRecordingWithStatus(largeSess, largeLoaded,
+                                                                        largeLoadedStatus);
+            REQUIRE(pre50.deviceConnected && pre50.canWriteUtoc && pre50.canRecord &&
+                        pre50.preservedOnDiscTracks == 50,
+                    "preflightNetMdRecordingWithStatus must succeed with 50 preserved tracks");
+        }
     }
 
     REQUIRE(carta::setNetMdTestMockSessionEnabled(false, mockErr),
