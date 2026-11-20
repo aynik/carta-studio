@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS deployment version")
 endif()
-project(CartaStudio VERSION 0.1.2 LANGUAGES C CXX)
+project(CartaStudio VERSION 0.2.0 LANGUAGES C CXX)
 
 include(FetchContent)
 FetchContent_Declare(JUCE
