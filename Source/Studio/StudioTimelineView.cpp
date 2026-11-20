@@ -139,7 +139,8 @@ std::vector<Studio::MdRibbonHit> Studio::layoutMdRibbonHits(juce::Rectangle<int>
             if (clamped1 <= clamped0) {
                 continue;
             }
-            const bool shared = spanCounts[{part.startSample, part.endSample}] > 1;
+            const int count = spanCounts[{part.startSample, part.endSample}];
+            const bool shared = count > 1;
             hits.push_back({static_cast<int>(ti),
                             static_cast<int>(pi),
                             {clamped0, ribbon.getY() + 2, clamped1 - clamped0,
@@ -149,7 +150,8 @@ std::vector<Studio::MdRibbonHit> Studio::layoutMdRibbonHits(juce::Rectangle<int>
                             groupColorForTrack[ti],
                             part.startSample,
                             part.endSample,
-                            shared});
+                            shared,
+                            count});
         }
     }
     return hits;
@@ -411,14 +413,16 @@ void Studio::drawMdRibbon(juce::Graphics& g, juce::Rectangle<int> area, double s
                                 : (dark ? juce::Colour(0xffeeeeee) : juce::Colour(0xff222222)));
                 g.setFont(
                     juce::FontOptions(10.5f, selected ? juce::Font::bold : juce::Font::plain));
+                const juce::String sharedSuffix =
+                    (h.sharedCount > 1 && h.bounds.getWidth() >= 64)
+                        ? (" [x" + juce::String(h.sharedCount) + "]")
+                        : juce::String();
                 const auto label =
                     "T" + juce::String(h.trackIndex + 1) +
                     (session.mdDisc.tracks[static_cast<size_t>(h.trackIndex)].parts.size() > 1
                          ? "." + juce::String(h.partIndex + 1)
                          : juce::String()) +
-                    " " + h.title +
-                    (h.sharesPhysical && h.bounds.getWidth() >= 92 ? juce::String(" [Shared]")
-                                                                   : juce::String());
+                    " " + h.title + sharedSuffix;
                 g.drawText(label, h.bounds.reduced(5, 0), juce::Justification::centredLeft, true);
             }
         }

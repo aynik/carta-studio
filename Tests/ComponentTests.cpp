@@ -528,6 +528,25 @@ struct StudioComponentTests {
                        dock.moveDownButton.getBounds(), dock.removeTrackButton.getBounds(),
                        dock.groupMenuButton.getBounds()}),
                   "Left track action bar buttons do not overlap");
+            check(!rectsOverlap({dock.partsHeaderLabel.getBounds(), dock.addPartButton.getBounds(),
+                                 dock.partBankButton.getBounds()}),
+                  "Right inspector part header and bank buttons do not overlap");
+            check(!rectsOverlap(
+                      {dock.partUpButton.getBounds(), dock.partDownButton.getBounds(),
+                       dock.setPartSelButton.getBounds(), dock.repeatPartButton.getBounds(),
+                       dock.delPartButton.getBounds(), dock.seekPartButton.getBounds()}),
+                  "Right inspector part action bar buttons do not overlap");
+            check(!rectsOverlap({dock.partsList.getBounds(), dock.partBankButton.getBounds(),
+                                 dock.partUpButton.getBounds()}),
+                  "Parts list does not overlap part action buttons");
+            check(rectsInsideBounds(
+                      {dock.partBankButton.getBounds(), dock.addPartButton.getBounds(),
+                       dock.partUpButton.getBounds(), dock.partDownButton.getBounds(),
+                       dock.setPartSelButton.getBounds(), dock.repeatPartButton.getBounds(),
+                       dock.delPartButton.getBounds(), dock.seekPartButton.getBounds(),
+                       dock.partsList.getBounds()},
+                      dock.rightCardBounds),
+                  "Single-track inspector part controls stay inside right card at all widths");
             if (w == 1180) {
                 check(rectsInsideBounds(
                           {dock.mdLabel.getBounds(), dock.discTitleEditor.getBounds(),
@@ -561,13 +580,14 @@ struct StudioComponentTests {
         check(dock.multiHeaderLabel.isVisible() && dock.multiGroupButton.isVisible() &&
                   dock.multiUngroupButton.isVisible() && dock.multiMergeButton.isVisible() &&
                   dock.multiDuplicateButton.isVisible() && dock.multiRemoveButton.isVisible() &&
-                  !dock.trackTitleEditor.isVisible(),
-              "Multi-selecting MD tracks switches right inspector to bulk/group/merge panel");
+                  dock.multiCopyButton.isVisible() && !dock.trackTitleEditor.isVisible(),
+              "Multi-selecting MD tracks switches right inspector to bulk/group/merge/copy panel");
         check(
             !rectsOverlap({dock.multiGroupButton.getBounds(), dock.multiUngroupButton.getBounds(),
                            dock.multiMergeButton.getBounds(), dock.multiDuplicateButton.getBounds(),
-                           dock.multiRemoveButton.getBounds()}),
-            "Multi-select inspector buttons do not overlap");
+                           dock.multiRemoveButton.getBounds(), dock.multiCopyButton.getBounds()}) &&
+                rectsInsideBounds({dock.multiCopyButton.getBounds()}, dock.rightCardBounds),
+            "Multi-select inspector buttons including Copy Selected do not overlap or clip");
         dock.selectTrackById("md-t1", true);
 
         check(dock.recordTabButton.getButtonText() == "Device & Record",
@@ -620,9 +640,16 @@ struct StudioComponentTests {
                                  dock.readDiscTocButton.getBounds(),
                                  dock.eraseDiscButton.getBounds()}),
                   "Device card bottom buttons do not overlap");
-            check(
-                !rectsOverlap({dock.planCardTitle.getBounds(), dock.utocSummaryLabel.getBounds()}),
-                "Plan card header does not overlap");
+            check(!rectsOverlap({dock.planCardTitle.getBounds(),
+                                 dock.planModePlaybackButton.getBounds(),
+                                 dock.planModeBankButton.getBounds(),
+                                 dock.utocSummaryLabel.getBounds()}) &&
+                      rectsInsideBounds({dock.planCardTitle.getBounds(),
+                                         dock.planModePlaybackButton.getBounds(),
+                                         dock.planModeBankButton.getBounds(),
+                                         dock.utocSummaryLabel.getBounds()},
+                                        dock.planCardBounds),
+                  "Plan card header, view toggles, and UTOC summary fit without overlap");
             check(!rectsOverlap(
                       {dock.writeUtocButton.getBounds(), dock.recordDiscButton.getBounds()}),
                   "Plan card write/record buttons do not overlap");
@@ -659,6 +686,66 @@ struct StudioComponentTests {
         check(dock.planList.isVisible() && dock.utocSummaryLabel.isVisible() &&
                   dock.recordStatusLabel.isVisible() && dock.inspectUtocButton.isVisible(),
               "Tab 2 linear plan list, UTOC summary, status, and UTOC buttons remain visible");
+        check(dock.planRows.size() == 2 && dock.planRows[1].partHopsText.isNotEmpty(),
+              "Multi-part track populates PlanRow::partHopsText cluster hop summary");
+        check(static_cast<bool>(md.ipcCommand({"disc", "view", "bank"})["ok"]) &&
+                  dock.currentView() == "record" && dock.currentPlanViewMode() == "bank" &&
+                  !dock.audioBankRows.empty() &&
+                  dock.planList.getListBoxModel()->getNumRows() ==
+                      static_cast<int>(dock.audioBankRows.size()),
+              "IPC disc view bank switches Tab 2 to inverse Audio Bank view");
+        check(static_cast<bool>(md.ipcCommand({"disc", "view", "playback"})["ok"]) &&
+                  dock.currentView() == "record" && dock.currentPlanViewMode() == "playback" &&
+                  dock.planList.getListBoxModel()->getNumRows() ==
+                      static_cast<int>(dock.planRows.size()),
+              "IPC disc view playback switches Tab 2 back to logical Playback view");
+
+        // Verify loaded on-disc PartRow addresses, shared ref counts, and reclaimed AudioBankRows
+        {
+            Studio loadedStudio;
+            loadedStudio.setSize(1180, 760);
+            carta::MdDisc loadedDisc;
+            loadedDisc.medium = carta::MdMedium::md80;
+            loadedDisc.defaultCodec = carta::MdCodecMode::spStereo;
+            loadedDisc.halfWidthTitle = "LOADED BANK";
+            loadedDisc.loadedDisc.active = true;
+            loadedDisc.loadedDisc.physicalStartCluster = 50;
+            loadedDisc.loadedDisc.physicalLastCluster = 2300;
+            loadedDisc.loadedDisc.regions = {
+                {"od-0", carta::MdCodecMode::spStereo, 0xCE, {50, 0, 0}, {50, 31, 10}, 352, 0,
+                 90112},
+                {"od-1", carta::MdCodecMode::spStereo, 0xCE, {53, 0, 0}, {53, 31, 10}, 352,
+                 90112, 180224}};
+            loadedDisc.loadedDisc.initialFreeRanges = {{{56, 0, 0}, {2300, 31, 10}}};
+            loadedDisc.tracks = {
+                {carta::makeMdTrackId(), "Disc T1", {}, {}, false, false, false, {}, {{0, 90112}}},
+                {carta::makeMdTrackId(), "Alias T2", {}, {}, false, false, false, {},
+                 {{0, 90112}}},
+                {carta::makeMdTrackId(), "Disc T3", {}, {}, false, false, false, {},
+                 {{90112, 180224}}}};
+            carta::populateLoadedDiscSession(loadedDisc, loadedStudio.session);
+            loadedStudio.refreshCommittedMasterRange();
+            loadedStudio.setDiscWorkspaceVisible(true);
+            loadedStudio.refreshDiscWorkspace(true);
+
+            const auto& ldDock = loadedStudio.discWorkspace;
+            check(ldDock.partRows.size() == 1 && ldDock.partRows[0].isOnDisc &&
+                      ldDock.partRows[0].sharedRefCount == 2 && ldDock.partRows[0].sharedSpan &&
+                      ldDock.trackRows[0].maxSharedRefs == 2,
+                  "Loaded on-disc partRows report isOnDisc and accurate sharedRefCount == 2");
+            check(static_cast<bool>(
+                      loadedStudio.ipcCommand({"disc", "track", "remove", "2"})["ok"]),
+                  "Remove Disc T3 to orphan on-disc region od-1");
+            bool foundReclaimed = false;
+            for (const auto& br : ldDock.audioBankRows) {
+                if (br.isOnDisc && br.startCluster == 53 && br.isReclaimed) {
+                    foundReclaimed = true;
+                    break;
+                }
+            }
+            check(foundReclaimed,
+                  "Orphaned on-disc audio region appears as isReclaimed in Audio Bank rows");
+        }
 
         check(static_cast<bool>(md.ipcCommand({"disc", "view", "tracks"})["ok"]) &&
                   dock.currentView() == "tracks",
@@ -959,11 +1046,69 @@ struct StudioComponentTests {
                       static_cast<bool>(midStatus["utoc_valid"]),
                   "UTOC and physical plan remain valid after structural group edits");
             check(
-                static_cast<bool>(studio.ipcCommand(
-                    {"disc", "group", "clear", "1",
-                     juce::String(static_cast<int>(studio.session.mdDisc.tracks.size()))})["ok"]) &&
+                static_cast<bool>(studio.ipcCommand({"disc", "group", "clear", "1",
+                                 juce::String(static_cast<int>(studio.session.mdDisc.tracks.size()))})["ok"]) &&
                     studio.session.mdDisc.groups.empty(),
                 "Ungroup range clears all MD groups");
+
+            // 3b. Non-linear IPC commands: clone, move-block, add-parts, part move + undo/redo
+            {
+                const int beforeNewClusters = static_cast<int>(
+                    studio.ipcCommand({"disc", "status"})["result"]["physical_plan"]
+                                     ["new_upload_clusters"]);
+                const int countBeforeClone = static_cast<int>(studio.session.mdDisc.tracks.size());
+                check(static_cast<bool>(
+                          studio.ipcCommand({"disc", "track", "clone", "0", "1"})["ok"]) &&
+                          static_cast<int>(studio.session.mdDisc.tracks.size()) ==
+                              countBeforeClone + 1 &&
+                          studio.session.mdDisc.tracks[1].parts ==
+                              studio.session.mdDisc.tracks[0].parts,
+                      "IPC disc track clone inserts shared clone at target index");
+                const int afterNewClusters = static_cast<int>(
+                    studio.ipcCommand({"disc", "status"})["result"]["physical_plan"]
+                                     ["new_upload_clusters"]);
+                check(afterNewClusters == beforeNewClusters,
+                      "IPC disc track clone consumes 0 extra physical clusters");
+                studio.restoreHistory(false);
+                check(static_cast<int>(studio.session.mdDisc.tracks.size()) == countBeforeClone,
+                      "Undo reverts IPC disc track clone cleanly");
+                studio.restoreHistory(true);
+                check(static_cast<int>(studio.session.mdDisc.tracks.size()) == countBeforeClone + 1,
+                      "Redo restores IPC disc track clone cleanly");
+
+                check(static_cast<bool>(studio.ipcCommand(
+                          {"disc", "track", "add-parts", "2", "MultiPaste", "default", "0", "22016",
+                           "44032", "66048"})["ok"]) &&
+                          studio.session.mdDisc.tracks[2].halfWidthTitle == "MultiPaste" &&
+                          studio.session.mdDisc.tracks[2].parts.size() == 2 &&
+                          studio.session.mdDisc.tracks[2].parts[0].startSample == 0 &&
+                          studio.session.mdDisc.tracks[2].parts[1].startSample == 44032,
+                      "IPC disc track add-parts creates multi-part track cleanly");
+                check(static_cast<bool>(
+                          studio.ipcCommand({"disc", "track", "part", "move", "2", "0", "1"})["ok"]) &&
+                          studio.session.mdDisc.tracks[2].parts[0].startSample == 44032 &&
+                          studio.session.mdDisc.tracks[2].parts[1].startSample == 0,
+                      "IPC disc track part move swaps parts cleanly");
+                studio.restoreHistory(false);
+                check(studio.session.mdDisc.tracks[2].parts[0].startSample == 0 &&
+                          studio.session.mdDisc.tracks[2].parts[1].startSample == 44032,
+                      "Undo reverts IPC disc track part move cleanly");
+
+                const auto id0 = studio.session.mdDisc.tracks[0].id;
+                const auto id1 = studio.session.mdDisc.tracks[1].id;
+                check(static_cast<bool>(
+                          studio.ipcCommand({"disc", "track", "move-block", "0", "1", "2"})["ok"]) &&
+                          studio.session.mdDisc.tracks[2].id == id0 &&
+                          studio.session.mdDisc.tracks[3].id == id1,
+                      "IPC disc track move-block moves contiguous 2-track block");
+                studio.restoreHistory(false);
+                check(studio.session.mdDisc.tracks[0].id == id0 &&
+                          studio.session.mdDisc.tracks[1].id == id1,
+                      "Undo reverts IPC disc track move-block cleanly");
+
+                studio.ipcCommand({"disc", "group", "clear", "1",
+                                   juce::String(static_cast<int>(studio.session.mdDisc.tracks.size()))});
+            }
 
             // 4. Shared physical span coalescing & UTOC Export/Import
             check(static_cast<bool>(

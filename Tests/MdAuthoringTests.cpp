@@ -575,6 +575,110 @@ void testLoadedDiscLocksPlaceholderAndSessionIO() {
     }
 }
 
+/** Verifies non-linear multi-part reordering, track cloning to position, and block moving. */
+void testNonLinearPartAndBlockEdits() {
+    std::string err;
+
+    // 1. Part reordering inside a multi-part track (moveMdTrackPart)
+    {
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        disc.halfWidthTitle = "PART REORDER";
+        carta::MdTrack t;
+        t.id = carta::makeMdTrackId();
+        t.halfWidthTitle = "Medley";
+        t.parts = {{0, 40000}, {40000, 80000}, {80000, 120000}};
+        disc.tracks = {t};
+
+        check(carta::moveMdTrackPart(disc, 0, 0, 2, err),
+              "moveMdTrackPart moves P1 to P3 cleanly: " + err);
+        check(disc.tracks[0].parts.size() == 3 && disc.tracks[0].parts[0].startSample == 40000 &&
+                  disc.tracks[0].parts[1].startSample == 80000 &&
+                  disc.tracks[0].parts[2].startSample == 0,
+              "moveMdTrackPart preserves all part sample bounds in new playback order");
+        check(!carta::moveMdTrackPart(disc, 0, -1, 0, err) && !err.empty(),
+              "moveMdTrackPart rejects negative source index");
+        check(!carta::moveMdTrackPart(disc, 0, 0, 3, err) && !err.empty(),
+              "moveMdTrackPart rejects out-of-range destination index");
+    }
+
+    // 2. Clone track to explicit position shares physical audio with zero extra clusters
+    {
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        disc.halfWidthTitle = "CLONE DISC";
+        carta::MdTrack t0{carta::makeMdTrackId(), "Alpha", {}, {}, false, false, false, {},
+                          {{0, 44100}}};
+        carta::MdTrack t1{carta::makeMdTrackId(), "Beta", {}, {}, false, false, false, {},
+                          {{44100, 88200}}};
+        carta::MdTrack t2{carta::makeMdTrackId(), "Gamma", {}, {}, false, false, false, {},
+                          {{88200, 132300}}};
+        disc.tracks = {t0, t1, t2};
+        disc.groups = {{1, 2, "Pair", {}}};
+
+        carta::MdPhysicalPlan planBefore;
+        check(carta::planMdPhysicalAudio(disc, planBefore, err),
+              "Initial physical plan succeeds before cloneMdTrackToPosition: " + err);
+
+        check(carta::cloneMdTrackToPosition(disc, 0, 2, err),
+              "cloneMdTrackToPosition inserts shared clone at index 2: " + err);
+        check(disc.tracks.size() == 4 && disc.tracks[2].id != disc.tracks[0].id &&
+                  disc.tracks[2].halfWidthTitle == "Alpha" &&
+                  disc.tracks[2].parts == disc.tracks[0].parts,
+              "Cloned track receives a fresh ID while aliasing source parts verbatim");
+        check(disc.groups.size() == 1 && disc.groups[0].startTrack == 1 &&
+                  disc.groups[0].endTrack == 2,
+              "Cloning outside group preserves group 1..2 boundaries");
+
+        carta::MdPhysicalPlan planAfter;
+        check(carta::planMdPhysicalAudio(disc, planAfter, err),
+              "Physical plan succeeds after cloneMdTrackToPosition: " + err);
+        check(planAfter.newUploadClusters == planBefore.newUploadClusters &&
+                  planAfter.usedClusters == planBefore.usedClusters &&
+                  planAfter.savedClusters > planBefore.savedClusters,
+              "Cloned track costs 0 additional physical clusters and increases saved clusters");
+    }
+
+    // 3. Contiguous multi-track block move (moveMdTrackBlock) with group preservation
+    {
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        disc.halfWidthTitle = "BLOCK MOVE";
+        for (int i = 0; i < 5; ++i) {
+            carta::MdTrack tr;
+            tr.id = carta::makeMdTrackId();
+            tr.halfWidthTitle = "T" + std::to_string(i + 1);
+            tr.parts = {{static_cast<std::int64_t>(i) * 44100,
+                         static_cast<std::int64_t>(i + 1) * 44100}};
+            disc.tracks.push_back(std::move(tr));
+        }
+        disc.groups = {{1, 2, "Group 1", {}}, {3, 4, "Group 2", {}}};
+
+        check(carta::moveMdTrackBlock(disc, 0, 1, 3, err),
+              "moveMdTrackBlock moves tracks 1..2 after T5: " + err);
+        check(disc.tracks[0].halfWidthTitle == "T3" && disc.tracks[1].halfWidthTitle == "T4" &&
+                  disc.tracks[2].halfWidthTitle == "T5" && disc.tracks[3].halfWidthTitle == "T1" &&
+                  disc.tracks[4].halfWidthTitle == "T2",
+              "moveMdTrackBlock yields T3, T4, T5, T1, T2 order");
+        check(disc.groups.size() == 2 && disc.groups[0].halfWidthTitle == "Group 2" &&
+                  disc.groups[0].startTrack == 1 && disc.groups[0].endTrack == 2 &&
+                  disc.groups[1].halfWidthTitle == "Group 1" && disc.groups[1].startTrack == 4 &&
+                  disc.groups[1].endTrack == 5,
+              "moveMdTrackBlock keeps intact groups contiguous and remaps track numbers cleanly");
+
+        // Move back up as a contiguous block
+        check(carta::moveMdTrackBlock(disc, 3, 4, 0, err),
+              "moveMdTrackBlock moves block back to index 0: " + err);
+        check(disc.tracks[0].halfWidthTitle == "T1" && disc.tracks[1].halfWidthTitle == "T2" &&
+                  disc.groups.size() == 2 && disc.groups[0].halfWidthTitle == "Group 1" &&
+                  disc.groups[0].startTrack == 1 && disc.groups[0].endTrack == 2,
+              "Moving contiguous grouped block restores original track order and Group 1..2");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -584,6 +688,7 @@ int main() {
     testPhysicalPlanCoalescingAndUtocRoundtrip();
     testInteractiveRibbonAndMultiLayerClipSync();
     testLoadedDiscLocksPlaceholderAndSessionIO();
+    testNonLinearPartAndBlockEdits();
     if (gFailures == 0) {
         std::cout << "MdAuthoringTests passed.\n";
         return 0;

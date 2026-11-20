@@ -179,7 +179,59 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
         mergeLeftIdx = info.trackIndex;
     }
 
+    struct StackedRibbonCandidate {
+        int trackIndex = -1;
+        juce::String trackId;
+        juce::String label;
+    };
+    std::vector<StackedRibbonCandidate> stackedCandidates;
+    {
+        const auto ribbon = mdRibbonArea();
+        const auto hits = layoutMdRibbonHits(area, viewLength(), ribbon);
+        for (const auto& h : hits) {
+            if (!h.bounds.contains(event.getPosition())) {
+                continue;
+            }
+            bool seen = false;
+            for (const auto& prev : stackedCandidates) {
+                if (prev.trackIndex == h.trackIndex) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                stackedCandidates.push_back(
+                    {h.trackIndex, h.trackId,
+                     "T" + juce::String(h.trackIndex + 1) + ": " + h.title});
+            }
+        }
+    }
+
     juce::PopupMenu menu;
+    if (stackedCandidates.size() > 1) {
+        juce::PopupMenu stackedMenu;
+        const int totalStacked = static_cast<int>(stackedCandidates.size());
+        const auto enDash = juce::String::fromUTF8("\xe2\x80\x93");
+        if (totalStacked <= 30) {
+            for (int k = 0; k < totalStacked; ++k) {
+                stackedMenu.addItem(1000 + k, stackedCandidates[static_cast<size_t>(k)].label);
+            }
+        } else {
+            for (int start = 0; start < totalStacked; start += 30) {
+                const int end = std::min(totalStacked, start + 30);
+                juce::PopupMenu page;
+                for (int k = start; k < end; ++k) {
+                    page.addItem(1000 + k, stackedCandidates[static_cast<size_t>(k)].label);
+                }
+                stackedMenu.addSubMenu("Tracks " + juce::String(start + 1) + enDash +
+                                           juce::String(end),
+                                       page);
+            }
+        }
+        menu.addSubMenu("Select Stacked Track (" + juce::String(totalStacked) + " here)",
+                        stackedMenu);
+        menu.addSeparator();
+    }
     menu.addItem(MdRibbonMenuId::splitHere, "Split Track Here", canSplitHere);
     menu.addItem(MdRibbonMenuId::splitPlayhead, "Split Track at Playhead", canSplitPlayhead);
     menu.addItem(MdRibbonMenuId::merge,
@@ -203,13 +255,25 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), revision, trackIdx, trackId,
-         mergeLeftIdx, clickSample, playheadSample](int result) {
+         mergeLeftIdx, clickSample, playheadSample, stackedCandidates](int result) {
             if (safe == nullptr || result == 0) {
                 return;
             }
             if (safe->editGeneration != revision) {
                 safe->status.setText("The project changed; open the menu again.",
                                      juce::dontSendNotification);
+                return;
+            }
+            if (result >= 1000) {
+                const int idx = result - 1000;
+                if (idx >= 0 && idx < static_cast<int>(stackedCandidates.size())) {
+                    if (!safe->discWorkspaceVisible) {
+                        safe->setDiscWorkspaceVisible(true);
+                    }
+                    safe->discWorkspace.selectTrackById(
+                        stackedCandidates[static_cast<size_t>(idx)].trackId, true);
+                    safe->repaint();
+                }
                 return;
             }
             switch (result) {

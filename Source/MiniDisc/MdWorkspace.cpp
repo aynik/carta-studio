@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <map>
+#include <set>
 #include <utility>
 
 namespace {
@@ -38,15 +40,52 @@ void paintAlternatingRowBackground(juce::Graphics& g, int row, int width, int he
     }
 }
 
-std::vector<int> computeSpanRefCounts(const carta::MdPhysicalPlan& plan) {
-    std::vector<int> refs(plan.spans.size(), 0);
-    for (const auto& placement : plan.placements) {
-        if (placement.spanIndex >= 0 &&
-            static_cast<std::size_t>(placement.spanIndex) < refs.size()) {
-            refs[static_cast<std::size_t>(placement.spanIndex)]++;
-        }
+int countPlacementAudioRefs(const carta::MdPhysicalPlan& plan, std::size_t placementIdx) {
+    if (placementIdx >= plan.placements.size()) {
+        return 1;
     }
-    return refs;
+    const auto& me = plan.placements[placementIdx];
+    if (me.isOnDisc) {
+        const auto myS = me.startAddr.toLinearUnits();
+        const auto myE = me.endAddr.toLinearUnits();
+        int count = 0;
+        for (const auto& other : plan.placements) {
+            if (!other.isOnDisc) {
+                continue;
+            }
+            const auto oS = other.startAddr.toLinearUnits();
+            const auto oE = other.endAddr.toLinearUnits();
+            if (oS <= myE && myS <= oE) {
+                ++count;
+            }
+        }
+        return std::max(1, count);
+    }
+    if (me.spanIndex >= 0) {
+        const int myS = me.unitOffsetInSpan;
+        const int myE = me.unitOffsetInSpan + me.unitCount;
+        int count = 0;
+        for (const auto& other : plan.placements) {
+            if (other.isOnDisc || other.spanIndex != me.spanIndex) {
+                continue;
+            }
+            const int oS = other.unitOffsetInSpan;
+            const int oE = other.unitOffsetInSpan + other.unitCount;
+            if (oS < myE && myS < oE) {
+                ++count;
+            }
+        }
+        return std::max(1, count);
+    }
+    return 1;
+}
+
+juce::String compactClusterLabel(int startCluster, int endCluster) {
+    const auto enDash = juce::String::fromUTF8("\xe2\x80\x93");
+    if (startCluster == endCluster) {
+        return "C" + juce::String(startCluster);
+    }
+    return "C" + juce::String(startCluster) + enDash + juce::String(endCluster);
 }
 
 bool resolveSelectedOrPlayheadRange(const carta::TimeSelection& sel, juce::int64 playhead,
@@ -70,6 +109,141 @@ bool resolveSelectedOrPlayheadRange(const carta::TimeSelection& sel, juce::int64
 // ============================================================================
 // Nested ListBox Models & Keyboard Handling
 // ============================================================================
+
+MdWorkspace::ReorderableListBox::ReorderableListBox(const juce::String& name,
+                                                    juce::ListBoxModel* modelRef)
+    : juce::ListBox(name, modelRef) {
+    addMouseListener(this, true);
+}
+
+MdWorkspace::ReorderableListBox::~ReorderableListBox() {
+    removeMouseListener(this);
+}
+
+bool MdWorkspace::ReorderableListBox::isIgnoredChildComponent(
+    const juce::Component* comp) const noexcept {
+    if (comp == nullptr) {
+        return false;
+    }
+    if (dynamic_cast<const juce::ScrollBar*>(comp) != nullptr ||
+        comp->findParentComponentOfClass<juce::ScrollBar>() != nullptr) {
+        return true;
+    }
+    if (dynamic_cast<const juce::TextEditor*>(comp) != nullptr ||
+        comp->findParentComponentOfClass<juce::TextEditor>() != nullptr) {
+        return true;
+    }
+    return false;
+}
+
+int MdWorkspace::ReorderableListBox::computeInsertBeforeRow(juce::Point<int> pt) {
+    auto* m = getListBoxModel();
+    const int totalRows = m ? m->getNumRows() : 0;
+    if (totalRows <= 0) {
+        return -1;
+    }
+    const int hitRow = getRowContainingPosition(pt.x, pt.y);
+    if (hitRow >= 0 && hitRow < totalRows) {
+        const auto pos = getRowPosition(hitRow, true);
+        return juce::jlimit(0, totalRows, (pt.y >= pos.getCentreY()) ? (hitRow + 1) : hitRow);
+    }
+    const auto firstRect = getRowPosition(0, true);
+    return (pt.y < firstRect.getY()) ? 0 : totalRows;
+}
+
+void MdWorkspace::ReorderableListBox::mouseDown(const juce::MouseEvent& event) {
+    // Only handle child row events or direct events once; guard against duplicate callback when
+    // originalComponent == this because juce::Component delivers its own mouse events natively too.
+    if (event.originalComponent == this && event.eventComponent == this) {
+        juce::ListBox::mouseDown(event);
+    }
+    if (!dragReorderEnabled || !onRowReorder || !event.mods.isLeftButtonDown() ||
+        event.mods.isPopupMenu() || event.mods.isShiftDown() || event.mods.isCommandDown() ||
+        event.mods.isCtrlDown() || event.mods.isAltDown() ||
+        isIgnoredChildComponent(event.originalComponent)) {
+        dragCandidate = false;
+        dragActive = false;
+        dragFromRow = -1;
+        dragInsertRow = -1;
+        return;
+    }
+    const auto pt = event.getEventRelativeTo(this).getPosition();
+    const int row = getRowContainingPosition(pt.x, pt.y);
+    if (row < 0 || (canStartDrag && !canStartDrag(row))) {
+        dragCandidate = false;
+        dragActive = false;
+        dragFromRow = -1;
+        dragInsertRow = -1;
+        return;
+    }
+    dragCandidate = true;
+    dragActive = false;
+    dragFromRow = row;
+    dragInsertRow = -1;
+    dragStartY = pt.y;
+}
+
+void MdWorkspace::ReorderableListBox::mouseDrag(const juce::MouseEvent& event) {
+    if (event.originalComponent == this && event.eventComponent == this) {
+        juce::ListBox::mouseDrag(event);
+    }
+    if (!dragCandidate) {
+        return;
+    }
+    const auto pt = event.getEventRelativeTo(this).getPosition();
+    if (!dragActive && std::abs(pt.y - dragStartY) >= 6) {
+        dragActive = true;
+    }
+    if (dragActive) {
+        dragInsertRow = computeInsertBeforeRow(pt);
+        repaint();
+    }
+}
+
+void MdWorkspace::ReorderableListBox::mouseUp(const juce::MouseEvent& event) {
+    if (event.originalComponent == this && event.eventComponent == this) {
+        juce::ListBox::mouseUp(event);
+    }
+    if (dragCandidate) {
+        const bool shouldCommit =
+            dragActive && dragFromRow >= 0 && dragInsertRow >= 0 && onRowReorder;
+        const int fromRow = dragFromRow;
+        const int insertRow = dragInsertRow;
+        dragCandidate = false;
+        dragActive = false;
+        dragFromRow = -1;
+        dragInsertRow = -1;
+        repaint();
+        if (shouldCommit) {
+            onRowReorder(fromRow, insertRow);
+        }
+    }
+}
+
+void MdWorkspace::ReorderableListBox::paintOverChildren(juce::Graphics& g) {
+    juce::ListBox::paintOverChildren(g);
+    if (!dragActive || dragInsertRow < 0) {
+        return;
+    }
+    auto* m = getListBoxModel();
+    const int totalRows = m ? m->getNumRows() : 0;
+    if (totalRows <= 0) {
+        return;
+    }
+    int lineY = 1;
+    if (dragInsertRow < totalRows) {
+        lineY = getRowPosition(dragInsertRow, true).getY();
+    } else {
+        lineY = getRowPosition(totalRows - 1, true).getBottom() - 2;
+    }
+    lineY = juce::jlimit(1, std::max(1, getHeight() - 3), lineY);
+    const bool dark = juce::Desktop::getInstance().isDarkModeActive();
+    const auto accent = dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e);
+    const int barW = std::max(16, getVisibleContentWidth() - 4);
+    g.setColour(accent);
+    g.fillRect(2, lineY, barW, 2);
+    g.fillEllipse(0.0f, static_cast<float>(lineY - 2), 6.0f, 6.0f);
+}
 
 MdWorkspace::TrackListModel::TrackListModel(MdWorkspace& ownerRef) : owner(ownerRef) {
 }
@@ -108,7 +282,7 @@ juce::String MdWorkspace::TrackListModel::getTooltipForRow(int row) {
 }
 
 MdWorkspace::TrackListBox::TrackListBox(MdWorkspace& ownerRef, TrackListModel& modelRef)
-    : juce::ListBox("MiniDisc tracks", &modelRef), owner(ownerRef) {
+    : ReorderableListBox("MiniDisc tracks", &modelRef), owner(ownerRef) {
 }
 
 bool MdWorkspace::TrackListBox::keyPressed(const juce::KeyPress& key) {
@@ -125,6 +299,21 @@ bool MdWorkspace::TrackListBox::keyPressed(const juce::KeyPress& key) {
     if (!key.getModifiers().isAnyModifierKeyDown() && key.isKeyCode(juce::KeyPress::spaceKey)) {
         owner.triggerPreviewSelected();
         return true;
+    }
+    if (key == juce::KeyPress('c', juce::ModifierKeys::commandModifier, 0)) {
+        if (!owner.selectedTrackIndices0().empty()) {
+            owner.triggerCopySelectedTracks();
+            return true;
+        }
+    }
+    if (key == juce::KeyPress('v', juce::ModifierKeys::commandModifier, 0)) {
+        if (!owner.copiedTrackClipboard.empty()) {
+            const auto sel = owner.selectedTrackIndices0();
+            const int afterRow =
+                !sel.empty() ? sel.back() : (static_cast<int>(owner.trackRows.size()) - 1);
+            owner.triggerPasteTracksAfter(afterRow);
+            return true;
+        }
     }
     return juce::ListBox::keyPressed(key);
 }
@@ -143,6 +332,10 @@ void MdWorkspace::PartListModel::paintListBoxItem(int row, juce::Graphics& g, in
 
 void MdWorkspace::PartListModel::selectedRowsChanged(int lastRowSelected) {
     owner.handlePartSelectionChanged(lastRowSelected);
+}
+
+void MdWorkspace::PartListModel::listBoxItemClicked(int row, const juce::MouseEvent& event) {
+    owner.handlePartClick(row, event);
 }
 
 void MdWorkspace::PartListModel::listBoxItemDoubleClicked(int row, const juce::MouseEvent&) {
@@ -165,16 +358,25 @@ MdWorkspace::PlanListModel::PlanListModel(MdWorkspace& ownerRef) : owner(ownerRe
 }
 
 int MdWorkspace::PlanListModel::getNumRows() {
-    return static_cast<int>(owner.planRows.size());
+    return owner.planViewMode == "bank" ? static_cast<int>(owner.audioBankRows.size())
+                                        : static_cast<int>(owner.planRows.size());
 }
 
 void MdWorkspace::PlanListModel::paintListBoxItem(int row, juce::Graphics& g, int width, int height,
                                                   bool selected) {
-    owner.paintPlanRow(row, g, width, height, selected);
+    if (owner.planViewMode == "bank") {
+        owner.paintAudioBankRow(row, g, width, height, selected);
+    } else {
+        owner.paintPlanRow(row, g, width, height, selected);
+    }
 }
 
 void MdWorkspace::PlanListModel::selectedRowsChanged(int lastRowSelected) {
     owner.handlePlanSelectionChanged(lastRowSelected);
+}
+
+void MdWorkspace::PlanListModel::listBoxItemClicked(int row, const juce::MouseEvent& event) {
+    owner.handlePlanClick(row, event);
 }
 
 void MdWorkspace::PlanListModel::listBoxItemDoubleClicked(int row, const juce::MouseEvent&) {
@@ -186,7 +388,8 @@ void MdWorkspace::PlanListModel::returnKeyPressed(int row) {
 }
 
 juce::String MdWorkspace::PlanListModel::getTooltipForRow(int row) {
-    return owner.tooltipForPlanRow(row);
+    return owner.planViewMode == "bank" ? owner.tooltipForAudioBankRow(row)
+                                        : owner.tooltipForPlanRow(row);
 }
 
 MdWorkspace::DeviceTrackListModel::DeviceTrackListModel(MdWorkspace& ownerRef) : owner(ownerRef) {
@@ -410,6 +613,11 @@ MdWorkspace::MdWorkspace()
     trackList.setRowHeight(26);
     trackList.setMultipleSelectionEnabled(true);
     trackList.setColour(juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
+    trackList.dragReorderEnabled = true;
+    trackList.canStartDrag = [this](int) { return inlineEditingRow < 0; };
+    trackList.onRowReorder = [this](int fromRow, int insertBeforeRow) {
+        handleTrackReorderDrag(fromRow, insertBeforeRow);
+    };
 
     addChildComponent(inlineTrackTitleEditor);
     inlineTrackTitleEditor.setReturnKeyStartsNewLine(false);
@@ -542,6 +750,18 @@ MdWorkspace::MdWorkspace()
         "Append timeline selection (or playhead-to-end) as a sequential part in this track");
     addPartButton.onClick = [this] { triggerAddPart(); };
 
+    addChildComponent(partBankButton);
+    partBankButton.setTooltip("Append an existing on-disc region or timeline clip as a part");
+    partBankButton.onClick = [this] { showPartBankMenu(); };
+
+    addChildComponent(partUpButton);
+    partUpButton.setTooltip("Move the selected part earlier in this track");
+    partUpButton.onClick = [this] { triggerMovePart(-1); };
+
+    addChildComponent(partDownButton);
+    partDownButton.setTooltip("Move the selected part later in this track");
+    partDownButton.onClick = [this] { triggerMovePart(1); };
+
     addChildComponent(setPartSelButton);
     setPartSelButton.setTooltip("Update the selected part to match the current timeline selection");
     setPartSelButton.onClick = [this] { triggerSetPartToSelection(); };
@@ -562,6 +782,10 @@ MdWorkspace::MdWorkspace()
     addChildComponent(partsList);
     partsList.setRowHeight(24);
     partsList.setColour(juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
+    partsList.dragReorderEnabled = true;
+    partsList.onRowReorder = [this](int fromRow, int insertBeforeRow) {
+        handlePartReorderDrag(fromRow, insertBeforeRow);
+    };
 
     // --- Tab 1 Right: Multi-Selection Inspector ---
     addChildComponent(multiHeaderLabel);
@@ -578,6 +802,9 @@ MdWorkspace::MdWorkspace()
     multiMergeButton.setTooltip(
         "Merge contiguous selected MiniDisc tracks sequentially into one track (T-MARK erase)");
     multiMergeButton.onClick = [this] { triggerMergeSelectedTracks(); };
+    addChildComponent(multiCopyButton);
+    multiCopyButton.setTooltip("Copy selected MD tracks so Cmd/Ctrl+V pastes shared-audio aliases");
+    multiCopyButton.onClick = [this] { triggerCopySelectedTracks(); };
 
     // --- Tab 2: Device & Record ---
     addChildComponent(inspectUtocButton);
@@ -663,9 +890,21 @@ MdWorkspace::MdWorkspace()
     };
 
     addChildComponent(planCardTitle);
-    planCardTitle.setText("Target Disc Plan", juce::dontSendNotification);
+    planCardTitle.setText("Recording Plan", juce::dontSendNotification);
     planCardTitle.setFont(juce::FontOptions(11.5f, juce::Font::bold));
     planCardTitle.setBorderSize(juce::BorderSize<int>(0));
+
+    addChildComponent(planModePlaybackButton);
+    planModePlaybackButton.setClickingTogglesState(false);
+    planModePlaybackButton.setTooltip(
+        "Show logical playback track order mapped onto physical cluster ranges (drag to reorder)");
+    planModePlaybackButton.onClick = [this] { setPlanViewMode("playback"); };
+
+    addChildComponent(planModeBankButton);
+    planModeBankButton.setClickingTogglesState(false);
+    planModeBankButton.setTooltip(
+        "Show physical Audio Bank regions & spans mapped back to referencing tracks");
+    planModeBankButton.onClick = [this] { setPlanViewMode("bank"); };
 
     addChildComponent(utocSummaryLabel);
     utocSummaryLabel.setFont(juce::FontOptions(10.4f));
@@ -675,6 +914,10 @@ MdWorkspace::MdWorkspace()
     addChildComponent(planList);
     planList.setRowHeight(22);
     planList.setColour(juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
+    planList.dragReorderEnabled = true;
+    planList.onRowReorder = [this](int fromRow, int insertBeforeRow) {
+        handlePlanReorderDrag(fromRow, insertBeforeRow);
+    };
 
     addChildComponent(recordStatusLabel);
     recordStatusLabel.setFont(juce::FontOptions(10.8f));
@@ -725,14 +968,20 @@ bool MdWorkspace::selectView(const juce::String& view, juce::String& error) {
         setActiveTab(norm, false);
         return true;
     }
-    error = "Disc workspace view must be tracks or record.";
+    if (norm == "bank" || norm == "playback") {
+        setPlanViewMode(norm);
+        setActiveTab("record", false);
+        return true;
+    }
+    error = "Disc workspace view must be tracks, record, bank, or playback.";
     return false;
 }
 
 void MdWorkspace::setActiveTab(const juce::String& tab, bool notify) {
     const auto norm = tab.trim().toLowerCase();
-    const auto next =
-        (norm == "record" || norm == "map") ? juce::String("record") : juce::String("tracks");
+    const auto next = (norm == "record" || norm == "map" || norm == "bank" || norm == "playback")
+                          ? juce::String("record")
+                          : juce::String("tracks");
     const bool changed = next != activeTab;
     if (changed && next != "tracks" && inlineEditingRow >= 0) {
         commitInlineTrackEdit(true);
@@ -744,6 +993,33 @@ void MdWorkspace::setActiveTab(const juce::String& tab, bool notify) {
     if (changed && notify && onTabChanged) {
         onTabChanged(activeTab);
     }
+}
+
+juce::String MdWorkspace::currentPlanViewMode() const noexcept {
+    return planViewMode;
+}
+
+void MdWorkspace::setPlanViewMode(const juce::String& mode) {
+    const auto norm = mode.trim().toLowerCase();
+    const auto next = (norm == "bank") ? juce::String("bank") : juce::String("playback");
+    planViewMode = next;
+    planList.dragReorderEnabled = (planViewMode == "playback");
+    syncingControls = true;
+    planList.updateContent();
+    if (planViewMode == "playback") {
+        const auto selected = selectedTrackIndices0();
+        if (!selected.empty() && selected.front() < static_cast<int>(planRows.size())) {
+            planList.selectRow(selected.front(), false, true);
+        } else {
+            planList.deselectAllRows();
+        }
+    } else {
+        planList.deselectAllRows();
+    }
+    syncingControls = false;
+    updateTabVisibility();
+    planList.repaint();
+    repaint();
 }
 
 bool MdWorkspace::hasPendingProgramEdits() const noexcept {
@@ -783,8 +1059,81 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
                              compiledUtoc, carta::mdMediumToString(discState.medium), physTotal)
                        : carta::UtocBudget{};
 
-    // Build per-span reference counts so aliased/shared parts are immediately identifiable.
-    const auto spanRefCounts = computeSpanRefCounts(physicalPlan);
+    // Build per-placement reference counts so aliased/shared parts across both newly uploaded
+    // spans and loaded on-disc regions are identified accurately without conflating coalesced
+    // sequential neighbors.
+    std::vector<int> placementRefCounts(physicalPlan.placements.size(), 1);
+    std::map<std::pair<int, int>, std::size_t> placementIndexByTrackPart;
+    std::vector<std::vector<std::size_t>> placementsByTrack(discState.tracks.size());
+    for (std::size_t pi = 0; pi < physicalPlan.placements.size(); ++pi) {
+        const auto& pl = physicalPlan.placements[pi];
+        placementRefCounts[pi] = countPlacementAudioRefs(physicalPlan, pi);
+        placementIndexByTrackPart.emplace(std::make_pair(pl.trackIndex, pl.partIndex), pi);
+        if (pl.trackIndex >= 0 && pl.trackIndex < static_cast<int>(placementsByTrack.size())) {
+            placementsByTrack[static_cast<std::size_t>(pl.trackIndex)].push_back(pi);
+        }
+    }
+
+    // Build deduplicated audio-bank timeline entries from all session layer clips (+ any loaded
+    // disc regions not represented by clips).
+    audioBankClipEntries.clear();
+    {
+        std::set<std::pair<juce::int64, juce::int64>> seenClipRanges;
+        for (const auto& layer : session.tracks) {
+            const auto layerLabel = layer.name;
+            for (const auto& clip : layer.clips) {
+                juce::int64 s0 = 0;
+                juce::int64 e0 = 0;
+                if (!carta::clipSampleRange(clip, s0, e0) || e0 <= s0) {
+                    continue;
+                }
+                if (!seenClipRanges.insert({s0, e0}).second) {
+                    continue;
+                }
+                BankClipEntry entry;
+                entry.label = carta::clipDisplayName(clip).replaceCharacters("\r\n", "  ").trim();
+                entry.layerName = layerLabel;
+                entry.startSample = s0;
+                entry.endSample = e0;
+                entry.codec = discState.defaultCodec;
+                if (discState.loadedDisc.active) {
+                    int rIdx = -1;
+                    if (!clip.onDiscRegionId.empty()) {
+                        for (std::size_t ri = 0; ri < discState.loadedDisc.regions.size(); ++ri) {
+                            if (discState.loadedDisc.regions[ri].id == clip.onDiscRegionId) {
+                                rIdx = static_cast<int>(ri);
+                                break;
+                            }
+                        }
+                    }
+                    if (rIdx < 0) {
+                        rIdx = carta::findMdOnDiscRegionForPart(discState.loadedDisc, {s0, e0});
+                    }
+                    if (rIdx >= 0 &&
+                        rIdx < static_cast<int>(discState.loadedDisc.regions.size())) {
+                        const auto& reg =
+                            discState.loadedDisc.regions[static_cast<std::size_t>(rIdx)];
+                        entry.isOnDisc = true;
+                        entry.onDiscRegionIndex = rIdx;
+                        entry.startCluster = reg.physStart.cluster;
+                        entry.endCluster = reg.physEnd.cluster;
+                        entry.codec = reg.codec;
+                    }
+                }
+                if (entry.label.isEmpty()) {
+                    entry.label = entry.isOnDisc
+                                      ? ("Region #" + juce::String(entry.onDiscRegionIndex + 1))
+                                      : carta::md_ui::formatClock(s0);
+                }
+                audioBankClipEntries.push_back(std::move(entry));
+            }
+        }
+        std::sort(audioBankClipEntries.begin(), audioBankClipEntries.end(),
+                  [](const BankClipEntry& a, const BankClipEntry& b) {
+                      return std::tie(a.startSample, a.endSample) <
+                             std::tie(b.startSample, b.endSample);
+                  });
+    }
 
     trackRows.clear();
     trackRows.reserve(discState.tracks.size());
@@ -822,16 +1171,12 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
                 break;
             }
         }
-        row.sharesPhysicalSpan = false;
+        row.maxSharedRefs = 1;
         row.onDisc = carta::mdTrackUsesOnDiscAudio(discState, t);
-        for (const auto& p : physicalPlan.placements) {
-            if (p.trackIndex == static_cast<int>(i) && p.spanIndex >= 0 &&
-                static_cast<std::size_t>(p.spanIndex) < spanRefCounts.size() &&
-                spanRefCounts[static_cast<std::size_t>(p.spanIndex)] > 1) {
-                row.sharesPhysicalSpan = true;
-                break;
-            }
+        for (const std::size_t pi : placementsByTrack[i]) {
+            row.maxSharedRefs = std::max(row.maxSharedRefs, placementRefCounts[pi]);
         }
+        row.sharesPhysicalSpan = row.maxSharedRefs > 1;
         trackRows.push_back(std::move(row));
     }
 
@@ -853,10 +1198,9 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         int odMinClu = 0;
         int odMaxClu = 0;
         bool hasOd = false;
-        for (const auto& place : physicalPlan.placements) {
-            if (place.trackIndex != static_cast<int>(i)) {
-                continue;
-            }
+        std::vector<juce::String> hops;
+        for (const std::size_t pi : placementsByTrack[i]) {
+            const auto& place = physicalPlan.placements[pi];
             if (place.isOnDisc) {
                 if (!hasOd) {
                     odMinClu = place.startAddr.cluster;
@@ -866,23 +1210,142 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
                     odMinClu = std::min(odMinClu, static_cast<int>(place.startAddr.cluster));
                     odMaxClu = std::max(odMaxClu, static_cast<int>(place.endAddr.cluster));
                 }
-            } else if (pr.primarySpanIndex < 0 && place.spanIndex >= 0 &&
+                pr.spanRefCount = std::max(pr.spanRefCount, placementRefCounts[pi]);
+                hops.push_back(
+                    compactClusterLabel(place.startAddr.cluster, place.endAddr.cluster));
+            } else if (place.spanIndex >= 0 &&
                        static_cast<std::size_t>(place.spanIndex) < physicalPlan.spans.size()) {
                 const auto& sp = physicalPlan.spans[static_cast<std::size_t>(place.spanIndex)];
-                pr.primarySpanIndex = place.spanIndex;
-                pr.spanClusterStart = sp.startCluster;
-                pr.spanClusterEnd = sp.startCluster + std::max(0, sp.clusterCount - 1);
-                pr.spanRefCount = static_cast<std::size_t>(place.spanIndex) < spanRefCounts.size()
-                                      ? spanRefCounts[static_cast<std::size_t>(place.spanIndex)]
-                                      : 1;
+                if (pr.primarySpanIndex < 0) {
+                    pr.primarySpanIndex = place.spanIndex;
+                    pr.spanClusterStart = sp.startCluster;
+                    pr.spanClusterEnd = sp.startCluster + std::max(0, sp.clusterCount - 1);
+                }
+                pr.spanRefCount = std::max(pr.spanRefCount, placementRefCounts[pi]);
+                const int pStartC =
+                    sp.startCluster + place.unitOffsetInSpan / carta::kMdUnitsPerCluster;
+                const int pEndC =
+                    sp.startCluster +
+                    std::max(0, place.unitOffsetInSpan + place.unitCount - 1) /
+                        carta::kMdUnitsPerCluster;
+                hops.push_back(compactClusterLabel(pStartC, pEndC));
             }
         }
         if (hasOd && pr.primarySpanIndex < 0) {
             pr.spanClusterStart = odMinClu;
             pr.spanClusterEnd = odMaxClu;
         }
+        if (hops.size() > 1) {
+            const auto arrow = juce::String::fromUTF8(" \xe2\x86\x92 ");
+            pr.partHopsText = juce::String(static_cast<int>(hops.size())) + "p: ";
+            if (hops.size() <= 3) {
+                pr.partHopsText += hops[0];
+                for (std::size_t h = 1; h < hops.size(); ++h) {
+                    pr.partHopsText += arrow + hops[h];
+                }
+            } else {
+                pr.partHopsText += hops[0] + arrow + hops[1] + arrow +
+                                   juce::String::fromUTF8("\xe2\x80\xa6") + arrow + hops.back();
+            }
+        }
         planRows.push_back(std::move(pr));
     }
+
+    // Build inverse Audio Bank table (physical on-disc regions + new local spans -> tracks).
+    audioBankRows.clear();
+    if (discState.loadedDisc.active) {
+        for (std::size_t ri = 0; ri < discState.loadedDisc.regions.size(); ++ri) {
+            const auto& reg = discState.loadedDisc.regions[ri];
+            AudioBankRow row;
+            row.isOnDisc = true;
+            row.onDiscRegionIndex = static_cast<int>(ri);
+            row.codec = reg.codec;
+            row.startCluster = reg.physStart.cluster;
+            row.endCluster = reg.physEnd.cluster;
+            row.clusterCount = std::max(1, row.endCluster - row.startCluster + 1);
+            row.timelineStartSample = reg.timelineStartSample;
+            row.timelineEndSample = reg.timelineEndSample;
+
+            std::set<int> uniqTracks;
+            for (const auto& place : physicalPlan.placements) {
+                if (place.isOnDisc && place.onDiscRegionIndex == static_cast<int>(ri)) {
+                    ++row.totalPartRefs;
+                    if (place.trackIndex >= 0 &&
+                        place.trackIndex < static_cast<int>(trackRows.size())) {
+                        uniqTracks.insert(place.trackIndex);
+                    }
+                }
+            }
+            row.referencingTrackIndices0.assign(uniqTracks.begin(), uniqTracks.end());
+            row.isReclaimed = row.referencingTrackIndices0.empty();
+
+            for (const auto& clipEntry : audioBankClipEntries) {
+                if (clipEntry.onDiscRegionIndex == static_cast<int>(ri) &&
+                    clipEntry.label.isNotEmpty()) {
+                    row.label = clipEntry.label;
+                    break;
+                }
+            }
+            if (row.label.isEmpty() && !row.referencingTrackIndices0.empty()) {
+                row.label = trackRows[static_cast<std::size_t>(row.referencingTrackIndices0.front())]
+                                .title;
+            }
+            if (row.label.isEmpty()) {
+                row.label = "On-Disc Region #" + juce::String(static_cast<int>(ri + 1));
+            }
+            audioBankRows.push_back(std::move(row));
+        }
+    }
+    for (std::size_t si = 0; si < physicalPlan.spans.size(); ++si) {
+        const auto& sp = physicalPlan.spans[si];
+        AudioBankRow row;
+        row.isOnDisc = false;
+        row.spanIndex = static_cast<int>(si);
+        row.codec = sp.codec;
+        row.startCluster = sp.startCluster;
+        row.endCluster = sp.startCluster + std::max(0, sp.clusterCount - 1);
+        row.clusterCount = sp.clusterCount;
+        row.timelineStartSample = sp.startSample;
+        row.timelineEndSample = sp.endSample;
+
+        std::set<int> uniqTracks;
+        for (const auto& place : physicalPlan.placements) {
+            if (!place.isOnDisc && place.spanIndex == static_cast<int>(si)) {
+                ++row.totalPartRefs;
+                if (place.trackIndex >= 0 &&
+                    place.trackIndex < static_cast<int>(trackRows.size())) {
+                    uniqTracks.insert(place.trackIndex);
+                }
+            }
+        }
+        row.referencingTrackIndices0.assign(uniqTracks.begin(), uniqTracks.end());
+
+        for (const auto& clipEntry : audioBankClipEntries) {
+            if (!clipEntry.isOnDisc && clipEntry.startSample < sp.endSample &&
+                sp.startSample < clipEntry.endSample && clipEntry.label.isNotEmpty()) {
+                row.label = clipEntry.label;
+                break;
+            }
+        }
+        if (row.label.isEmpty() && !row.referencingTrackIndices0.empty()) {
+            row.label =
+                trackRows[static_cast<std::size_t>(row.referencingTrackIndices0.front())].title;
+        }
+        if (row.label.isEmpty()) {
+            row.label = "New Span #" + juce::String(static_cast<int>(si + 1));
+        }
+        audioBankRows.push_back(std::move(row));
+    }
+    std::sort(audioBankRows.begin(), audioBankRows.end(),
+              [](const AudioBankRow& a, const AudioBankRow& b) {
+                  if (a.isOnDisc != b.isOnDisc) {
+                      return a.isOnDisc;
+                  }
+                  if (a.startCluster != b.startCluster) {
+                      return a.startCluster < b.startCluster;
+                  }
+                  return a.timelineStartSample < b.timelineStartSample;
+              });
 
     syncingControls = true;
     discBaselineTitle = juce::String::fromUTF8(discState.halfWidthTitle.c_str());
@@ -915,9 +1378,17 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
     planList.updateContent();
     if (targetRow >= 0) {
         trackList.selectRow(targetRow, false, true);
-        planList.selectRow(targetRow, false, true);
+        if (planViewMode == "playback") {
+            planList.selectRow(targetRow, false, true);
+        }
     } else {
         trackList.deselectAllRows();
+        if (planViewMode == "playback") {
+            planList.deselectAllRows();
+        }
+    }
+    if (planViewMode == "bank" &&
+        planList.getSelectedRow() >= static_cast<int>(audioBankRows.size())) {
         planList.deselectAllRows();
     }
     syncingControls = false;
@@ -1160,12 +1631,17 @@ void MdWorkspace::paint(juce::Graphics& g) {
             }
         }
         paintTargetCapacityBar(g, targetBarBounds, dark);
-        if (planRows.empty() && !planList.getBounds().isEmpty()) {
+        const bool planListEmpty =
+            planViewMode == "bank" ? audioBankRows.empty() : planRows.empty();
+        if (planListEmpty && !planList.getBounds().isEmpty()) {
             g.setColour(textMuted);
             g.setFont(juce::FontOptions(11.3f));
-            g.drawText("Add MiniDisc tracks (Tracks & UTOC -> Tracks from Clips) to plan physical "
-                       "disc spans.",
-                       planList.getBounds().reduced(8, 0), juce::Justification::centred, true);
+            g.drawText(
+                planViewMode == "bank"
+                    ? "Load a disc or import timeline audio to view physical Audio Bank regions."
+                    : "Add MiniDisc tracks (Tracks & UTOC -> Tracks from Clips) to plan physical "
+                      "disc spans.",
+                planList.getBounds().reduced(8, 0), juce::Justification::centred, true);
         }
         if (recordBusy || recordUiState.progress.active) {
             paintPlanProgressBar(g, planProgressBounds, dark);
@@ -1368,9 +1844,11 @@ void MdWorkspace::layoutRightInspector(juce::Rectangle<int> area) {
     multiArea.removeFromTop(6);
     auto multiRow3 = multiArea.removeFromTop(24);
     multiMergeButton.setBounds(multiRow3.removeFromLeft(130));
+    multiRow3.removeFromLeft(6);
+    multiCopyButton.setBounds(multiRow3.removeFromLeft(110));
 
     auto singleArea = area;
-    auto rowA = singleArea.removeFromTop(24);
+    auto rowA = singleArea.removeFromTop(22);
     trackTitleLabel.setBounds(rowA.removeFromLeft(34));
     const int formsW = 64;
     const int flagsW = 62;
@@ -1380,32 +1858,43 @@ void MdWorkspace::layoutRightInspector(juce::Rectangle<int> area) {
     rowA.removeFromRight(4);
     trackTitleEditor.setBounds(rowA);
 
-    singleArea.removeFromTop(5);
-    auto rowB = singleArea.removeFromTop(24);
+    singleArea.removeFromTop(4);
+    auto rowB = singleArea.removeFromTop(22);
     trackCodecLabel.setBounds(rowB.removeFromLeft(42));
-    const int codecW = std::min(150, std::max(100, rowB.getWidth() / 2));
+    const int codecW = std::min(140, std::max(96, rowB.getWidth() / 2));
     trackCodecBox.setBounds(rowB.removeFromLeft(codecW));
     rowB.removeFromLeft(6);
     trackGroupButton.setBounds(rowB);
 
-    singleArea.removeFromTop(6);
-    auto rowC = singleArea.removeFromTop(24);
-    const int seekW = 48;
-    const int delW = 40;
-    const int repW = 68;
-    const int setW = 70;
-    const int addW = 56;
-    seekPartButton.setBounds(rowC.removeFromRight(seekW));
-    rowC.removeFromRight(3);
-    delPartButton.setBounds(rowC.removeFromRight(delW));
-    rowC.removeFromRight(3);
-    repeatPartButton.setBounds(rowC.removeFromRight(repW));
-    rowC.removeFromRight(3);
-    setPartSelButton.setBounds(rowC.removeFromRight(setW));
+    singleArea.removeFromTop(5);
+    auto rowC = singleArea.removeFromTop(22);
+    const int bankW = 90;
+    const int addW = 52;
+    partBankButton.setBounds(rowC.removeFromRight(bankW));
     rowC.removeFromRight(3);
     addPartButton.setBounds(rowC.removeFromRight(addW));
     rowC.removeFromRight(4);
     partsHeaderLabel.setBounds(rowC);
+
+    singleArea.removeFromTop(3);
+    auto rowD = singleArea.removeFromTop(22);
+    const int pUpW = 28;
+    const int pDnW = 28;
+    const int setW = 64;
+    const int repW = 64;
+    const int delW = 34;
+    const int seekW = 42;
+    seekPartButton.setBounds(rowD.removeFromRight(seekW));
+    rowD.removeFromRight(3);
+    delPartButton.setBounds(rowD.removeFromRight(delW));
+    rowD.removeFromRight(3);
+    repeatPartButton.setBounds(rowD.removeFromRight(repW));
+    rowD.removeFromRight(3);
+    setPartSelButton.setBounds(rowD.removeFromRight(setW));
+    rowD.removeFromRight(3);
+    partDownButton.setBounds(rowD.removeFromRight(pDnW));
+    rowD.removeFromRight(3);
+    partUpButton.setBounds(rowD.removeFromRight(pUpW));
 
     singleArea.removeFromTop(4);
     partsList.setBounds(singleArea);
@@ -1453,8 +1942,12 @@ void MdWorkspace::layoutPlanCard(juce::Rectangle<int> area) {
         planProgressBounds = {};
         return;
     }
-    auto topRow = area.removeFromTop(16);
-    planCardTitle.setBounds(topRow.removeFromLeft(116));
+    auto topRow = area.removeFromTop(20);
+    planCardTitle.setBounds(topRow.removeFromLeft(90));
+    topRow.removeFromLeft(4);
+    planModePlaybackButton.setBounds(topRow.removeFromLeft(64));
+    topRow.removeFromLeft(2);
+    planModeBankButton.setBounds(topRow.removeFromLeft(76));
     topRow.removeFromLeft(6);
     utocSummaryLabel.setBounds(topRow);
 
@@ -1516,6 +2009,9 @@ void MdWorkspace::updateTabVisibility() {
     trackGroupButton.setVisible(oneSelected);
     partsHeaderLabel.setVisible(oneSelected);
     addPartButton.setVisible(oneSelected);
+    partBankButton.setVisible(oneSelected);
+    partUpButton.setVisible(oneSelected);
+    partDownButton.setVisible(oneSelected);
     setPartSelButton.setVisible(oneSelected);
     repeatPartButton.setVisible(oneSelected);
     delPartButton.setVisible(oneSelected);
@@ -1528,6 +2024,7 @@ void MdWorkspace::updateTabVisibility() {
     multiDuplicateButton.setVisible(multiSelected);
     multiRemoveButton.setVisible(multiSelected);
     multiMergeButton.setVisible(multiSelected);
+    multiCopyButton.setVisible(multiSelected);
 
     deviceCardTitle.setVisible(isRecord);
     recordDeviceBox.setVisible(isRecord);
@@ -1542,6 +2039,8 @@ void MdWorkspace::updateTabVisibility() {
     readDiscTocButton.setVisible(isRecord);
     eraseDiscButton.setVisible(isRecord);
     planCardTitle.setVisible(isRecord);
+    planModePlaybackButton.setVisible(isRecord);
+    planModeBankButton.setVisible(isRecord);
     utocSummaryLabel.setVisible(isRecord);
     planList.setVisible(isRecord);
     recordStatusLabel.setVisible(isRecord && !recordBusy);
@@ -1556,6 +2055,10 @@ void MdWorkspace::updateTabVisibility() {
                               baseBtnCol.withAlpha(isTracks ? 1.0f : 0.65f));
     recordTabButton.setColour(juce::TextButton::buttonColourId,
                               baseBtnCol.withAlpha(isRecord ? 1.0f : 0.65f));
+    planModePlaybackButton.setColour(juce::TextButton::buttonColourId,
+                                     baseBtnCol.withAlpha(planViewMode == "playback" ? 1.0f : 0.62f));
+    planModeBankButton.setColour(juce::TextButton::buttonColourId,
+                                 baseBtnCol.withAlpha(planViewMode == "bank" ? 1.0f : 0.62f));
 }
 
 void MdWorkspace::refreshPlanSummaryLabels() {
@@ -1603,21 +2106,22 @@ void MdWorkspace::rebuildPartRows(int preferredPartRow) {
     if (selected.size() == 1) {
         const int row = selected.front();
         const auto& track = discState.tracks[static_cast<std::size_t>(row)];
-        const auto spanRefs = computeSpanRefCounts(physicalPlan);
 
         for (std::size_t p = 0; p < track.parts.size(); ++p) {
             PartRow pr;
             pr.index0 = static_cast<int>(p);
             pr.startSample = track.parts[p].startSample;
             pr.endSample = track.parts[p].endSample;
-            for (const auto& place : physicalPlan.placements) {
+            for (std::size_t pi = 0; pi < physicalPlan.placements.size(); ++pi) {
+                const auto& place = physicalPlan.placements[pi];
                 if (place.trackIndex == row && place.partIndex == static_cast<int>(p)) {
                     pr.spanIndex = place.spanIndex;
+                    pr.isOnDisc = place.isOnDisc;
+                    pr.onDiscRegionIndex = place.onDiscRegionIndex;
                     pr.startAddr = place.startAddr;
                     pr.endAddr = place.endAddr;
-                    pr.sharedSpan = place.spanIndex >= 0 &&
-                                    static_cast<std::size_t>(place.spanIndex) < spanRefs.size() &&
-                                    spanRefs[static_cast<std::size_t>(place.spanIndex)] > 1;
+                    pr.sharedRefCount = countPlacementAudioRefs(physicalPlan, pi);
+                    pr.sharedSpan = pr.sharedRefCount > 1;
                     break;
                 }
             }
@@ -1678,6 +2182,8 @@ void MdWorkspace::updateButtonStates() {
     const bool hasSel = timeSelection.hasRange();
     const bool hasValidSinglePart = partRow >= 0 && partRow < static_cast<int>(partRows.size());
     const bool hasAudio = masterEndSample > 0;
+    const bool contiguous = !selected.empty() && (selected.back() - selected.front() + 1 ==
+                                                  static_cast<int>(selected.size()));
 
     insertTrackButton.setEnabled(hasSel || hasAudio);
     duplicateTrackButton.setEnabled(!selected.empty());
@@ -1692,8 +2198,9 @@ void MdWorkspace::updateButtonStates() {
         }
     }
     splitTrackButton.setEnabled(canSplit);
-    moveUpButton.setEnabled(row > 0);
-    moveDownButton.setEnabled(row >= 0 && row + 1 < static_cast<int>(trackRows.size()));
+    moveUpButton.setEnabled(contiguous && selected.front() > 0);
+    moveDownButton.setEnabled(contiguous &&
+                              selected.back() + 1 < static_cast<int>(trackRows.size()));
     removeTrackButton.setEnabled(!selected.empty());
     groupMenuButton.setEnabled(!trackRows.empty());
 
@@ -1702,18 +2209,21 @@ void MdWorkspace::updateButtonStates() {
     reviewWavButton.setEnabled(!trackRows.empty());
 
     addPartButton.setEnabled(row >= 0 && (hasSel || hasAudio));
+    partBankButton.setEnabled(row >= 0 && !audioBankClipEntries.empty());
+    partUpButton.setEnabled(row >= 0 && hasValidSinglePart && partRow > 0);
+    partDownButton.setEnabled(row >= 0 && hasValidSinglePart &&
+                              partRow + 1 < static_cast<int>(partRows.size()));
     setPartSelButton.setEnabled(row >= 0 && hasValidSinglePart && hasSel);
     repeatPartButton.setEnabled(row >= 0 && hasValidSinglePart);
     delPartButton.setEnabled(row >= 0 && hasValidSinglePart && partRows.size() > 1);
     seekPartButton.setEnabled(row >= 0 && hasValidSinglePart);
 
-    const bool contiguous = selected.size() >= 1 && (selected.back() - selected.front() + 1 ==
-                                                     static_cast<int>(selected.size()));
     multiGroupButton.setEnabled(contiguous);
     multiUngroupButton.setEnabled(!selected.empty());
     multiDuplicateButton.setEnabled(!selected.empty());
     multiRemoveButton.setEnabled(!selected.empty());
     multiMergeButton.setEnabled(contiguous && selected.size() >= 2);
+    multiCopyButton.setEnabled(!selected.empty());
 }
 
 // ============================================================================
@@ -1725,10 +2235,12 @@ void MdWorkspace::handleTrackSelectionChanged(int lastRowSelected) {
         return;
     }
     syncingControls = true;
-    if (lastRowSelected >= 0 && lastRowSelected < static_cast<int>(planRows.size())) {
-        planList.selectRow(lastRowSelected, false, true);
-    } else {
-        planList.deselectAllRows();
+    if (planViewMode == "playback") {
+        if (lastRowSelected >= 0 && lastRowSelected < static_cast<int>(planRows.size())) {
+            planList.selectRow(lastRowSelected, false, true);
+        } else {
+            planList.deselectAllRows();
+        }
     }
     syncingControls = false;
     rebuildPartRows();
@@ -1747,6 +2259,17 @@ void MdWorkspace::handlePlanSelectionChanged(int lastRowSelected) {
     if (syncingControls) {
         return;
     }
+    if (planViewMode == "bank") {
+        if (lastRowSelected < 0 || lastRowSelected >= static_cast<int>(audioBankRows.size())) {
+            return;
+        }
+        const auto& br = audioBankRows[static_cast<std::size_t>(lastRowSelected)];
+        if (onSeekRange && br.timelineEndSample > br.timelineStartSample) {
+            onSeekRange(br.timelineStartSample, br.timelineEndSample, revision);
+        }
+        repaint();
+        return;
+    }
     if (lastRowSelected < 0 || lastRowSelected >= static_cast<int>(trackRows.size())) {
         return;
     }
@@ -1762,7 +2285,41 @@ void MdWorkspace::handlePlanSelectionChanged(int lastRowSelected) {
     }
 }
 
+void MdWorkspace::handlePlanClick(int row, const juce::MouseEvent& event) {
+    if (event.mods.isPopupMenu()) {
+        const int numRows = planViewMode == "bank" ? static_cast<int>(audioBankRows.size())
+                                                   : static_cast<int>(planRows.size());
+        if (row < 0 || row >= numRows) {
+            return;
+        }
+        if (!planList.isRowSelected(row)) {
+            planList.selectRow(row, false, true);
+        }
+        if (planViewMode == "bank") {
+            showAudioBankContextMenu(row);
+        } else {
+            showPlanContextMenu(row);
+        }
+    }
+}
+
 void MdWorkspace::triggerOpenPlanRow(int row) {
+    if (planViewMode == "bank") {
+        if (row < 0 || row >= static_cast<int>(audioBankRows.size())) {
+            return;
+        }
+        const auto& br = audioBankRows[static_cast<std::size_t>(row)];
+        if (onSeekRange && br.timelineEndSample > br.timelineStartSample) {
+            onSeekRange(br.timelineStartSample, br.timelineEndSample, revision);
+        }
+        if (!br.referencingTrackIndices0.empty()) {
+            const int trIdx = br.referencingTrackIndices0.front();
+            if (trIdx >= 0 && trIdx < static_cast<int>(trackRows.size())) {
+                trackList.selectRow(trIdx, false, true);
+            }
+        }
+        return;
+    }
     if (row < 0 || row >= static_cast<int>(trackRows.size())) {
         return;
     }
@@ -1790,6 +2347,18 @@ void MdWorkspace::handleTrackDoubleClick(int row) {
         return;
     }
     beginInlineTrackEdit(row);
+}
+
+void MdWorkspace::handlePartClick(int row, const juce::MouseEvent& event) {
+    if (row < 0 || row >= static_cast<int>(partRows.size())) {
+        return;
+    }
+    if (event.mods.isPopupMenu()) {
+        if (!partsList.isRowSelected(row)) {
+            partsList.selectRow(row, false, true);
+        }
+        showPartContextMenu(row);
+    }
 }
 
 void MdWorkspace::beginInlineTrackEdit(int row) {
@@ -1974,15 +2543,248 @@ void MdWorkspace::triggerSplitTrack() {
 
 void MdWorkspace::triggerMoveTrack(int delta) {
     commitPendingEdits();
+    const auto selected = selectedTrackIndices0();
+    if (selected.empty() || !onCommand || delta == 0) {
+        return;
+    }
+    if (selected.size() == 1) {
+        const int row = selected.front();
+        const int dest = row + delta;
+        if (dest < 0 || dest >= static_cast<int>(trackRows.size())) {
+            return;
+        }
+        onCommand({"disc", "track", "move", juce::String(row), juce::String(dest)}, revision);
+        return;
+    }
+    const int fromStart = selected.front();
+    const int fromEnd = selected.back();
+    const int blockLen = fromEnd - fromStart + 1;
+    if (blockLen != static_cast<int>(selected.size())) {
+        if (onFeedback) {
+            onFeedback("Select a single track or contiguous block of tracks to move.");
+        }
+        return;
+    }
+    const int destStart = fromStart + delta;
+    if (destStart < 0 || destStart + blockLen > static_cast<int>(trackRows.size())) {
+        return;
+    }
+    if (onCommand({"disc", "track", "move-block", juce::String(fromStart), juce::String(fromEnd),
+                   juce::String(destStart)},
+                  revision)) {
+        syncingControls = true;
+        trackList.deselectAllRows();
+        for (int r = destStart; r < destStart + blockLen; ++r) {
+            trackList.selectRow(r, false, false);
+        }
+        if (planViewMode == "playback") {
+            planList.deselectAllRows();
+            for (int r = destStart; r < destStart + blockLen; ++r) {
+                planList.selectRow(r, false, false);
+            }
+        }
+        syncingControls = false;
+        rebuildPartRows();
+        updateTabVisibility();
+        updateButtonStates();
+        repaint();
+    }
+}
+
+void MdWorkspace::triggerCopySelectedTracks() {
+    commitPendingEdits();
+    const auto selected = selectedTrackIndices0();
+    if (selected.empty()) {
+        return;
+    }
+    copiedTrackClipboard.clear();
+    copiedTrackClipboard.reserve(selected.size());
+    for (const int idx : selected) {
+        if (idx >= 0 && idx < static_cast<int>(discState.tracks.size())) {
+            copiedTrackClipboard.push_back(discState.tracks[static_cast<std::size_t>(idx)]);
+        }
+    }
+    if (onFeedback && !copiedTrackClipboard.empty()) {
+        onFeedback("Copied " + juce::String(static_cast<int>(copiedTrackClipboard.size())) +
+                   (copiedTrackClipboard.size() == 1 ? " MD track" : " MD tracks") +
+                   " (paste with Cmd/Ctrl+V for shared-audio aliases).");
+    }
+}
+
+void MdWorkspace::triggerPasteTracksAfter(int afterRow) {
+    commitPendingEdits();
+    if (copiedTrackClipboard.empty() || !onCommand) {
+        return;
+    }
+    int dest = juce::jlimit(0, static_cast<int>(discState.tracks.size()), afterRow + 1);
+    const auto snapshot = copiedTrackClipboard;
+    int pastedCount = 0;
+    for (const auto& tr : snapshot) {
+        if (tr.parts.empty()) {
+            continue;
+        }
+        juce::StringArray cmd;
+        cmd.add("disc");
+        cmd.add("track");
+        cmd.add("add-parts");
+        cmd.add(juce::String(dest));
+        const auto title = tr.halfWidthTitle.empty()
+                               ? juce::String::fromUTF8(tr.fullWidthTitle.c_str())
+                               : juce::String::fromUTF8(tr.halfWidthTitle.c_str());
+        cmd.add(title.isNotEmpty() ? title : ("Track " + juce::String(dest + 1)));
+        cmd.add(tr.codecOverride ? juce::String(carta::mdCodecModeToString(*tr.codecOverride))
+                                 : juce::String("default"));
+        for (const auto& p : tr.parts) {
+            cmd.add(juce::String(p.startSample));
+            cmd.add(juce::String(p.endSample));
+        }
+        if (!onCommand(cmd, revision)) {
+            break;
+        }
+        ++dest;
+        ++pastedCount;
+    }
+    if (onFeedback && pastedCount > 0) {
+        onFeedback("Pasted " + juce::String(pastedCount) +
+                   (pastedCount == 1 ? " shared-audio track." : " shared-audio tracks."));
+    }
+}
+
+void MdWorkspace::promptMoveTrackToPosition(int row) {
+    commitPendingEdits();
+    const int count = static_cast<int>(trackRows.size());
+    if (row < 0 || row >= count || !onCommand) {
+        return;
+    }
+    auto* dialog = new juce::AlertWindow(
+        "Move Track to Position",
+        "Enter destination track number (1 to " + juce::String(count) + "):",
+        juce::MessageBoxIconType::NoIcon, this);
+    dialog->addTextEditor("pos", juce::String(row + 1), "Position:");
+    dialog->addButton("Move", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    dialog->enterModalState(
+        true,
+        juce::ModalCallbackFunction::create(
+            [safe = juce::Component::SafePointer<MdWorkspace>(this),
+             safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog),
+             row](int answer) {
+                if (safe == nullptr || safeDialog == nullptr || answer != 1 || !safe->onCommand) {
+                    return;
+                }
+                const auto raw = safeDialog->getTextEditorContents("pos").trim();
+                const int maxCount = static_cast<int>(safe->trackRows.size());
+                const int pos1 = raw.getIntValue();
+                if (raw.isEmpty() || !raw.containsOnly("0123456789") || pos1 < 1 ||
+                    pos1 > maxCount) {
+                    if (safe->onFeedback) {
+                        safe->onFeedback("Track position must be between 1 and " +
+                                         juce::String(maxCount) + ".");
+                    }
+                    return;
+                }
+                const int dest0 = pos1 - 1;
+                if (dest0 != row) {
+                    safe->onCommand(
+                        {"disc", "track", "move", juce::String(row), juce::String(dest0)},
+                        safe->revision);
+                }
+            }),
+        true);
+}
+
+void MdWorkspace::handleTrackReorderDrag(int fromRow, int insertBeforeRow) {
+    commitPendingEdits();
+    const int count = static_cast<int>(trackRows.size());
+    if (fromRow < 0 || fromRow >= count || !onCommand) {
+        return;
+    }
+    const auto selected = selectedTrackIndices0();
+    const bool contiguous = !selected.empty() && (selected.back() - selected.front() + 1 ==
+                                                  static_cast<int>(selected.size()));
+    if (contiguous && selected.size() > 1 && fromRow >= selected.front() &&
+        fromRow <= selected.back()) {
+        const int blockStart = selected.front();
+        const int blockEnd = selected.back();
+        const int blockLen = blockEnd - blockStart + 1;
+        int destStart = blockStart;
+        if (insertBeforeRow <= blockStart) {
+            destStart = insertBeforeRow;
+        } else if (insertBeforeRow > blockEnd + 1) {
+            destStart = insertBeforeRow - blockLen;
+        } else {
+            return;
+        }
+        destStart = juce::jlimit(0, count - blockLen, destStart);
+        if (destStart == blockStart) {
+            return;
+        }
+        if (onCommand({"disc", "track", "move-block", juce::String(blockStart),
+                       juce::String(blockEnd), juce::String(destStart)},
+                      revision)) {
+            syncingControls = true;
+            trackList.deselectAllRows();
+            for (int r = destStart; r < destStart + blockLen; ++r) {
+                trackList.selectRow(r, false, false);
+            }
+            if (planViewMode == "playback") {
+                planList.deselectAllRows();
+                for (int r = destStart; r < destStart + blockLen; ++r) {
+                    planList.selectRow(r, false, false);
+                }
+            }
+            syncingControls = false;
+            rebuildPartRows();
+            updateTabVisibility();
+            updateButtonStates();
+            repaint();
+        }
+        return;
+    }
+
+    int dest = (insertBeforeRow > fromRow) ? (insertBeforeRow - 1) : insertBeforeRow;
+    dest = juce::jlimit(0, count - 1, dest);
+    if (dest != fromRow) {
+        onCommand({"disc", "track", "move", juce::String(fromRow), juce::String(dest)}, revision);
+    }
+}
+
+void MdWorkspace::handlePartReorderDrag(int fromRow, int insertBeforeRow) {
+    commitPendingEdits();
     const int row = singleSelectedTrackIndex();
-    if (row < 0 || !onCommand) {
+    const int count = static_cast<int>(partRows.size());
+    if (row < 0 || fromRow < 0 || fromRow >= count || !onCommand) {
         return;
     }
-    const int dest = row + delta;
-    if (dest < 0 || dest >= static_cast<int>(trackRows.size())) {
+    int dest = (insertBeforeRow > fromRow) ? (insertBeforeRow - 1) : insertBeforeRow;
+    dest = juce::jlimit(0, count - 1, dest);
+    if (dest == fromRow) {
         return;
     }
-    onCommand({"disc", "track", "move", juce::String(row), juce::String(dest)}, revision);
+    if (onCommand({"disc", "track", "part", "move", juce::String(row), juce::String(fromRow),
+                   juce::String(dest)},
+                  revision)) {
+        syncingControls = true;
+        partsList.selectRow(dest, false, true);
+        syncingControls = false;
+        updateButtonStates();
+    }
+}
+
+void MdWorkspace::handlePlanReorderDrag(int fromRow, int insertBeforeRow) {
+    if (planViewMode != "playback") {
+        return;
+    }
+    commitPendingEdits();
+    const int count = static_cast<int>(planRows.size());
+    if (fromRow < 0 || fromRow >= count || !onCommand) {
+        return;
+    }
+    int dest = (insertBeforeRow > fromRow) ? (insertBeforeRow - 1) : insertBeforeRow;
+    dest = juce::jlimit(0, count - 1, dest);
+    if (dest != fromRow) {
+        onCommand({"disc", "track", "move", juce::String(fromRow), juce::String(dest)}, revision);
+    }
 }
 
 void MdWorkspace::triggerRemoveSelectedTracks() {
@@ -2080,9 +2882,91 @@ void MdWorkspace::triggerSeekPart(int partRow) {
     }
 }
 
+void MdWorkspace::triggerMovePart(int delta) {
+    commitPendingEdits();
+    const int row = singleSelectedTrackIndex();
+    const int partRow = partsList.getSelectedRow();
+    const int count = static_cast<int>(partRows.size());
+    if (row < 0 || partRow < 0 || partRow >= count || !onCommand || delta == 0) {
+        return;
+    }
+    const int dest = partRow + delta;
+    if (dest < 0 || dest >= count || dest == partRow) {
+        return;
+    }
+    if (onCommand({"disc", "track", "part", "move", juce::String(row), juce::String(partRow),
+                   juce::String(dest)},
+                  revision)) {
+        syncingControls = true;
+        partsList.selectRow(dest, false, true);
+        syncingControls = false;
+        updateButtonStates();
+    }
+}
+
 // ============================================================================
 // Popup Menus & Group Assignment Dialog
 // ============================================================================
+
+void MdWorkspace::populateAudioBankSubmenu(juce::PopupMenu& menu, int baseId, int chunkSize) const {
+    const int total = static_cast<int>(audioBankClipEntries.size());
+    if (total <= 0) {
+        return;
+    }
+    const auto enDash = juce::String::fromUTF8("\xe2\x80\x93");
+    auto addItem = [&](juce::PopupMenu& target, int index) {
+        const auto& entry = audioBankClipEntries[static_cast<std::size_t>(index)];
+        juce::String itemLabel =
+            entry.label + " (" + carta::md_ui::formatClock(entry.startSample) + enDash +
+            carta::md_ui::formatClock(entry.endSample) + ")";
+        if (entry.isOnDisc) {
+            itemLabel += " [" + compactClusterLabel(entry.startCluster, entry.endCluster) + "]";
+        }
+        target.addItem(baseId + index, itemLabel);
+    };
+
+    const int pageLen = std::max(1, chunkSize);
+    if (total <= pageLen) {
+        for (int i = 0; i < total; ++i) {
+            addItem(menu, i);
+        }
+        return;
+    }
+    for (int start = 0; start < total; start += pageLen) {
+        const int end = std::min(total, start + pageLen);
+        juce::PopupMenu sub;
+        for (int i = start; i < end; ++i) {
+            addItem(sub, i);
+        }
+        menu.addSubMenu("Bank " + juce::String(start + 1) + enDash + juce::String(end), sub);
+    }
+}
+
+void MdWorkspace::showPartBankMenu() {
+    commitPendingEdits();
+    const int row = singleSelectedTrackIndex();
+    if (row < 0 || audioBankClipEntries.empty() || !onCommand) {
+        return;
+    }
+    juce::PopupMenu menu;
+    populateAudioBankSubmenu(menu, 100, 30);
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&partBankButton),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), row, rev = revision](int choice) {
+            if (safe == nullptr || choice < 100 || !safe->onCommand) {
+                return;
+            }
+            const int entryIdx = choice - 100;
+            if (entryIdx < 0 ||
+                entryIdx >= static_cast<int>(safe->audioBankClipEntries.size())) {
+                return;
+            }
+            const auto& entry = safe->audioBankClipEntries[static_cast<std::size_t>(entryIdx)];
+            safe->onCommand({"disc", "track", "part", "add", juce::String(row),
+                             juce::String(entry.startSample), juce::String(entry.endSample)},
+                            rev);
+        });
+}
 
 void MdWorkspace::showRepeatPartMenu() {
     const int row = singleSelectedTrackIndex();
@@ -2117,37 +3001,279 @@ void MdWorkspace::showTrackContextMenu(int row) {
     menu.addItem(2, "ASCII & Full-Width Titles...");
     menu.addItem(3, "Flags & Timestamp...");
     menu.addSeparator();
-    menu.addItem(4, "Duplicate Track");
+    menu.addItem(4, "Duplicate Track (Shared Audio)");
+    menu.addItem(11, "Copy Track(s)");
+    menu.addItem(12, "Paste Track(s) After", !copiedTrackClipboard.empty());
+    menu.addItem(10, "Move Track to Position...", trackRows.size() > 1);
     menu.addItem(8, "Merge with Next Track", row + 1 < static_cast<int>(trackRows.size()));
     menu.addItem(5, "Remove Track");
+    if (!audioBankClipEntries.empty()) {
+        menu.addSeparator();
+        juce::PopupMenu bankSub;
+        populateAudioBankSubmenu(bankSub, 1000, 30);
+        menu.addSubMenu("Insert Track After from Audio Bank", bankSub);
+    }
     menu.addSeparator();
     menu.addItem(6, "Preview Track");
     menu.addItem(7, "Preview From Here to End");
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&trackList),
-                       [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
-                           if (safe == nullptr || choice <= 0) {
-                               return;
-                           }
-                           safe->trackList.selectRow(row, false, true);
-                           if (choice == 1) {
-                               safe->focusTrackRename();
-                           } else if (choice == 2 && safe->onEditTrackForms) {
-                               safe->onEditTrackForms();
-                           } else if (choice == 3 && safe->onEditTrackFlags) {
-                               safe->onEditTrackFlags();
-                           } else if (choice == 4) {
-                               safe->triggerDuplicateTrack();
-                           } else if (choice == 8 && safe->onCommand) {
-                               safe->onCommand({"disc", "track", "merge", juce::String(row)},
-                                               safe->revision);
-                           } else if (choice == 5) {
-                               safe->triggerRemoveSelectedTracks();
-                           } else if (choice == 6) {
-                               safe->triggerPreviewSelected(false);
-                           } else if (choice == 7) {
-                               safe->triggerPreviewSelected(true);
-                           }
-                       });
+    menu.addItem(13, "Show in Audio Bank (Physical Map)", !audioBankRows.empty());
+
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&trackList),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
+            if (safe == nullptr || choice <= 0 || row < 0 ||
+                row >= static_cast<int>(safe->trackRows.size())) {
+                return;
+            }
+            if (choice >= 1000 && safe->onCommand) {
+                const int entryIdx = choice - 1000;
+                if (entryIdx >= 0 &&
+                    entryIdx < static_cast<int>(safe->audioBankClipEntries.size())) {
+                    const auto& entry =
+                        safe->audioBankClipEntries[static_cast<std::size_t>(entryIdx)];
+                    const auto label = entry.label.isNotEmpty()
+                                           ? entry.label
+                                           : ("Track " + juce::String(row + 2));
+                    const auto codecStr =
+                        (entry.isOnDisc && entry.codec != safe->discState.defaultCodec)
+                            ? juce::String(carta::mdCodecModeToString(entry.codec))
+                            : juce::String("default");
+                    safe->onCommand({"disc", "track", "add-parts", juce::String(row + 1), label,
+                                     codecStr, juce::String(entry.startSample),
+                                     juce::String(entry.endSample)},
+                                    safe->revision);
+                }
+                return;
+            }
+
+            const bool multiCapable = (choice == 4 || choice == 5 || choice == 11 || choice == 12);
+            if (!multiCapable || !safe->trackList.isRowSelected(row)) {
+                safe->trackList.selectRow(row, false, true);
+            }
+
+            if (choice == 1) {
+                safe->focusTrackRename();
+            } else if (choice == 2 && safe->onEditTrackForms) {
+                safe->onEditTrackForms();
+            } else if (choice == 3 && safe->onEditTrackFlags) {
+                safe->onEditTrackFlags();
+            } else if (choice == 4) {
+                safe->triggerDuplicateTrack();
+            } else if (choice == 11) {
+                safe->triggerCopySelectedTracks();
+            } else if (choice == 12) {
+                const auto sel = safe->selectedTrackIndices0();
+                const int after = !sel.empty() ? sel.back() : row;
+                safe->triggerPasteTracksAfter(after);
+            } else if (choice == 10) {
+                safe->promptMoveTrackToPosition(row);
+            } else if (choice == 8 && safe->onCommand) {
+                safe->onCommand({"disc", "track", "merge", juce::String(row)}, safe->revision);
+            } else if (choice == 5) {
+                safe->triggerRemoveSelectedTracks();
+            } else if (choice == 6) {
+                safe->triggerPreviewSelected(false);
+            } else if (choice == 7) {
+                safe->triggerPreviewSelected(true);
+            } else if (choice == 13) {
+                int bankTarget = -1;
+                for (int bi = 0; bi < static_cast<int>(safe->audioBankRows.size()); ++bi) {
+                    const auto& refs =
+                        safe->audioBankRows[static_cast<std::size_t>(bi)].referencingTrackIndices0;
+                    if (std::find(refs.begin(), refs.end(), row) != refs.end()) {
+                        bankTarget = bi;
+                        break;
+                    }
+                }
+                safe->setPlanViewMode("bank");
+                safe->setActiveTab("record", true);
+                if (bankTarget >= 0 &&
+                    bankTarget < static_cast<int>(safe->audioBankRows.size())) {
+                    safe->planList.selectRow(bankTarget, false, true);
+                    safe->planList.scrollToEnsureRowIsOnscreen(bankTarget);
+                }
+            }
+        });
+}
+
+void MdWorkspace::showPartContextMenu(int partRow) {
+    const int row = singleSelectedTrackIndex();
+    if (row < 0 || partRow < 0 || partRow >= static_cast<int>(partRows.size())) {
+        return;
+    }
+    juce::PopupMenu menu;
+    menu.addItem(1, "Move Part Up", partRow > 0);
+    menu.addItem(2, "Move Part Down", partRow + 1 < static_cast<int>(partRows.size()));
+    menu.addSeparator();
+    menu.addItem(3, "Repeat Part (1x Shared)");
+    menu.addItem(4, "Set to Timeline Selection", timeSelection.hasRange());
+    menu.addItem(5, "Seek on Timeline");
+    menu.addSeparator();
+    menu.addItem(6, "Delete Part", partRows.size() > 1);
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&partsList),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), row, partRow,
+         rev = revision](int choice) {
+            if (safe == nullptr || choice <= 0) {
+                return;
+            }
+            safe->partsList.selectRow(partRow, false, true);
+            if (choice == 1) {
+                safe->triggerMovePart(-1);
+            } else if (choice == 2) {
+                safe->triggerMovePart(1);
+            } else if (choice == 3 && safe->onCommand) {
+                safe->onCommand({"disc", "track", "part", "repeat", juce::String(row),
+                                 juce::String(partRow), "1"},
+                                rev);
+            } else if (choice == 4) {
+                safe->triggerSetPartToSelection();
+            } else if (choice == 5) {
+                safe->triggerSeekPart(partRow);
+            } else if (choice == 6) {
+                safe->triggerDeletePart(partRow);
+            }
+        });
+}
+
+void MdWorkspace::showPlanContextMenu(int row) {
+    if (row < 0 || row >= static_cast<int>(planRows.size())) {
+        return;
+    }
+    juce::PopupMenu menu;
+    menu.addItem(1, "Edit Track in Tracks Tab");
+    menu.addItem(2, "Duplicate Track (Shared Audio)");
+    menu.addItem(3, "Move Track to Position...", planRows.size() > 1);
+    menu.addSeparator();
+    menu.addItem(4, "Preview Track");
+    menu.addItem(5, "Show Audio in Audio Bank", !audioBankRows.empty());
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&planList),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
+            if (safe == nullptr || choice <= 0 || row < 0 ||
+                row >= static_cast<int>(safe->planRows.size())) {
+                return;
+            }
+            if (choice == 1) {
+                safe->triggerOpenPlanRow(row);
+            } else if (choice == 2 && safe->onCommand) {
+                safe->onCommand({"disc", "track", "duplicate", juce::String(row)}, safe->revision);
+            } else if (choice == 3) {
+                safe->promptMoveTrackToPosition(row);
+            } else if (choice == 4 && safe->onPreviewTrack) {
+                safe->onPreviewTrack(safe->planRows[static_cast<std::size_t>(row)].id, false);
+            } else if (choice == 5) {
+                int bankTarget = -1;
+                for (int bi = 0; bi < static_cast<int>(safe->audioBankRows.size()); ++bi) {
+                    const auto& refs =
+                        safe->audioBankRows[static_cast<std::size_t>(bi)].referencingTrackIndices0;
+                    if (std::find(refs.begin(), refs.end(), row) != refs.end()) {
+                        bankTarget = bi;
+                        break;
+                    }
+                }
+                safe->setPlanViewMode("bank");
+                if (bankTarget >= 0 &&
+                    bankTarget < static_cast<int>(safe->audioBankRows.size())) {
+                    safe->planList.selectRow(bankTarget, false, true);
+                    safe->planList.scrollToEnsureRowIsOnscreen(bankTarget);
+                }
+            }
+        });
+}
+
+void MdWorkspace::showAudioBankContextMenu(int row) {
+    if (row < 0 || row >= static_cast<int>(audioBankRows.size())) {
+        return;
+    }
+    const auto& br = audioBankRows[static_cast<std::size_t>(row)];
+    const bool hasRange = br.timelineEndSample > br.timelineStartSample;
+    const int selTrack = singleSelectedTrackIndex();
+
+    juce::PopupMenu menu;
+    menu.addItem(1, "Seek Audio on Timeline", hasRange && onSeekRange != nullptr);
+    menu.addItem(2, "Add New Track from This Audio", hasRange && onCommand != nullptr);
+    menu.addItem(3, "Append as Part to Selected Track",
+                 hasRange && selTrack >= 0 && onCommand != nullptr);
+
+    if (!br.referencingTrackIndices0.empty()) {
+        menu.addSeparator();
+        juce::PopupMenu jumpMenu;
+        const int refTotal = static_cast<int>(br.referencingTrackIndices0.size());
+        const auto enDash = juce::String::fromUTF8("\xe2\x80\x93");
+        auto addRefItem = [&](juce::PopupMenu& target, int k) {
+            const int trIdx = br.referencingTrackIndices0[static_cast<std::size_t>(k)];
+            if (trIdx >= 0 && trIdx < static_cast<int>(trackRows.size())) {
+                target.addItem(
+                    100 + k, "T" + juce::String(trIdx + 1) + ": " +
+                                 trackRows[static_cast<std::size_t>(trIdx)].title);
+            }
+        };
+        if (refTotal <= 30) {
+            for (int k = 0; k < refTotal; ++k) {
+                addRefItem(jumpMenu, k);
+            }
+        } else {
+            for (int start = 0; start < refTotal; start += 30) {
+                const int end = std::min(refTotal, start + 30);
+                juce::PopupMenu sub;
+                for (int k = start; k < end; ++k) {
+                    addRefItem(sub, k);
+                }
+                jumpMenu.addSubMenu("Refs " + juce::String(start + 1) + enDash + juce::String(end),
+                                    sub);
+            }
+        }
+        menu.addSubMenu("Jump to Referencing Track", jumpMenu);
+    }
+
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&planList),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
+            if (safe == nullptr || choice <= 0 || row < 0 ||
+                row >= static_cast<int>(safe->audioBankRows.size())) {
+                return;
+            }
+            const auto& bankRow = safe->audioBankRows[static_cast<std::size_t>(row)];
+            if (choice == 1) {
+                if (safe->onSeekRange &&
+                    bankRow.timelineEndSample > bankRow.timelineStartSample) {
+                    safe->onSeekRange(bankRow.timelineStartSample, bankRow.timelineEndSample,
+                                      safe->revision);
+                }
+            } else if (choice == 2 && safe->onCommand) {
+                const int dest = static_cast<int>(safe->trackRows.size());
+                const auto label = bankRow.label.isNotEmpty()
+                                       ? bankRow.label
+                                       : ("Track " + juce::String(dest + 1));
+                const auto codecStr =
+                    (bankRow.isOnDisc && bankRow.codec != safe->discState.defaultCodec)
+                        ? juce::String(carta::mdCodecModeToString(bankRow.codec))
+                        : juce::String("default");
+                safe->onCommand({"disc", "track", "add-parts", juce::String(dest), label, codecStr,
+                                 juce::String(bankRow.timelineStartSample),
+                                 juce::String(bankRow.timelineEndSample)},
+                                safe->revision);
+            } else if (choice == 3 && safe->onCommand) {
+                const int sel = safe->singleSelectedTrackIndex();
+                if (sel >= 0) {
+                    safe->onCommand({"disc", "track", "part", "add", juce::String(sel),
+                                     juce::String(bankRow.timelineStartSample),
+                                     juce::String(bankRow.timelineEndSample)},
+                                    safe->revision);
+                }
+            } else if (choice >= 100) {
+                const int k = choice - 100;
+                if (k >= 0 && k < static_cast<int>(bankRow.referencingTrackIndices0.size())) {
+                    const int trIdx = bankRow.referencingTrackIndices0[static_cast<std::size_t>(k)];
+                    if (trIdx >= 0 && trIdx < static_cast<int>(safe->trackRows.size())) {
+                        const auto trId = safe->trackRows[static_cast<std::size_t>(trIdx)].id;
+                        safe->setActiveTab("tracks", true);
+                        safe->selectTrackById(trId, true);
+                    }
+                }
+            }
+        });
 }
 
 void MdWorkspace::showGroupMenu() {
@@ -2320,7 +3446,7 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
         attrs.add("FW");
     }
     if (tr.sharesPhysicalSpan) {
-        attrs.add("ALIAS");
+        attrs.add("ALIAS x" + juce::String(tr.maxSharedRefs));
     }
     const auto attrText = attrs.joinIntoString(" ");
     const int attrWidth =
@@ -2379,33 +3505,42 @@ void MdWorkspace::paintPartRow(int row, juce::Graphics& g, int width, int height
 
     g.setColour(textMuted);
     g.setFont(juce::FontOptions(10.8f, juce::Font::bold));
-    g.drawText("P" + juce::String(row + 1), 6, 0, 26, height, juce::Justification::centredLeft,
+    g.drawText("P" + juce::String(row + 1), 6, 0, 24, height, juce::Justification::centredLeft,
                false);
 
     const auto rangeStr = carta::md_ui::formatClock(pr.startSample) +
                           juce::String::fromUTF8(" \xe2\x80\x93 ") +
                           carta::md_ui::formatClock(pr.endSample);
     g.setColour(textPrimary);
-    g.setFont(juce::FontOptions(11.3f));
-    g.drawText(rangeStr, 34, 0, 122, height, juce::Justification::centredLeft, true);
+    g.setFont(juce::FontOptions(10.8f));
+    g.drawText(rangeStr, 30, 0, 90, height, juce::Justification::centredLeft, true);
 
+    const bool hasAddr = pr.isOnDisc || pr.spanIndex >= 0;
     const auto addrStr =
-        pr.spanIndex >= 0
+        hasAddr
             ? (carta::md_ui::formatAddr(pr.startAddr) + ".." + carta::md_ui::formatAddr(pr.endAddr))
             : juce::String("(unplanned)");
+    const bool showTag = pr.isOnDisc || pr.sharedSpan;
+    const int tagW = showTag ? 64 : 0;
+    const int addrX = 122;
+    const int addrW = std::max(36, width - addrX - (showTag ? (tagW + 8) : 6));
     g.setColour(textMuted);
-    g.setFont(juce::FontOptions(10.6f));
-    g.drawText(addrStr, 158, 0, std::max(40, width - 220), height, juce::Justification::centredLeft,
-               true);
+    g.setFont(juce::FontOptions(10.2f));
+    g.drawText(addrStr, addrX, 0, addrW, height, juce::Justification::centredLeft, true);
 
-    if (pr.sharedSpan) {
-        const auto tag = juce::Rectangle<int>(width - 58, 4, 52, height - 8);
+    if (showTag) {
+        const auto tag = juce::Rectangle<int>(width - tagW - 4, 4, tagW, height - 8);
         const auto teal = dark ? juce::Colour(0xff34a39e) : juce::Colour(0xff0f766e);
+        const auto badgeText =
+            pr.isOnDisc
+                ? (pr.sharedSpan ? ("DISC x" + juce::String(pr.sharedRefCount))
+                                 : juce::String("ON-DISC"))
+                : ("SHARED x" + juce::String(pr.sharedRefCount));
         g.setColour(teal.withAlpha(dark ? 0.25f : 0.14f));
         g.fillRoundedRectangle(tag.toFloat(), 3.0f);
         g.setColour(teal);
-        g.setFont(juce::FontOptions(9.8f, juce::Font::bold));
-        g.drawText("SHARED", tag, juce::Justification::centred, false);
+        g.setFont(juce::FontOptions(9.4f, juce::Font::bold));
+        g.drawText(badgeText, tag, juce::Justification::centred, false);
     }
 }
 
@@ -2422,7 +3557,8 @@ juce::String MdWorkspace::tooltipForTrackRow(int row) const {
            juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::formatClock(tr.totalSamples) +
            " (" + juce::String(tr.partCount) + (tr.partCount == 1 ? " part)" : " parts)");
     if (tr.sharesPhysicalSpan) {
-        tip += juce::String::fromUTF8(" \xc2\xb7 Aliases existing physical clusters");
+        tip += juce::String::fromUTF8(" \xc2\xb7 Aliases existing physical clusters (x") +
+               juce::String(tr.maxSharedRefs) + ")";
     }
     tip += juce::String::fromUTF8(" \xc2\xb7 Double-click to edit title in place");
     return tip;
@@ -2435,14 +3571,18 @@ juce::String MdWorkspace::tooltipForPartRow(int row) const {
     const auto& pr = partRows[static_cast<std::size_t>(row)];
     juce::String tip = "Part " + juce::String(row + 1) + ": samples [" +
                        juce::String(pr.startSample) + ", " + juce::String(pr.endSample) + ")";
-    if (pr.spanIndex >= 0) {
+    if (pr.isOnDisc) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 On-disc Region #") +
+               juce::String(pr.onDiscRegionIndex + 1) + " (" + carta::md_ui::formatAddr(pr.startAddr) +
+               " to " + carta::md_ui::formatAddr(pr.endAddr) + ")";
+    } else if (pr.spanIndex >= 0) {
         tip += juce::String::fromUTF8(" \xc2\xb7 Physical span #") +
                juce::String(pr.spanIndex + 1) + " (" + carta::md_ui::formatAddr(pr.startAddr) +
                " to " + carta::md_ui::formatAddr(pr.endAddr) + ")";
-        if (pr.sharedSpan) {
-            tip +=
-                juce::String::fromUTF8(" \xc2\xb7 Shared with other parts (0 extra disc clusters)");
-        }
+    }
+    if (pr.sharedSpan) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Shared across ") +
+               juce::String(pr.sharedRefCount) + " part references (0 extra disc clusters)";
     }
     return tip;
 }
@@ -2795,7 +3935,7 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
     g.drawText(carta::md_ui::codecShortLabel(pr.codec), codecRect, juce::Justification::centred,
                false);
 
-    const int physW = std::min(196, std::max(110, width / 3));
+    const int physW = std::min(240, std::max(130, (width * 40) / 100));
     const int durW = 54;
     const int titleX = 86;
     const int titleW = std::max(40, width - titleX - physW - durW - 12);
@@ -2814,23 +3954,29 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
                height, juce::Justification::centredRight, false);
 
     juce::String physText;
-    const auto enDash = juce::String::fromUTF8("\xe2\x80\x93");
-    if (pr.onDisc && pr.primarySpanIndex < 0) {
-        const auto range = "C" + juce::String(pr.spanClusterStart) + enDash +
-                           juce::String(pr.spanClusterEnd);
-        physText = "ON-DISC " + range + (pr.sharesPhysicalSpan ? " (shared)" : "");
+    const juce::String sharedTag =
+        pr.spanRefCount > 1 ? (" (x" + juce::String(pr.spanRefCount) + ")") : juce::String();
+    if (pr.partHopsText.isNotEmpty()) {
+        const juce::String tagPrefix =
+            (pr.onDisc && pr.primarySpanIndex >= 0)
+                ? "MIX "
+                : (pr.onDisc ? "DISC " : (discState.loadedDisc.active ? "NEW " : ""));
+        physText = tagPrefix + pr.partHopsText + sharedTag;
+    } else if (pr.onDisc && pr.primarySpanIndex < 0) {
+        const auto range = compactClusterLabel(pr.spanClusterStart, pr.spanClusterEnd);
+        physText = "ON-DISC " + range +
+                   (pr.sharesPhysicalSpan ? (" x" + juce::String(pr.spanRefCount)) : "");
     } else if (pr.primarySpanIndex >= 0) {
-        const auto range =
-            "C" + juce::String(pr.spanClusterStart) + enDash + juce::String(pr.spanClusterEnd);
+        const auto range = compactClusterLabel(pr.spanClusterStart, pr.spanClusterEnd);
         const juce::String prefix =
             pr.onDisc ? "ON-DISC + NEW #"
                       : (discState.loadedDisc.active ? "NEW Span #" : "Span #");
         if (pr.sharesPhysicalSpan) {
-            physText =
-                "Alias -> Span #" + juce::String(pr.primarySpanIndex + 1) + " (" + range + ")";
+            physText = "Alias -> Span #" + juce::String(pr.primarySpanIndex + 1) + " (" + range +
+                       ") x" + juce::String(pr.spanRefCount);
         } else if (pr.spanRefCount > 1) {
-            physText =
-                prefix + juce::String(pr.primarySpanIndex + 1) + " (shared " + range + ")";
+            physText = prefix + juce::String(pr.primarySpanIndex + 1) + " (" + range + ") x" +
+                       juce::String(pr.spanRefCount);
         } else {
             physText = prefix + juce::String(pr.primarySpanIndex + 1) + " " + range;
         }
@@ -2863,6 +4009,137 @@ juce::String MdWorkspace::tooltipForPlanRow(int row) const {
                (discState.loadedDisc.active ? "New Upload Span #" : "Physical Span #") +
                juce::String(pr.primarySpanIndex + 1) + " (Clusters " +
                juce::String(pr.spanClusterStart) + ".." + juce::String(pr.spanClusterEnd) + ")";
+    }
+    if (pr.partHopsText.isNotEmpty()) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Clusters: ") + pr.partHopsText;
+    }
+    if (pr.spanRefCount > 1) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Shared across ") +
+               juce::String(pr.spanRefCount) + " part references";
+    }
+    return tip;
+}
+
+void MdWorkspace::paintAudioBankRow(int row, juce::Graphics& g, int width, int height,
+                                    bool selected) const {
+    if (row < 0 || row >= static_cast<int>(audioBankRows.size())) {
+        return;
+    }
+    const auto& br = audioBankRows[static_cast<std::size_t>(row)];
+    const bool dark = juce::Desktop::getInstance().isDarkModeActive();
+    const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
+    const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
+    paintAlternatingRowBackground(g, row, width, height, selected, dark);
+
+    // Origin / Reclaim pill
+    const auto statusCol =
+        br.isReclaimed
+            ? (dark ? juce::Colour(0xfff59e0b) : juce::Colour(0xffb45309))
+            : (br.isOnDisc ? (dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e))
+                           : (dark ? juce::Colour(0xff60a5fa) : juce::Colour(0xff2563eb)));
+    const auto statusRect = juce::Rectangle<int>(6, 4, 58, height - 8);
+    g.setColour(statusCol.withAlpha(dark ? 0.24f : 0.14f));
+    g.fillRoundedRectangle(statusRect.toFloat(), 3.0f);
+    g.setColour(statusCol);
+    g.setFont(juce::FontOptions(9.5f, juce::Font::bold));
+    g.drawText(br.isReclaimed ? "RECLAIM" : (br.isOnDisc ? "ON-DISC" : "NEW"), statusRect,
+               juce::Justification::centred, false);
+
+    // Codec badge
+    const auto codecCol = carta::md_ui::codecColour(br.codec, dark);
+    const auto codecRect = juce::Rectangle<int>(68, 4, 46, height - 8);
+    g.setColour(codecCol.withAlpha(dark ? 0.28f : 0.14f));
+    g.fillRoundedRectangle(codecRect.toFloat(), 3.0f);
+    g.setColour(dark ? codecCol.brighter(0.35f) : codecCol);
+    g.setFont(juce::FontOptions(9.8f, juce::Font::bold));
+    g.drawText(carta::md_ui::codecShortLabel(br.codec), codecRect, juce::Justification::centred,
+               false);
+
+    const int refsW = std::min(155, std::max(88, (width * 30) / 100));
+    const int cluW = 86;
+    const int labelX = 118;
+    const int labelW = std::max(36, width - labelX - refsW - cluW - 18);
+
+    g.setColour(textPrimary);
+    g.setFont(juce::FontOptions(11.3f, selected ? juce::Font::bold : juce::Font::plain));
+    g.drawText(br.label, labelX, 0, labelW, height, juce::Justification::centredLeft, true);
+
+    const auto cluStr =
+        compactClusterLabel(br.startCluster, br.endCluster) + " (" + juce::String(br.clusterCount) +
+        " cl)";
+    g.setColour(textMuted);
+    g.setFont(juce::FontOptions(10.4f));
+    g.drawText(cluStr, width - refsW - cluW - 12, 0, cluW, height,
+               juce::Justification::centredRight, true);
+
+    juce::String refsStr;
+    if (br.isReclaimed) {
+        refsStr = "reclaims " + juce::String(br.clusterCount) + " cl";
+    } else {
+        const int nTrk = static_cast<int>(br.referencingTrackIndices0.size());
+        refsStr = juce::String(nTrk) + " trk";
+        if (br.totalPartRefs > nTrk) {
+            refsStr += "/" + juce::String(br.totalPartRefs) + "p";
+        }
+        refsStr += ": ";
+        const int shown = std::min(3, nTrk);
+        for (int k = 0; k < shown; ++k) {
+            if (k > 0) {
+                refsStr += ", ";
+            }
+            refsStr += "T" + juce::String(br.referencingTrackIndices0[static_cast<std::size_t>(k)] +
+                                          1);
+        }
+        if (nTrk > shown) {
+            refsStr += juce::String::fromUTF8(", \xe2\x80\xa6");
+        }
+    }
+    const auto refsCol = br.isReclaimed
+                             ? (dark ? juce::Colour(0xfffbbf24) : juce::Colour(0xffb45309))
+                             : (br.totalPartRefs > 1 ? statusCol : textMuted);
+    g.setColour(refsCol);
+    g.setFont(juce::FontOptions(10.4f, (br.totalPartRefs > 1 || br.isReclaimed) ? juce::Font::bold
+                                                                               : juce::Font::plain));
+    g.drawText(refsStr, width - refsW - 6, 0, refsW, height, juce::Justification::centredRight,
+               true);
+}
+
+juce::String MdWorkspace::tooltipForAudioBankRow(int row) const {
+    if (row < 0 || row >= static_cast<int>(audioBankRows.size())) {
+        return {};
+    }
+    const auto& br = audioBankRows[static_cast<std::size_t>(row)];
+    juce::String tip = br.isOnDisc ? ("On-Disc Region #" + juce::String(br.onDiscRegionIndex + 1))
+                                   : ("New Upload Span #" + juce::String(br.spanIndex + 1));
+    tip += ": " + br.label + juce::String::fromUTF8(" \xc2\xb7 ") +
+           carta::md_ui::codecLongLabel(br.codec) + juce::String::fromUTF8(" \xc2\xb7 Clusters ") +
+           juce::String(br.startCluster) + ".." + juce::String(br.endCluster) + " (" +
+           juce::String(br.clusterCount) + (br.clusterCount == 1 ? " cluster)" : " clusters)");
+    if (br.timelineEndSample > br.timelineStartSample) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 ") +
+               carta::md_ui::formatClock(br.timelineEndSample - br.timelineStartSample);
+    }
+    if (br.isReclaimed) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Unreferenced — reclaims ") +
+               juce::String(br.clusterCount) + " clusters on Write UTOC / Record";
+    } else {
+        juce::StringArray trNames;
+        const int cap = std::min(12, static_cast<int>(br.referencingTrackIndices0.size()));
+        for (int k = 0; k < cap; ++k) {
+            const int trIdx = br.referencingTrackIndices0[static_cast<std::size_t>(k)];
+            if (trIdx >= 0 && trIdx < static_cast<int>(trackRows.size())) {
+                trNames.add("T" + juce::String(trIdx + 1) + " " +
+                            trackRows[static_cast<std::size_t>(trIdx)].title);
+            }
+        }
+        tip += juce::String::fromUTF8(" \xc2\xb7 Referenced by ") +
+               juce::String(static_cast<int>(br.referencingTrackIndices0.size())) + " track(s) (" +
+               juce::String(br.totalPartRefs) + " part refs): " + trNames.joinIntoString(", ");
+        if (static_cast<int>(br.referencingTrackIndices0.size()) > cap) {
+            tip += " ... +" +
+                   juce::String(static_cast<int>(br.referencingTrackIndices0.size()) - cap) +
+                   " more";
+        }
     }
     return tip;
 }

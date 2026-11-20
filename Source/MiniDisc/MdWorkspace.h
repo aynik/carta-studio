@@ -228,7 +228,33 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         MdWorkspace& owner;
     };
 
-    class TrackListBox final : public juce::ListBox {
+    /** ListBox supporting vertical mouse-drag row reordering with insertion-bar feedback. */
+    class ReorderableListBox : public juce::ListBox {
+      public:
+        ReorderableListBox(const juce::String& name, juce::ListBoxModel* modelRef);
+        ~ReorderableListBox() override;
+
+        bool dragReorderEnabled = false;
+        std::function<bool(int row)> canStartDrag;
+        std::function<void(int fromRow, int insertBeforeRow)> onRowReorder;
+
+        void mouseDown(const juce::MouseEvent& event) override;
+        void mouseDrag(const juce::MouseEvent& event) override;
+        void mouseUp(const juce::MouseEvent& event) override;
+        void paintOverChildren(juce::Graphics& g) override;
+
+      private:
+        bool isIgnoredChildComponent(const juce::Component* comp) const noexcept;
+        int computeInsertBeforeRow(juce::Point<int> pt);
+
+        bool dragCandidate = false;
+        bool dragActive = false;
+        int dragFromRow = -1;
+        int dragInsertRow = -1;
+        int dragStartY = 0;
+    };
+
+    class TrackListBox final : public ReorderableListBox {
       public:
         TrackListBox(MdWorkspace& ownerRef, TrackListModel& modelRef);
         bool keyPressed(const juce::KeyPress& key) override;
@@ -244,6 +270,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         void paintListBoxItem(int row, juce::Graphics& g, int width, int height,
                               bool selected) override;
         void selectedRowsChanged(int lastRowSelected) override;
+        void listBoxItemClicked(int row, const juce::MouseEvent& event) override;
         void listBoxItemDoubleClicked(int row, const juce::MouseEvent& event) override;
         void returnKeyPressed(int row) override;
         void deleteKeyPressed(int row) override;
@@ -253,7 +280,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         MdWorkspace& owner;
     };
 
-    /** Linear Target Recording Plan list shown on Tab 2 ("Device & Record"). */
+    /** Linear Target Recording Plan / Audio Bank list shown on Tab 2 ("Device & Record"). */
     class PlanListModel final : public juce::ListBoxModel {
       public:
         explicit PlanListModel(MdWorkspace& ownerRef);
@@ -261,6 +288,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         void paintListBoxItem(int row, juce::Graphics& g, int width, int height,
                               bool selected) override;
         void selectedRowsChanged(int lastRowSelected) override;
+        void listBoxItemClicked(int row, const juce::MouseEvent& event) override;
         void listBoxItemDoubleClicked(int row, const juce::MouseEvent& event) override;
         void returnKeyPressed(int row) override;
         juce::String getTooltipForRow(int row) override;
@@ -313,6 +341,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         bool hasTimestamp = false;
         int partCount = 0;
         bool sharesPhysicalSpan = false;
+        int maxSharedRefs = 1;
         bool onDisc = false;
         juce::int64 totalSamples = 0;
         juce::int64 firstStartSample = 0;
@@ -325,9 +354,12 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         juce::int64 startSample = 0;
         juce::int64 endSample = 0;
         int spanIndex = -1;
+        bool isOnDisc = false;
+        int onDiscRegionIndex = -1;
         carta::MdPhysAddr startAddr{};
         carta::MdPhysAddr endAddr{};
         bool sharedSpan = false;
+        int sharedRefCount = 1;
     };
 
     /** Cached display row for one logical track mapped onto physical spans on Tab 2. */
@@ -346,6 +378,37 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         int spanRefCount = 0;
         bool sharesPhysicalSpan = false;
         bool onDisc = false;
+        juce::String partHopsText;
+    };
+
+    /** Inverse physical-to-logical map row for the Tab 2 Audio Bank view. */
+    struct AudioBankRow {
+        bool isOnDisc = false;
+        bool isReclaimed = false;
+        int onDiscRegionIndex = -1;
+        int spanIndex = -1;
+        juce::String label;
+        carta::MdCodecMode codec = carta::MdCodecMode::spStereo;
+        int startCluster = 0;
+        int endCluster = 0;
+        int clusterCount = 0;
+        juce::int64 timelineStartSample = 0;
+        juce::int64 timelineEndSample = 0;
+        std::vector<int> referencingTrackIndices0;
+        int totalPartRefs = 0;
+    };
+
+    /** Pickable timeline audio-bank region or local clip entry for "+ From Bank...". */
+    struct BankClipEntry {
+        juce::String label;
+        juce::String layerName;
+        juce::int64 startSample = 0;
+        juce::int64 endSample = 0;
+        bool isOnDisc = false;
+        int onDiscRegionIndex = -1;
+        int startCluster = 0;
+        int endCluster = 0;
+        carta::MdCodecMode codec = carta::MdCodecMode::spStereo;
     };
 
     /** Device, preflight, and live operation status pushed by the parent Studio window. */
@@ -379,6 +442,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     std::function<void()> onReviewWav;
     std::function<void(const juce::String& trackId, int partIndex, juce::uint64 revision)>
         onSeekPart;
+    std::function<void(juce::int64 startSample, juce::int64 endSample, juce::uint64 revision)>
+        onSeekRange;
     std::function<void(const juce::String& trackId, bool throughEnd)> onPreviewTrack;
     std::function<void()> onInspectUtoc;
     std::function<void()> onImportUtoc;
@@ -402,6 +467,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::String currentView() const noexcept;
     bool selectView(const juce::String& view, juce::String& error);
     void setActiveTab(const juce::String& tab, bool notify = true);
+    juce::String currentPlanViewMode() const noexcept;
+    void setPlanViewMode(const juce::String& mode);
 
     bool hasPendingProgramEdits() const noexcept;
     void commitPendingEdits();
@@ -438,6 +505,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     void updateButtonStates();
     void handleTrackSelectionChanged(int lastRowSelected);
     void handlePlanSelectionChanged(int lastRowSelected);
+    void handlePlanClick(int row, const juce::MouseEvent& event);
     void triggerOpenPlanRow(int row);
     void handleTrackClick(int row, const juce::MouseEvent& event);
     void handleTrackDoubleClick(int row);
@@ -446,6 +514,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     void cancelInlineTrackEdit();
     void navigateInlineTrackEdit(int rowDelta);
     void updateInlineTrackEditorBounds();
+    void handlePartClick(int row, const juce::MouseEvent& event);
     void handlePartSelectionChanged(int lastRowSelected);
     void commitDiscTitle();
     void commitTrackTitle();
@@ -455,13 +524,25 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     void triggerMoveTrack(int delta);
     void triggerRemoveSelectedTracks();
     void triggerMergeSelectedTracks();
+    void triggerCopySelectedTracks();
+    void triggerPasteTracksAfter(int afterRow);
+    void promptMoveTrackToPosition(int row);
+    void handleTrackReorderDrag(int fromRow, int insertBeforeRow);
+    void handlePartReorderDrag(int fromRow, int insertBeforeRow);
+    void handlePlanReorderDrag(int fromRow, int insertBeforeRow);
     void triggerPreviewSelected(bool throughEnd = false);
     void triggerAddPart();
+    void showPartBankMenu();
+    void triggerMovePart(int delta);
     void triggerSetPartToSelection();
     void triggerDeletePart(int partRow);
     void triggerSeekPart(int partRow);
+    void populateAudioBankSubmenu(juce::PopupMenu& menu, int baseId, int chunkSize = 30) const;
     void showRepeatPartMenu();
     void showTrackContextMenu(int row);
+    void showPartContextMenu(int partRow);
+    void showPlanContextMenu(int row);
+    void showAudioBankContextMenu(int row);
     void showGroupMenu();
     void promptCreateGroupForSelection();
     void clearGroupsForSelection();
@@ -478,7 +559,9 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     void paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int> bounds, bool dark) const;
     void paintPlanProgressBar(juce::Graphics& g, juce::Rectangle<int> bounds, bool dark) const;
     void paintPlanRow(int row, juce::Graphics& g, int width, int height, bool selected) const;
+    void paintAudioBankRow(int row, juce::Graphics& g, int width, int height, bool selected) const;
     juce::String tooltipForPlanRow(int row) const;
+    juce::String tooltipForAudioBankRow(int row) const;
 
     // State
     carta::MdDisc discState;
@@ -494,6 +577,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     std::string utocErrorText;
 
     juce::String activeTab = "tracks";
+    juce::String planViewMode = "playback";
     juce::String discBaselineTitle;
     juce::String trackBaselineTitle;
     juce::String budgetPillText;
@@ -509,6 +593,9 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     std::vector<TrackRow> trackRows;
     std::vector<PartRow> partRows;
     std::vector<PlanRow> planRows;
+    std::vector<AudioBankRow> audioBankRows;
+    std::vector<BankClipEntry> audioBankClipEntries;
+    std::vector<carta::MdTrack> copiedTrackClipboard;
     RecordUiSnapshot recordUiState;
 
     // Layout rects painted by MdWorkspace
@@ -571,12 +658,15 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::TextButton trackGroupButton{"Group: None..."};
     juce::Label partsHeaderLabel;
     juce::TextButton addPartButton{"+ Part"};
+    juce::TextButton partBankButton{"+ From Bank..."};
+    juce::TextButton partUpButton{"Up"};
+    juce::TextButton partDownButton{"Dn"};
     juce::TextButton setPartSelButton{"Set to Sel"};
     juce::TextButton repeatPartButton{"Repeat..."};
     juce::TextButton delPartButton{"Del"};
     juce::TextButton seekPartButton{"Seek"};
     PartListModel partModel;
-    juce::ListBox partsList;
+    ReorderableListBox partsList;
 
     // Right pane: Multi-selection inspector
     juce::Label multiHeaderLabel;
@@ -585,6 +675,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::TextButton multiDuplicateButton{"Duplicate All"};
     juce::TextButton multiRemoveButton{"Remove All"};
     juce::TextButton multiMergeButton{"Merge Selected"};
+    juce::TextButton multiCopyButton{"Copy Selected"};
 
     // Tab 2 widgets
     juce::Label deviceCardTitle;
@@ -598,9 +689,11 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::TextButton readDiscTocButton{"Read Disc TOC..."};
     juce::TextButton eraseDiscButton{"Erase Disc..."};
     juce::Label planCardTitle;
+    juce::TextButton planModePlaybackButton{"Playback"};
+    juce::TextButton planModeBankButton{"Audio Bank"};
     juce::Label utocSummaryLabel;
     PlanListModel planModel;
-    juce::ListBox planList;
+    ReorderableListBox planList;
     juce::Label recordStatusLabel;
     juce::TextButton writeUtocButton{"Write UTOC Only..."};
     juce::TextButton recordDiscButton{"Record MiniDisc..."};

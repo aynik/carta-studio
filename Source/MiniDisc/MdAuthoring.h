@@ -390,9 +390,21 @@ bool mergeMdTrackWithNext(MdDisc& disc, int trackIndex0, std::string& error);
  * error. */
 bool duplicateMdTrack(MdDisc& disc, int trackIndex0, std::string& error);
 
+/** Clones `srcIndex0` to 0-based `destIndex0` (`0..count`) with a fresh ID; leaves `disc`
+ * unchanged on error. */
+bool cloneMdTrackToPosition(MdDisc& disc, int srcIndex0, int destIndex0, std::string& error);
+
 /** Reorders `fromIndex0` to `toIndex0` while maintaining valid disjoint groups; leaves `disc`
  * unchanged on error. */
 bool moveMdTrack(MdDisc& disc, int fromIndex0, int toIndex0, std::string& error);
+
+/** Moves contiguous track block `[fromStart0..fromEnd0]` to final start `destStart0` while
+ * preserving valid disjoint groups; leaves `disc` unchanged on error. */
+bool moveMdTrackBlock(MdDisc& disc, int fromStart0, int fromEnd0, int destStart0,
+                      std::string& error);
+
+/** Reorders `fromPart0` to `toPart0` within `trackIndex0`; leaves `disc` unchanged on error. */
+bool moveMdTrackPart(MdDisc& disc, int trackIndex0, int fromPart0, int toPart0, std::string& error);
 
 /** Removes `trackIndex0` and shifts group indices; leaves `disc` unchanged on error. */
 bool removeMdTrack(MdDisc& disc, int trackIndex0, std::string& error);

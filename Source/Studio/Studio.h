@@ -263,6 +263,7 @@ class Studio final : public juce::AudioAppComponent,
         std::int64_t startSample = 0;
         std::int64_t endSample = 0;
         bool sharesPhysical = false;
+        int sharedCount = 1;
     };
 
     struct MdRibbonPointerInfo {

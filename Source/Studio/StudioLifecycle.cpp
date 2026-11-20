@@ -113,8 +113,36 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     discWorkspace.onRecordWriteUtoc = [this] { triggerRecordWriteUtocFromUi(); };
     discWorkspace.onRecordStart = [this] { triggerRecordStartFromUi(); };
     discWorkspace.onImportAudio = [this] { importAudio(); };
-    discWorkspace.onSeekPart = [this](const juce::String& trackId, int partIndex,
-                                      juce::uint64 revision) {
+    auto seekMdTimelineRange = [this](juce::int64 startSample, juce::int64 endSample,
+                                      const juce::String& focusTrackId) {
+        const auto spanEnd = carta::projectEndSample(session);
+        if (endSample <= startSample || endSample > spanEnd) {
+            status.setText("This audio range extends beyond current timeline audio.",
+                           juce::dontSendNotification);
+            return;
+        }
+        const bool keepPlayback = selectionPlaybackContinues();
+        stopSpecialAudition();
+        carta::activateTimeSelection(timeSelection, timelineClipSelection,
+                                     {startSample, endSample, 0, 0},
+                                     static_cast<int>(session.tracks.size()));
+        if (!keepPlayback) {
+            position = static_cast<double>(startSample) / carta::sessionRate;
+            playing = false;
+            auditionActive = false;
+        }
+        const auto at = static_cast<double>(startSample) / carta::sessionRate;
+        if (at < viewStart || at >= viewStart + viewLength()) {
+            viewStart = juce::jlimit(0.0, std::max(0.0, fullLength() - viewLength()),
+                                     at - viewLength() * 0.25);
+            suspendFollowingForNavigation();
+        }
+        refreshDiscWorkspace(false, focusTrackId);
+        menuItemsChanged();
+        repaint();
+    };
+    discWorkspace.onSeekPart = [this, seekMdTimelineRange](const juce::String& trackId, int partIndex,
+                                                           juce::uint64 revision) {
         if (revision != editGeneration || dragMode != kDragNone) {
             return;
         }
@@ -127,31 +155,15 @@ Studio::Studio(bool headless) : headlessMode(headless) {
             return;
         }
         const auto& part = parts[static_cast<size_t>(partIndex)];
-        const auto spanEnd = carta::projectEndSample(session);
-        if (part.endSample <= part.startSample || part.endSample > spanEnd) {
-            status.setText("This UTOC part extends beyond current timeline audio.",
-                           juce::dontSendNotification);
+        seekMdTimelineRange(part.startSample, part.endSample, trackId);
+    };
+    discWorkspace.onSeekRange = [this, seekMdTimelineRange](juce::int64 startSample,
+                                                            juce::int64 endSample,
+                                                            juce::uint64 revision) {
+        if (revision != editGeneration || dragMode != kDragNone) {
             return;
         }
-        const bool keepPlayback = selectionPlaybackContinues();
-        stopSpecialAudition();
-        carta::activateTimeSelection(timeSelection, timelineClipSelection,
-                                     {part.startSample, part.endSample, 0, 0},
-                                     static_cast<int>(session.tracks.size()));
-        if (!keepPlayback) {
-            position = static_cast<double>(part.startSample) / carta::sessionRate;
-            playing = false;
-            auditionActive = false;
-        }
-        const auto at = static_cast<double>(part.startSample) / carta::sessionRate;
-        if (at < viewStart || at >= viewStart + viewLength()) {
-            viewStart = juce::jlimit(0.0, std::max(0.0, fullLength() - viewLength()),
-                                     at - viewLength() * 0.25);
-            suspendFollowingForNavigation();
-        }
-        refreshDiscWorkspace(false, trackId);
-        menuItemsChanged();
-        repaint();
+        seekMdTimelineRange(startSample, endSample, {});
     };
     discWorkspace.onFeedback = [this](const juce::String& message) {
         status.setText(message, juce::dontSendNotification);

@@ -1292,6 +1292,152 @@ bool duplicateMdTrack(MdDisc& disc, int trackIndex0, std::string& error) {
     return true;
 }
 
+bool cloneMdTrackToPosition(MdDisc& disc, int srcIndex0, int destIndex0, std::string& error) {
+    error.clear();
+    const int count = static_cast<int>(disc.tracks.size());
+    if (srcIndex0 < 0 || srcIndex0 >= count) {
+        error = "Source track index out of range.";
+        return false;
+    }
+    if (destIndex0 < 0 || destIndex0 > count) {
+        error = "Destination track index out of range.";
+        return false;
+    }
+    MdTrack copy = disc.tracks[static_cast<std::size_t>(srcIndex0)];
+    copy.id = makeMdTrackId();
+    return insertMdTrack(disc, destIndex0 + 1, std::move(copy), error);
+}
+
+bool moveMdTrackPart(MdDisc& disc, int trackIndex0, int fromPart0, int toPart0, std::string& error) {
+    error.clear();
+    if (trackIndex0 < 0 || trackIndex0 >= static_cast<int>(disc.tracks.size())) {
+        error = "Track index out of range.";
+        return false;
+    }
+    const int partCount =
+        static_cast<int>(disc.tracks[static_cast<std::size_t>(trackIndex0)].parts.size());
+    if (fromPart0 < 0 || fromPart0 >= partCount || toPart0 < 0 || toPart0 >= partCount) {
+        error = "Part index out of range.";
+        return false;
+    }
+    if (fromPart0 == toPart0) {
+        return true;
+    }
+
+    MdDisc candidate = disc;
+    auto& parts = candidate.tracks[static_cast<std::size_t>(trackIndex0)].parts;
+    MdPart moved = parts[static_cast<std::size_t>(fromPart0)];
+    parts.erase(parts.begin() + fromPart0);
+    parts.insert(parts.begin() + toPart0, moved);
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
+bool moveMdTrackBlock(MdDisc& disc, int fromStart0, int fromEnd0, int destStart0,
+                      std::string& error) {
+    error.clear();
+    const int count = static_cast<int>(disc.tracks.size());
+    if (fromStart0 < 0 || fromEnd0 < fromStart0 || fromEnd0 >= count) {
+        error = "Track block range out of range.";
+        return false;
+    }
+    const int blockLen = fromEnd0 - fromStart0 + 1;
+    if (destStart0 < 0 || destStart0 > count - blockLen) {
+        error = "Track block destination out of range.";
+        return false;
+    }
+    if (destStart0 == fromStart0) {
+        return true;
+    }
+
+    std::vector<int> perm(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        perm[static_cast<std::size_t>(i)] = i + 1;
+    }
+    std::vector<int> movedPerm(perm.begin() + fromStart0, perm.begin() + fromEnd0 + 1);
+    perm.erase(perm.begin() + fromStart0, perm.begin() + fromEnd0 + 1);
+    perm.insert(perm.begin() + destStart0, movedPerm.begin(), movedPerm.end());
+
+    std::vector<int> newPosByOrig1(static_cast<std::size_t>(count + 1), 0);
+    for (int newIdx0 = 0; newIdx0 < count; ++newIdx0) {
+        newPosByOrig1[static_cast<std::size_t>(perm[static_cast<std::size_t>(newIdx0)])] =
+            newIdx0 + 1;
+    }
+
+    MdDisc candidate = disc;
+    std::vector<MdTrack> movedTracks;
+    movedTracks.reserve(static_cast<std::size_t>(blockLen));
+    for (int i = fromStart0; i <= fromEnd0; ++i) {
+        movedTracks.push_back(std::move(candidate.tracks[static_cast<std::size_t>(i)]));
+    }
+    candidate.tracks.erase(candidate.tracks.begin() + fromStart0,
+                           candidate.tracks.begin() + fromEnd0 + 1);
+    candidate.tracks.insert(candidate.tracks.begin() + destStart0,
+                            std::make_move_iterator(movedTracks.begin()),
+                            std::make_move_iterator(movedTracks.end()));
+
+    std::vector<MdGroup> nextGroups;
+    for (const auto& g : candidate.groups) {
+        const int origLen = g.endTrack - g.startTrack + 1;
+        int movedCount = 0;
+        int otherCount = 0;
+        int minMoved = count + 1;
+        int maxMoved = 0;
+        int minOther = count + 1;
+        int maxOther = 0;
+        for (int orig1 = g.startTrack; orig1 <= g.endTrack; ++orig1) {
+            const int np = newPosByOrig1[static_cast<std::size_t>(orig1)];
+            if (orig1 >= fromStart0 + 1 && orig1 <= fromEnd0 + 1) {
+                ++movedCount;
+                minMoved = std::min(minMoved, np);
+                maxMoved = std::max(maxMoved, np);
+            } else {
+                ++otherCount;
+                minOther = std::min(minOther, np);
+                maxOther = std::max(maxOther, np);
+            }
+        }
+        if (otherCount == 0 && maxMoved - minMoved + 1 == origLen) {
+            MdGroup ng = g;
+            ng.startTrack = minMoved;
+            ng.endTrack = maxMoved;
+            nextGroups.push_back(std::move(ng));
+        } else if (movedCount == 0 && maxOther >= minOther) {
+            const int spanLen = maxOther - minOther + 1;
+            if (spanLen == otherCount || spanLen == otherCount + blockLen) {
+                MdGroup ng = g;
+                ng.startTrack = minOther;
+                ng.endTrack = maxOther;
+                nextGroups.push_back(std::move(ng));
+            }
+        } else if (movedCount > 0 && otherCount > 0) {
+            const int allLo = std::min(minMoved, minOther);
+            const int allHi = std::max(maxMoved, maxOther);
+            if (allHi - allLo + 1 == origLen) {
+                MdGroup ng = g;
+                ng.startTrack = allLo;
+                ng.endTrack = allHi;
+                nextGroups.push_back(std::move(ng));
+            } else if (maxOther - minOther + 1 == otherCount) {
+                MdGroup ng = g;
+                ng.startTrack = minOther;
+                ng.endTrack = maxOther;
+                nextGroups.push_back(std::move(ng));
+            }
+        }
+    }
+    normalizeGroups(nextGroups);
+    candidate.groups = std::move(nextGroups);
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
 bool moveMdTrack(MdDisc& disc, int fromIndex0, int toIndex0, std::string& error) {
     error.clear();
     const int count = static_cast<int>(disc.tracks.size());

@@ -524,6 +524,74 @@ struct Studio::IpcRouter {
             return carta::moveMdTrack(d, static_cast<int>(from), static_cast<int>(to), mdErr) ||
                    fail(mdErr);
         }
+        if (args[2] == "move-block" && args.size() == 6) {
+            juce::int64 fromStart = 0;
+            juce::int64 fromEnd = 0;
+            juce::int64 destStart = 0;
+            if (!parseNonNegativeIpcInt(args[3], fromStart) ||
+                !parseNonNegativeIpcInt(args[4], fromEnd) ||
+                !parseNonNegativeIpcInt(args[5], destStart) || fromEnd < fromStart ||
+                fromEnd >= static_cast<juce::int64>(d.tracks.size())) {
+                return fail("MD track block range out of range.");
+            }
+            preferredTrackId =
+                juce::String::fromUTF8(d.tracks[static_cast<size_t>(fromStart)].id.c_str());
+            actionLabel = "Move MiniDisc tracks";
+            return carta::moveMdTrackBlock(d, static_cast<int>(fromStart),
+                                           static_cast<int>(fromEnd),
+                                           static_cast<int>(destStart), mdErr) ||
+                   fail(mdErr);
+        }
+        if (args[2] == "clone" && args.size() == 5) {
+            juce::int64 src = 0;
+            juce::int64 dest = 0;
+            if (!parseNonNegativeIpcInt(args[3], src) || !parseNonNegativeIpcInt(args[4], dest) ||
+                src >= static_cast<juce::int64>(d.tracks.size()) ||
+                dest > static_cast<juce::int64>(d.tracks.size())) {
+                return fail("MD track clone index out of range.");
+            }
+            if (!carta::cloneMdTrackToPosition(d, static_cast<int>(src), static_cast<int>(dest),
+                                               mdErr)) {
+                return fail(mdErr);
+            }
+            if (dest >= 0 && dest < static_cast<juce::int64>(d.tracks.size())) {
+                preferredTrackId =
+                    juce::String::fromUTF8(d.tracks[static_cast<size_t>(dest)].id.c_str());
+            }
+            actionLabel = "Clone MiniDisc track";
+            return true;
+        }
+        if (args[2] == "add-parts" && args.size() >= 8 && (args.size() - 6) % 2 == 0) {
+            juce::int64 dest = 0;
+            if (!parseNonNegativeIpcInt(args[3], dest) ||
+                dest > static_cast<juce::int64>(d.tracks.size())) {
+                return fail("Insert index must be between 0 and track count.");
+            }
+            carta::MdTrack track;
+            track.id = carta::makeMdTrackId();
+            track.halfWidthTitle = args[4].toStdString();
+            const auto codecTok = args[5].trim();
+            if (codecTok.isNotEmpty() && codecTok != "default" && codecTok != "clear") {
+                carta::MdCodecMode mode = d.defaultCodec;
+                if (!carta::parseMdCodecMode(codecTok.toStdString(), mode)) {
+                    return fail("Track codec must be sp-stereo, sp-mono, lp2, lp4, or default.");
+                }
+                track.codecOverride = mode;
+            }
+            for (int a = 6; a + 1 < args.size(); a += 2) {
+                juce::int64 s0 = 0;
+                juce::int64 e0 = 0;
+                if (!carta::parseSampleOrTime(args[a], s0) ||
+                    !carta::parseSampleOrTime(args[a + 1], e0) || e0 <= s0) {
+                    return fail("Each part must specify valid START < END.");
+                }
+                track.parts.push_back({s0, e0});
+            }
+            preferredTrackId = juce::String::fromUTF8(track.id.c_str());
+            actionLabel = "Paste MiniDisc track";
+            return carta::insertMdTrack(d, static_cast<int>(dest) + 1, std::move(track), mdErr) ||
+                   fail(mdErr);
+        }
         if (args[2] == "duplicate" && (args.size() == 4 || args.size() == 5)) {
             juce::int64 idx = 0;
             juce::int64 count = 1;
@@ -765,6 +833,20 @@ struct Studio::IpcRouter {
                 tr.parts.erase(tr.parts.begin() + static_cast<ptrdiff_t>(pIdx));
                 actionLabel = "Remove UTOC part";
                 return carta::validateMdDisc(d, mdErr) || fail(mdErr);
+            }
+            if (args[3] == "move" && args.size() == 7) {
+                juce::int64 fromP = 0;
+                juce::int64 toP = 0;
+                if (!parseNonNegativeIpcInt(args[5], fromP) ||
+                    !parseNonNegativeIpcInt(args[6], toP) ||
+                    fromP >= static_cast<juce::int64>(tr.parts.size()) ||
+                    toP >= static_cast<juce::int64>(tr.parts.size())) {
+                    return fail("Part index out of range.");
+                }
+                actionLabel = "Move UTOC part";
+                return carta::moveMdTrackPart(d, static_cast<int>(idx), static_cast<int>(fromP),
+                                              static_cast<int>(toP), mdErr) ||
+                       fail(mdErr);
             }
         }
         return fail("Unknown or invalid ipc disc track command.");
