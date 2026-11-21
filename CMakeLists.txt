@@ -284,6 +284,7 @@ if(APPLE)
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-himd"
         VERBATIM)
 elseif(WIN32)
+    target_link_libraries(CartaStudio PRIVATE shell32)
     add_custom_command(TARGET CartaStudio POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:carta-netmd>"
@@ -429,6 +430,7 @@ if(BUILD_TESTING)
         target_link_libraries(CartaComponentTests PRIVATE juce::juce_audio_utils juce::juce_gui_extra juce::juce_dsp juce::juce_cryptography PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
         carta_link_porffor_codecs(CartaComponentTests)
         if(WIN32)
+            target_link_libraries(CartaComponentTests PRIVATE shell32)
             add_custom_command(TARGET CartaComponentTests POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-netmd>" "$<TARGET_FILE:carta-himd>" "$<TARGET_FILE_DIR:CartaComponentTests>/"
                 VERBATIM)

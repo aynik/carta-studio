@@ -31,10 +31,10 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #include <shellapi.h>
-#include <windows.h>
 #else
 #include <cerrno>
 #include <csignal>
@@ -134,11 +134,12 @@ bool containsCaseInsensitive(const std::string& hay, const char* needle) noexcep
 enum class HiMdElevationMode { Auto, Off, Direct, Sudo };
 
 HiMdElevationMode readElevationMode() {
-    const char* raw = std::getenv("CARTA_HIMD_ELEVATION");
-    if (!raw || raw[0] == '\0') {
+    const juce::String rawStr =
+        juce::SystemStats::getEnvironmentVariable("CARTA_HIMD_ELEVATION", {});
+    if (rawStr.isEmpty()) {
         return HiMdElevationMode::Auto;
     }
-    std::string v(raw);
+    std::string v = rawStr.toStdString();
     for (char& ch : v) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     }
@@ -246,13 +247,15 @@ bool locateHiMdHelperUnlocked(std::string& outPath, std::string& error) {
     static constexpr const char* kHelperName = "carta-himd";
 #endif
 
-    if (const char* envPath = std::getenv("CARTA_HIMD_HELPER"); envPath && envPath[0] != '\0') {
-        const juce::File f(juce::String::fromUTF8(envPath));
+    const juce::String envPath =
+        juce::SystemStats::getEnvironmentVariable("CARTA_HIMD_HELPER", {});
+    if (envPath.isNotEmpty()) {
+        const juce::File f(envPath);
         if (f.existsAsFile()) {
             outPath = f.getFullPathName().toStdString();
             return true;
         }
-        error = "CARTA_HIMD_HELPER points to a missing file: " + std::string(envPath);
+        error = "CARTA_HIMD_HELPER points to a missing file: " + envPath.toStdString();
         return false;
     }
 
@@ -305,8 +308,10 @@ void publishHelperProgressLine(const juce::DynamicObject* obj, const HelperProgr
     const auto op = obj->getProperty("operation").toString().toStdString();
     const auto phase = obj->getProperty("phase").toString().toStdString();
     const double rawProg = static_cast<double>(obj->getProperty("progress"));
-    const auto done = static_cast<std::int64_t>(obj->getProperty("bytes_done"));
-    const auto total = static_cast<std::int64_t>(obj->getProperty("bytes_total"));
+    const auto done =
+        static_cast<std::int64_t>(static_cast<juce::int64>(obj->getProperty("bytes_done")));
+    const auto total =
+        static_cast<std::int64_t>(static_cast<juce::int64>(obj->getProperty("bytes_total")));
 
     if (window && window->active) {
         const double scaled =
@@ -1128,7 +1133,8 @@ class PersistentElevatedHiMdSession final {
         if (sockFd_ >= 0) {
             if (wasOpen) {
                 const char quitCmd[] = "quit\n";
-                (void)::write(sockFd_, quitCmd, sizeof(quitCmd) - 1u);
+                const ssize_t ignored = ::write(sockFd_, quitCmd, sizeof(quitCmd) - 1u);
+                (void)ignored;
             }
             ::close(sockFd_);
             sockFd_ = -1;
@@ -1466,14 +1472,19 @@ bool probeHiMdDeviceUnlocked(const std::string& resolvedId, HiMdDeviceStatus& ou
         out.inquiryRev = inq->getProperty("rev").toString().toStdString();
     }
     if (const auto* cap = st->getProperty("capacity").getDynamicObject()) {
-        out.maxLba = static_cast<std::int64_t>(cap->getProperty("maxLba"));
+        out.maxLba =
+            static_cast<std::int64_t>(static_cast<juce::int64>(cap->getProperty("maxLba")));
         out.blockSize = static_cast<int>(cap->getProperty("blockSize"));
-        out.deviceSize = static_cast<std::int64_t>(cap->getProperty("deviceSize"));
+        out.deviceSize =
+            static_cast<std::int64_t>(static_cast<juce::int64>(cap->getProperty("deviceSize")));
     }
     if (const auto* fs = st->getProperty("filesystem").getDynamicObject()) {
-        out.fsTotalBytes = static_cast<std::int64_t>(fs->getProperty("total"));
-        out.fsUsedBytes = static_cast<std::int64_t>(fs->getProperty("used"));
-        out.fsFreeBytes = static_cast<std::int64_t>(fs->getProperty("left"));
+        out.fsTotalBytes =
+            static_cast<std::int64_t>(static_cast<juce::int64>(fs->getProperty("total")));
+        out.fsUsedBytes =
+            static_cast<std::int64_t>(static_cast<juce::int64>(fs->getProperty("used")));
+        out.fsFreeBytes =
+            static_cast<std::int64_t>(static_cast<juce::int64>(fs->getProperty("left")));
     }
     out.datanum = static_cast<int>(st->getProperty("datanum"));
     out.discId = st->getProperty("discId").toString().toStdString();
@@ -2009,8 +2020,10 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
                 res.getDynamicObject()
                     ? res.getDynamicObject()->getProperty("upload").getDynamicObject()
                     : nullptr) {
-            totalBlocksWritten += static_cast<std::int64_t>(uObj->getProperty("blocksWritten"));
-            const auto bw = static_cast<std::int64_t>(uObj->getProperty("bytesWritten"));
+            totalBlocksWritten += static_cast<std::int64_t>(
+                static_cast<juce::int64>(uObj->getProperty("blocksWritten")));
+            const auto bw =
+                static_cast<std::int64_t>(static_cast<juce::int64>(uObj->getProperty("bytesWritten")));
             totalBytesUploaded += bw > 0 ? bw : up.payloadBytes;
             latestDatanum = static_cast<int>(uObj->getProperty("datanum"));
         } else {

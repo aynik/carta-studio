@@ -227,10 +227,11 @@ bool sendSocketCommand(int fd, std::string& carry, const std::string& rawLine, j
 struct ScopedElevationEnv {
     explicit ScopedElevationEnv(const char* value) {
 #if defined(_WIN32)
-        const char* prev = std::getenv("CARTA_HIMD_ELEVATION");
-        if (prev != nullptr) {
+        const juce::String prev =
+            juce::SystemStats::getEnvironmentVariable("CARTA_HIMD_ELEVATION", {});
+        if (prev.isNotEmpty()) {
             hadPrev = true;
-            prevValue = prev;
+            prevValue = prev.toStdString();
         }
         _putenv_s("CARTA_HIMD_ELEVATION", value ? value : "");
 #else
