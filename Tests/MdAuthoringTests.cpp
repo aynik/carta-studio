@@ -579,28 +579,73 @@ void testLoadedDiscLocksPlaceholderAndSessionIO() {
 void testNonLinearPartAndBlockEdits() {
     std::string err;
 
-    // 1. Part reordering inside a multi-part track (moveMdTrackPart)
+    // 1. Play Order aliasing, canonical sync, Make Unique (detach), and guards
     {
         carta::MdDisc disc;
         disc.medium = carta::MdMedium::md80;
         disc.defaultCodec = carta::MdCodecMode::spStereo;
-        disc.halfWidthTitle = "PART REORDER";
-        carta::MdTrack t;
-        t.id = carta::makeMdTrackId();
-        t.halfWidthTitle = "Medley";
-        t.parts = {{0, 40000}, {40000, 80000}, {80000, 120000}};
-        disc.tracks = {t};
+        disc.halfWidthTitle = "PLAY ORDER";
+        carta::MdTrack t0;
+        t0.id = carta::makeMdTrackId();
+        t0.halfWidthTitle = "Theme";
+        t0.parts = {{0, 44100}};
+        carta::MdTrack t1;
+        t1.id = carta::makeMdTrackId();
+        t1.halfWidthTitle = "Bridge";
+        t1.parts = {{44100, 88200}};
+        disc.tracks = {t0, t1};
 
-        check(carta::moveMdTrackPart(disc, 0, 0, 2, err),
-              "moveMdTrackPart moves P1 to P3 cleanly: " + err);
-        check(disc.tracks[0].parts.size() == 3 && disc.tracks[0].parts[0].startSample == 40000 &&
-                  disc.tracks[0].parts[1].startSample == 80000 &&
-                  disc.tracks[0].parts[2].startSample == 0,
-              "moveMdTrackPart preserves all part sample bounds in new playback order");
-        check(!carta::moveMdTrackPart(disc, 0, -1, 0, err) && !err.empty(),
-              "moveMdTrackPart rejects negative source index");
-        check(!carta::moveMdTrackPart(disc, 0, 0, 3, err) && !err.empty(),
-              "moveMdTrackPart rejects out-of-range destination index");
+        check(carta::aliasMdTrackAtPosition(disc, 0, 2, err) && disc.tracks.size() == 3,
+              "aliasMdTrackAtPosition appends Play Order alias cleanly: " + err);
+        const std::string aid = carta::effectiveMdAudioId(disc.tracks[0]);
+        check(!disc.tracks[0].audioId.empty() && disc.tracks[0].audioId == disc.tracks[2].audioId &&
+                  carta::countMdAudioRefs(disc, aid) == 2 &&
+                  carta::findMdPlayOrderIndicesForAudio(disc, aid) == std::vector<int>({0, 2}),
+              "Alias and source share canonical audioId with refcount == 2");
+        check(carta::insertMdAliasByAudioId(disc, aid, 1, err) &&
+                  carta::countMdAudioRefs(disc, aid) == 3 &&
+                  carta::findMdPlayOrderIndicesForAudio(disc, aid) ==
+                      std::vector<int>({0, 1, 3}),
+              "insertMdAliasByAudioId inserts another alias sharing the same audioId: " + err);
+
+        // Editing canonical metadata or timeline range propagates across all aliases
+        disc.tracks[0].halfWidthTitle = "Theme Edited";
+        carta::syncAliasedMdTracks(disc, 0);
+        check(disc.tracks[1].halfWidthTitle == "Theme Edited" &&
+                  disc.tracks[3].halfWidthTitle == "Theme Edited",
+              "syncAliasedMdTracks propagates title updates across aliases");
+        check(carta::setMdTrackRange(disc, 1, 1024, 22016, err) &&
+                  disc.tracks[0].parts[0].startSample == 1024 &&
+                  disc.tracks[3].parts[0].endSample == 22016,
+              "setMdTrackRange syncs range across all Play Order aliases: " + err);
+
+        // Splitting or merging an aliased track is rejected until detached
+        check(!carta::splitMdTrackAtSample(disc, 0, 8192, err) && !err.empty(),
+              "splitMdTrackAtSample rejects aliased track");
+        check(!carta::mergeMdTrackWithNext(disc, 0, err) && !err.empty(),
+              "mergeMdTrackWithNext rejects aliased track");
+
+        // Divergent alias metadata fails validateMdDisc
+        auto badDiv = disc;
+        badDiv.tracks[1].halfWidthTitle = "Diverged";
+        check(!carta::validateMdDisc(badDiv, err) && !err.empty(),
+              "validateMdDisc rejects diverged alias metadata");
+
+        // Make Unique (detach) branches occurrence independently
+        check(carta::detachMdTrackAlias(disc, 1, err) &&
+                  carta::countMdAudioRefs(disc, aid) == 2 &&
+                  carta::effectiveMdAudioId(disc.tracks[1]) != aid,
+              "detachMdTrackAlias isolates one Play Order entry cleanly: " + err);
+        check(carta::setMdTrackRange(disc, 1, 5000, 15000, err) &&
+                  disc.tracks[0].parts[0].startSample == 1024 &&
+                  disc.tracks[1].parts[0].startSample == 5000,
+              "Detached track range edits no longer affect remaining aliases: " + err);
+
+        // Merging tracks with mismatched codecs is rejected
+        auto mixCodecDisc = disc;
+        mixCodecDisc.tracks[1].codecOverride = carta::MdCodecMode::lp2;
+        check(!carta::mergeMdTrackWithNext(mixCodecDisc, 1, err) && !err.empty(),
+              "mergeMdTrackWithNext rejects tracks with mismatched codecs");
     }
 
     // 2. Clone track to explicit position shares physical audio with zero extra clusters
@@ -843,6 +888,140 @@ void testHiMdAuthoringAndSessionV27() {
         int unchangedChannels = 2;
         check(!carta::loadSession(unchangedSession, unchangedChannels, formats, badV26File, ioErr),
               "v26 project containing Hi-MD features is rejected");
+    }
+
+    // 4. Hi-MD 2047 Play Order limit, Hi-MD deduplicated bytes, and 240-track 24HCLK parity
+    {
+        check(carta::mdMaxTracks(carta::MdMedium::md80) == 255 &&
+                  carta::mdMaxAudioTracks(carta::MdMedium::md80) == 255 &&
+                  carta::mdMaxTracks(carta::MdMedium::himd300) == 2047 &&
+                  carta::mdMaxAudioTracks(carta::MdMedium::himd1gb) == 2047,
+              "Medium track and audio-pool limits match 255 NetMD / 2047 Hi-MD");
+
+        carta::MdDisc maxHi;
+        maxHi.medium = carta::MdMedium::himd300;
+        maxHi.defaultCodec = carta::MdCodecMode::hiLp;
+        maxHi.halfWidthTitle = "2047 PLAY ORDER";
+        const std::string poolId = carta::makeMdAudioId();
+        maxHi.tracks.reserve(2047);
+        for (int i = 0; i < 2047; ++i) {
+            carta::MdTrack tr;
+            tr.id = carta::makeMdTrackId();
+            tr.audioId = poolId;
+            tr.halfWidthTitle = "Repeat Chime";
+            tr.parts = {{0, 44100}};
+            maxHi.tracks.push_back(std::move(tr));
+        }
+        carta::MdPhysicalPlan maxPlan;
+        check(carta::validateMdDisc(maxHi, err) &&
+                  carta::planMdPhysicalAudio(maxHi, maxPlan, err) &&
+                  maxPlan.playOrderTrackCount == 2047 && maxPlan.uniqueAudioTrackCount == 1 &&
+                  maxPlan.aliasedTrackCount == 2046 && maxPlan.spans.size() == 1 &&
+                  maxPlan.hiMdUniqueBytes < maxPlan.hiMdUnaliasedBytes &&
+                  maxPlan.hiMdSavedBytes == maxPlan.hiMdUnaliasedBytes - maxPlan.hiMdUniqueBytes,
+              "Hi-MD validates 2047 Play Order entries over 1 unique audio item with dedup bytes");
+        check(!carta::aliasMdTrackAtPosition(maxHi, 0, 2047, err) && !err.empty(),
+              "Hi-MD rejects 2048th Play Order entry cleanly");
+
+        // Construct a full 240-track, 125-unique-audio, 24-group 24HCLK layout on both media
+        auto make24Hclk = [](carta::MdMedium med, carta::MdCodecMode codec) {
+            carta::MdDisc d;
+            d.medium = med;
+            d.defaultCodec = codec;
+            d.halfWidthTitle = "24HCLK";
+            std::int64_t sampleCursor = 0;
+            const std::int64_t speechLen = 44100;
+            const std::int64_t musicLen = 88200;
+            std::vector<carta::MdTrack> uniqueMusic(5);
+            for (int m = 0; m < 5; ++m) {
+                uniqueMusic[static_cast<std::size_t>(m)].audioId = carta::makeMdAudioId();
+                uniqueMusic[static_cast<std::size_t>(m)].halfWidthTitle =
+                    "Music Track #" + std::to_string(m + 1);
+                uniqueMusic[static_cast<std::size_t>(m)].parts = {
+                    {sampleCursor, sampleCursor + musicLen}};
+                sampleCursor += musicLen;
+            }
+            for (int h = 0; h < 24; ++h) {
+                const int start1 = static_cast<int>(d.tracks.size()) + 1;
+                for (int q = 0; q < 4; ++q) {
+                    carta::MdTrack sp;
+                    sp.id = carta::makeMdTrackId();
+                    sp.halfWidthTitle = "Time " + std::to_string(h) + ":" + std::to_string(q * 15);
+                    sp.parts = {{sampleCursor, sampleCursor + speechLen}};
+                    sampleCursor += speechLen;
+                    d.tracks.push_back(std::move(sp));
+
+                    carta::MdTrack mu = uniqueMusic[static_cast<std::size_t>((h + q) % 5)];
+                    mu.id = carta::makeMdTrackId();
+                    d.tracks.push_back(std::move(mu));
+                }
+                for (int e = 0; e < 2; ++e) {
+                    carta::MdTrack sp;
+                    sp.id = carta::makeMdTrackId();
+                    sp.halfWidthTitle = "Cue " + std::to_string(h) + "_" + std::to_string(e);
+                    sp.parts = {{sampleCursor, sampleCursor + speechLen}};
+                    sampleCursor += speechLen;
+                    d.tracks.push_back(std::move(sp));
+                }
+                const int end1 = static_cast<int>(d.tracks.size());
+                d.groups.push_back({start1, end1, "Hour " + std::to_string(h), {}});
+            }
+            return d;
+        };
+
+        // 24*(4*1 + 2*1 + 4 aliases over 5 shared) = 24*(10) = 240 tracks, 144+5 = 149 -> refine to
+        // 125 unique (make 5 speech + 5 music aliased? 120 unique speech + 5 shared music = 125!)
+        const auto build24HclkExact125 = [&make24Hclk](carta::MdMedium med,
+                                                       carta::MdCodecMode codec) {
+            auto d = make24Hclk(med, codec);
+            // Make hour-2+ cues share 1 unique cue pool item -> exact 125 unique? Even cleaner: build
+            // explicitly 96 speech + 24 cue1 + 5 music = 125 unique, + (24 cue2 aliases + 91 music
+            // aliases) = 240 total!
+            d.tracks.clear();
+            d.groups.clear();
+            std::int64_t pos = 0;
+            std::vector<carta::MdTrack> sharedMusic(5);
+            for (int m = 0; m < 5; ++m) {
+                sharedMusic[static_cast<std::size_t>(m)].audioId = carta::makeMdAudioId();
+                sharedMusic[static_cast<std::size_t>(m)].halfWidthTitle =
+                    "Music Loop " + std::to_string(m + 1);
+                sharedMusic[static_cast<std::size_t>(m)].parts = {{pos, pos + 88200}};
+                pos += 88200;
+            }
+            for (int h = 0; h < 24; ++h) {
+                const int s1 = static_cast<int>(d.tracks.size()) + 1;
+                for (int step = 0; step < 5; ++step) {
+                    carta::MdTrack announce;
+                    announce.id = carta::makeMdTrackId();
+                    announce.halfWidthTitle =
+                        "H" + std::to_string(h) + "S" + std::to_string(step);
+                    announce.parts = {{pos, pos + 22528}};
+                    pos += 22528;
+                    d.tracks.push_back(std::move(announce));
+
+                    carta::MdTrack mu = sharedMusic[static_cast<std::size_t>(step)];
+                    mu.id = carta::makeMdTrackId();
+                    d.tracks.push_back(std::move(mu));
+                }
+                d.groups.push_back({s1, static_cast<int>(d.tracks.size()),
+                                    "HR" + std::to_string(h), {}});
+            }
+            return d; // 24 * 10 = 240 tracks, 24*5 + 5 = 125 unique, 24 groups!
+        };
+
+        const auto net24 = build24HclkExact125(carta::MdMedium::md80, carta::MdCodecMode::lp4);
+        const auto himd24 = build24HclkExact125(carta::MdMedium::himd300, carta::MdCodecMode::hiLp);
+        carta::MdPhysicalPlan netPlan, himdPlan;
+        check(carta::planMdPhysicalAudio(net24, netPlan, err) &&
+                  netPlan.playOrderTrackCount == 240 && netPlan.uniqueAudioTrackCount == 125 &&
+                  netPlan.aliasedTrackCount == 115 && net24.groups.size() == 24,
+              "24HCLK 240-track / 125-unique / 24-group layout validates on NetMD MD80: " + err);
+        check(carta::planMdPhysicalAudio(himd24, himdPlan, err) &&
+                  himdPlan.playOrderTrackCount == 240 && himdPlan.uniqueAudioTrackCount == 125 &&
+                  himdPlan.aliasedTrackCount == 115 && himd24.groups.size() == 24 &&
+                  himdPlan.hiMdSavedBytes > 0,
+              "24HCLK 240-track / 125-unique / 24-group layout validates identically on Hi-MD 300M: " +
+                  err);
     }
 }
 

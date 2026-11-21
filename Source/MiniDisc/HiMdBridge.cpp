@@ -1790,7 +1790,6 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
         return report;
     }
 
-    std::int64_t totalAudio = 0;
     for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
         const auto& tr = disc.tracks[i];
         const auto codec = effectiveTrackCodec(disc, tr);
@@ -1801,18 +1800,29 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
                            "PCM).";
             return report;
         }
-        totalAudio += estimateHiMdTrackBytes(codec, tr.totalSamples());
+    }
+
+    MdPhysicalPlan plan;
+    MdDisc hiMdView = disc;
+    if (!isHiMdMedium(hiMdView.medium)) {
+        hiMdView.medium = MdMedium::himd300;
+    }
+    if (!planMdPhysicalAudio(hiMdView, plan, report.error)) {
+        return report;
     }
 
     const std::int64_t trackOverhead =
-        static_cast<std::int64_t>(disc.tracks.size()) * kHiMdPerTrackMetaBytes;
+        static_cast<std::int64_t>(plan.uniqueAudioTrackCount) * kHiMdPerTrackMetaBytes;
     const std::int64_t defaultCap =
         isHiMdMedium(disc.medium) ? hiMdMediumCapacityBytes(disc.medium)
                                   : hiMdMediumCapacityBytes(MdMedium::himd300);
 
-    report.tracksToUpload = static_cast<int>(disc.tracks.size());
-    report.estimatedAudioBytes = totalAudio;
-    report.requiredBytes = totalAudio + trackOverhead + kHiMdMetadataReserveBytes;
+    report.tracksToUpload = plan.playOrderTrackCount;
+    report.uniqueAudioTracksToUpload = plan.uniqueAudioTrackCount;
+    report.estimatedAudioBytes = plan.hiMdUniqueBytes;
+    report.unaliasedAudioBytes = plan.hiMdUnaliasedBytes;
+    report.savedBytes = plan.hiMdSavedBytes;
+    report.requiredBytes = plan.hiMdUniqueBytes + trackOverhead + kHiMdMetadataReserveBytes;
     report.discTotalBytes =
         (deviceStatus && deviceStatus->fsTotalBytes > 0) ? deviceStatus->fsTotalBytes : defaultCap;
     report.discFreeBytes = (deviceStatus && deviceStatus->fsTotalBytes > 0)
@@ -2372,21 +2382,47 @@ bool loadHiMdDiscIntoSession(const std::string& deviceId, MdDisc& outDisc,
     outDisc.loadedDisc.baselineSector0Hash =
         status.discId + ":" + std::to_string(status.datanum);
 
+    std::map<int, int> slotRefCounts;
+    for (const auto& tr : status.tracks) {
+        if (tr.slot > 0) {
+            ++slotRefCounts[tr.slot];
+        }
+    }
+    struct LoadedSlotEntry {
+        MdTrack canonicalTrack{};
+    };
+    std::map<int, LoadedSlotEntry> poolBySlot;
+
     std::int64_t timelineCursor = 0;
     outDisc.tracks.reserve(status.tracks.size());
     outDisc.loadedDisc.regions.reserve(status.tracks.size());
     for (const auto& tr : status.tracks) {
+        if (tr.slot > 0) {
+            if (const auto it = poolBySlot.find(tr.slot); it != poolBySlot.end()) {
+                MdTrack mt = it->second.canonicalTrack;
+                mt.id = makeMdTrackId();
+                outDisc.tracks.push_back(std::move(mt));
+                continue;
+            }
+        }
+
         const auto codec = codecFromHiMdTrack(tr.encoding, tr.bitrate);
         const std::int64_t samples = std::max<std::int64_t>(
             1, std::llround(tr.durationSeconds * static_cast<double>(kMdSampleRate)));
 
         MdTrack mt;
         mt.id = makeMdTrackId();
+        if (tr.slot > 0 && slotRefCounts[tr.slot] > 1) {
+            mt.audioId = "himd-slot-" + std::to_string(tr.slot);
+        }
         mt.halfWidthTitle = tr.title;
         mt.artist = tr.artist;
         mt.album = tr.album;
         mt.codecOverride = codec;
         mt.parts = {{timelineCursor, timelineCursor + samples}};
+        if (tr.slot > 0) {
+            poolBySlot.emplace(tr.slot, LoadedSlotEntry{mt});
+        }
         outDisc.tracks.push_back(std::move(mt));
 
         MdOnDiscRegion reg;
@@ -2409,6 +2445,11 @@ bool loadHiMdDiscIntoSession(const std::string& deviceId, MdDisc& outDisc,
         mg.endTrack = grp.startIndex + grp.trackCount;
         mg.halfWidthTitle = grp.title;
         outDisc.groups.push_back(std::move(mg));
+    }
+
+    if (!validateMdDisc(outDisc, error)) {
+        outDisc = {};
+        return false;
     }
 
     if (outStatus != nullptr) {

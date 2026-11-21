@@ -194,8 +194,10 @@ bool appendUncoveredLoadedSyncTracks(const std::vector<std::pair<std::int64_t, s
         if (alreadyCovered) {
             continue;
         }
-        if (static_cast<int>(candidate.tracks.size()) >= kMdMaxTracks) {
-            error = "Loaded disc plus new clips exceeds the maximum 255 tracks.";
+        const int maxTracks = mdMaxTracks(candidate.medium);
+        if (static_cast<int>(candidate.tracks.size()) >= maxTracks) {
+            error = "Loaded disc plus new clips exceeds the maximum " + std::to_string(maxTracks) +
+                    " tracks.";
             return false;
         }
         MdTrack tr;
@@ -354,6 +356,14 @@ int mdTotalClusters(MdMedium medium) noexcept {
         return 0;
     }
     return 2350;
+}
+
+int mdMaxTracks(MdMedium medium) noexcept {
+    return isHiMdMedium(medium) ? kHiMdMaxTracks : kMdMaxStandardTracks;
+}
+
+int mdMaxAudioTracks(MdMedium medium) noexcept {
+    return isHiMdMedium(medium) ? kHiMdMaxAudioSlots : kMdMaxStandardTracks;
 }
 
 std::string mdCodecModeToString(MdCodecMode mode) {
@@ -546,6 +556,49 @@ std::string makeMdTrackId() {
            "-" + std::to_string(n);
 }
 
+std::string makeMdAudioId() {
+    static std::atomic<std::uint64_t> seq{1};
+    const auto n = seq.fetch_add(1, std::memory_order_relaxed);
+    return "mda-" +
+           juce::Uuid()
+               .toString()
+               .removeCharacters("-")
+               .toLowerCase()
+               .substring(0, 8)
+               .toStdString() +
+           "-" + std::to_string(n);
+}
+
+std::string effectiveMdAudioId(const MdTrack& track) {
+    return track.audioId.empty() ? track.id : track.audioId;
+}
+
+int countMdAudioRefs(const MdDisc& disc, const std::string& audioKey) noexcept {
+    if (audioKey.empty()) {
+        return 0;
+    }
+    int refs = 0;
+    for (const auto& tr : disc.tracks) {
+        if (effectiveMdAudioId(tr) == audioKey) {
+            ++refs;
+        }
+    }
+    return refs;
+}
+
+std::vector<int> findMdPlayOrderIndicesForAudio(const MdDisc& disc, const std::string& audioKey) {
+    std::vector<int> indices;
+    if (audioKey.empty()) {
+        return indices;
+    }
+    for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
+        if (effectiveMdAudioId(disc.tracks[i]) == audioKey) {
+            indices.push_back(static_cast<int>(i));
+        }
+    }
+    return indices;
+}
+
 bool validateMdDisc(const MdDisc& disc, std::string& error) {
     error.clear();
     if (!validTimestampOrEmpty(disc.discTimestamp)) {
@@ -557,8 +610,12 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
                 "' is not supported on medium '" + mdMediumToString(disc.medium) + "'.";
         return false;
     }
-    if (static_cast<int>(disc.tracks.size()) > kMdMaxTracks) {
-        error = "MiniDisc UTOC supports at most 255 tracks.";
+    const int maxTracks = mdMaxTracks(disc.medium);
+    if (static_cast<int>(disc.tracks.size()) > maxTracks) {
+        error = isHiMdMedium(disc.medium)
+                    ? ("Hi-MD Play Order supports at most " + std::to_string(maxTracks) +
+                       " tracks.")
+                    : ("MiniDisc UTOC supports at most " + std::to_string(maxTracks) + " tracks.");
         return false;
     }
 
@@ -606,6 +663,7 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
     }
 
     std::set<std::string> seenIds;
+    std::map<std::string, const MdTrack*> audioCanonical;
     std::size_t totalParts = 0;
     for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
         const auto& tr = disc.tracks[t];
@@ -622,15 +680,34 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
                     " timestamp must be empty or formatted YYYY-MM-DD HH:MM:SS.";
             return false;
         }
-        if (!isCodecValidForMedium(disc.medium, effectiveTrackCodec(disc, tr))) {
+        const auto trCodec = effectiveTrackCodec(disc, tr);
+        if (!isCodecValidForMedium(disc.medium, trCodec)) {
             error = "Track " + std::to_string(t + 1) + " codec '" +
-                    mdCodecModeToString(effectiveTrackCodec(disc, tr)) +
+                    mdCodecModeToString(trCodec) +
                     "' is not supported on medium '" + mdMediumToString(disc.medium) + "'.";
             return false;
         }
         if (tr.parts.empty()) {
             error = "Track " + std::to_string(t + 1) + " must contain at least one timeline part.";
             return false;
+        }
+        const std::string audioKey = effectiveMdAudioId(tr);
+        if (const auto it = audioCanonical.find(audioKey); it != audioCanonical.end()) {
+            const auto& canonical = *it->second;
+            if (tr.halfWidthTitle != canonical.halfWidthTitle ||
+                tr.fullWidthTitle != canonical.fullWidthTitle || tr.artist != canonical.artist ||
+                tr.album != canonical.album ||
+                trCodec != effectiveTrackCodec(disc, canonical) ||
+                tr.writeProtected != canonical.writeProtected ||
+                tr.scmsCopyProtected != canonical.scmsCopyProtected ||
+                tr.emphasis != canonical.emphasis || tr.timestamp != canonical.timestamp ||
+                tr.parts != canonical.parts) {
+                error = "Aliased track " + std::to_string(t + 1) + " sharing audio ID '" +
+                        audioKey + "' does not match its canonical Audio Pool metadata/range.";
+                return false;
+            }
+        } else {
+            audioCanonical.emplace(audioKey, &tr);
         }
         for (std::size_t p = 0; p < tr.parts.size(); ++p) {
             const auto& part = tr.parts[p];
@@ -660,7 +737,12 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
             ++totalParts;
         }
     }
-    if (totalParts > 254 && disc.tracks.size() >= 255) {
+    if (static_cast<int>(audioCanonical.size()) > mdMaxAudioTracks(disc.medium)) {
+        error = "Unique Audio Pool items exceed the medium limit of " +
+                std::to_string(mdMaxAudioTracks(disc.medium)) + ".";
+        return false;
+    }
+    if (!isHiMdMedium(disc.medium) && totalParts > 254 && disc.tracks.size() >= 255) {
         // Fine check happens during UTOC DAG fragment compilation; still catch impossible totals
         // early.
     }
@@ -696,29 +778,45 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
 
     if (isHiMdMedium(disc.medium)) {
         std::vector<std::pair<std::int64_t, std::int64_t>> intervals;
+        std::map<std::string, std::vector<int>> spanIndicesByAudioKey;
         for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
             const auto& tr = disc.tracks[t];
             const auto codec = effectiveTrackCodec(disc, tr);
+            const std::string audioKey = effectiveMdAudioId(tr);
+            const std::int64_t trBytes = estimateHiMdTrackBytes(codec, tr.totalSamples());
+            out.hiMdUnaliasedBytes += trBytes;
+
+            auto [it, inserted] =
+                spanIndicesByAudioKey.emplace(audioKey, std::vector<int>{});
+            if (inserted) {
+                out.hiMdUniqueBytes += trBytes;
+                it->second.reserve(tr.parts.size());
+                for (std::size_t p = 0; p < tr.parts.size(); ++p) {
+                    const auto& part = tr.parts[p];
+                    intervals.emplace_back(part.startSample, part.endSample);
+
+                    MdPhysicalSpan span;
+                    span.codec = codec;
+                    span.startSample = part.startSample;
+                    span.endSample = part.endSample;
+                    span.unitCount = 0;
+                    span.startCluster = 0;
+                    span.clusterCount = 0;
+                    const int spanIdx = static_cast<int>(out.spans.size());
+                    out.spans.push_back(span);
+                    it->second.push_back(spanIdx);
+                }
+            }
+
             for (std::size_t p = 0; p < tr.parts.size(); ++p) {
                 const auto& part = tr.parts[p];
                 out.maxEndSample = std::max(out.maxEndSample, part.endSample);
                 out.logicalPlaySamples += part.durationSamples();
-                intervals.emplace_back(part.startSample, part.endSample);
-
-                MdPhysicalSpan span;
-                span.codec = codec;
-                span.startSample = part.startSample;
-                span.endSample = part.endSample;
-                span.unitCount = 0;
-                span.startCluster = 0;
-                span.clusterCount = 0;
-                const int spanIdx = static_cast<int>(out.spans.size());
-                out.spans.push_back(span);
 
                 MdPartPlacement place;
                 place.trackIndex = static_cast<int>(t);
                 place.partIndex = static_cast<int>(p);
-                place.spanIndex = spanIdx;
+                place.spanIndex = it->second[p];
                 out.placements.push_back(place);
             }
         }
@@ -737,6 +835,11 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
             }
             out.uniquePhysicalSamples += (curE - curS);
         }
+        out.hiMdSavedBytes =
+            std::max<std::int64_t>(0, out.hiMdUnaliasedBytes - out.hiMdUniqueBytes);
+        out.playOrderTrackCount = static_cast<int>(disc.tracks.size());
+        out.uniqueAudioTrackCount = static_cast<int>(spanIndicesByAudioKey.size());
+        out.aliasedTrackCount = std::max(0, out.playOrderTrackCount - out.uniqueAudioTrackCount);
         return true;
     }
 
@@ -1061,6 +1164,13 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
     }
 
     out.savedClusters = std::max(0, out.uncoalescedClusters - out.usedClusters);
+    std::set<std::string> uniqueAudioKeys;
+    for (const auto& tr : disc.tracks) {
+        uniqueAudioKeys.insert(effectiveMdAudioId(tr));
+    }
+    out.playOrderTrackCount = static_cast<int>(disc.tracks.size());
+    out.uniqueAudioTrackCount = static_cast<int>(uniqueAudioKeys.size());
+    out.aliasedTrackCount = std::max(0, out.playOrderTrackCount - out.uniqueAudioTrackCount);
     return true;
 }
 
@@ -1100,7 +1210,7 @@ int findMdTrackIndex(const MdDisc& disc, const std::string& idOrOneBasedIndex) n
 
 bool appendAutoTrackForClip(MdDisc& disc, const std::string& title, std::int64_t startSample,
                             std::int64_t endSample) {
-    if (!disc.autoTrackOnImport || static_cast<int>(disc.tracks.size()) >= kMdMaxTracks) {
+    if (!disc.autoTrackOnImport || static_cast<int>(disc.tracks.size()) >= mdMaxTracks(disc.medium)) {
         return false;
     }
     if (startSample < 0 || endSample <= startSample) {
@@ -1117,7 +1227,7 @@ bool appendAutoTrackForClip(MdDisc& disc, const std::string& title, std::int64_t
 
 bool applyAutoTrackForPlacedClip(MdDisc& disc, const std::string& title, std::int64_t startSample,
                                  std::int64_t endSample) {
-    if (!disc.autoTrackOnImport || static_cast<int>(disc.tracks.size()) >= kMdMaxTracks) {
+    if (!disc.autoTrackOnImport || static_cast<int>(disc.tracks.size()) >= mdMaxTracks(disc.medium)) {
         return false;
     }
     if (startSample < 0 || endSample <= startSample) {
@@ -1166,8 +1276,12 @@ bool applyAutoTrackForPlacedClip(MdDisc& disc, const std::string& title, std::in
 bool insertMdTrack(MdDisc& disc, int oneBasedPosition, MdTrack track, std::string& error) {
     error.clear();
     const int count = static_cast<int>(disc.tracks.size());
-    if (count >= kMdMaxTracks) {
-        error = "MiniDisc already has the maximum 255 tracks.";
+    const int maxTracks = mdMaxTracks(disc.medium);
+    if (count >= maxTracks) {
+        error = isHiMdMedium(disc.medium)
+                    ? ("Hi-MD already has the maximum " + std::to_string(maxTracks) + " tracks.")
+                    : ("MiniDisc already has the maximum " + std::to_string(maxTracks) +
+                       " tracks.");
         return false;
     }
     if (oneBasedPosition < 1 || oneBasedPosition > count + 1) {
@@ -1192,16 +1306,24 @@ bool splitMdTrackAtSample(MdDisc& disc, int trackIndex0, std::int64_t timelineSa
                           std::string& error) {
     error.clear();
     const int count = static_cast<int>(disc.tracks.size());
+    const int maxTracks = mdMaxTracks(disc.medium);
     if (trackIndex0 < 0 || trackIndex0 >= count) {
         error = "Track index out of range.";
         return false;
     }
-    if (count >= kMdMaxTracks) {
-        error = "MiniDisc already has the maximum 255 tracks.";
+    if (count >= maxTracks) {
+        error = isHiMdMedium(disc.medium)
+                    ? ("Hi-MD already has the maximum " + std::to_string(maxTracks) + " tracks.")
+                    : ("MiniDisc already has the maximum " + std::to_string(maxTracks) +
+                       " tracks.");
         return false;
     }
 
     const auto& src = disc.tracks[static_cast<std::size_t>(trackIndex0)];
+    if (countMdAudioRefs(disc, effectiveMdAudioId(src)) > 1) {
+        error = "Cannot split an aliased Play Order track; Make Unique first.";
+        return false;
+    }
     int hitPart = -1;
     for (std::size_t p = 0; p < src.parts.size(); ++p) {
         if (src.parts[p].startSample < timelineSample && timelineSample < src.parts[p].endSample) {
@@ -1217,8 +1339,10 @@ bool splitMdTrackAtSample(MdDisc& disc, int trackIndex0, std::int64_t timelineSa
 
     MdDisc candidate = disc;
     auto& first = candidate.tracks[static_cast<std::size_t>(trackIndex0)];
+    first.audioId.clear();
     MdTrack second = first;
     second.id = makeMdTrackId();
+    second.audioId.clear();
 
     const MdPart splitPart = first.parts[static_cast<std::size_t>(hitPart)];
     std::int64_t splitSample = timelineSample;
@@ -1272,8 +1396,21 @@ bool mergeMdTrackWithNext(MdDisc& disc, int trackIndex0, std::string& error) {
         return false;
     }
 
+    const auto& srcFirst = disc.tracks[static_cast<std::size_t>(trackIndex0)];
+    const auto& srcSecond = disc.tracks[static_cast<std::size_t>(trackIndex0 + 1)];
+    if (countMdAudioRefs(disc, effectiveMdAudioId(srcFirst)) > 1 ||
+        countMdAudioRefs(disc, effectiveMdAudioId(srcSecond)) > 1) {
+        error = "Cannot merge aliased Play Order tracks; Make Unique first.";
+        return false;
+    }
+    if (effectiveTrackCodec(disc, srcFirst) != effectiveTrackCodec(disc, srcSecond)) {
+        error = "Cannot merge tracks with different codec modes.";
+        return false;
+    }
+
     MdDisc candidate = disc;
     auto& first = candidate.tracks[static_cast<std::size_t>(trackIndex0)];
+    first.audioId.clear();
     const auto second = candidate.tracks[static_cast<std::size_t>(trackIndex0 + 1)];
     for (const auto& p : second.parts) {
         if (!first.parts.empty() && first.parts.back().endSample == p.startSample) {
@@ -1311,6 +1448,12 @@ bool moveMdSharedBoundary(MdDisc& disc, int leftTrack0, int leftPart0, int right
         error = "Shared split requires two distinct parts.";
         return false;
     }
+    if (leftTrack0 != rightTrack0 &&
+        effectiveMdAudioId(disc.tracks[static_cast<std::size_t>(leftTrack0)]) ==
+            effectiveMdAudioId(disc.tracks[static_cast<std::size_t>(rightTrack0)])) {
+        error = "Cannot move a split boundary between aliases of the same audio item.";
+        return false;
+    }
 
     MdDisc candidate = disc;
     auto& leftPart = candidate.tracks[static_cast<std::size_t>(leftTrack0)]
@@ -1338,6 +1481,8 @@ bool moveMdSharedBoundary(MdDisc& disc, int leftTrack0, int leftPart0, int right
             }
             leftPart.endSample = adjustedSample;
             rightPart.startSample = adjustedSample;
+            syncAliasedMdTracks(candidate, leftTrack0);
+            syncAliasedMdTracks(candidate, rightTrack0);
             if (!validateMdDisc(candidate, error)) {
                 return false;
             }
@@ -1353,6 +1498,8 @@ bool moveMdSharedBoundary(MdDisc& disc, int leftTrack0, int leftPart0, int right
     }
     leftPart.endSample = adjustedSample;
     rightPart.startSample = adjustedSample;
+    syncAliasedMdTracks(candidate, leftTrack0);
+    syncAliasedMdTracks(candidate, rightTrack0);
     if (!validateMdDisc(candidate, error)) {
         return false;
     }
@@ -1407,6 +1554,7 @@ bool trimMdPartEdge(MdDisc& disc, int trackIndex0, int partIndex0, bool rightEdg
         }
         part.startSample = clamped;
     }
+    syncAliasedMdTracks(candidate, trackIndex0);
     if (!validateMdDisc(candidate, error)) {
         return false;
     }
@@ -1450,6 +1598,146 @@ bool slideMdPartRange(MdDisc& disc, int trackIndex0, int partIndex0, std::int64_
     const std::int64_t clamped = std::clamp<std::int64_t>(adjustedStart, minBound, maxBound - len);
     part.startSample = clamped;
     part.endSample = clamped + len;
+    syncAliasedMdTracks(candidate, trackIndex0);
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
+void syncAliasedMdTracks(MdDisc& disc, int sourceTrackIndex0) {
+    if (sourceTrackIndex0 < 0 || sourceTrackIndex0 >= static_cast<int>(disc.tracks.size())) {
+        return;
+    }
+    const auto& src = disc.tracks[static_cast<std::size_t>(sourceTrackIndex0)];
+    if (src.audioId.empty()) {
+        return;
+    }
+    for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
+        if (static_cast<int>(i) == sourceTrackIndex0) {
+            continue;
+        }
+        auto& dst = disc.tracks[i];
+        if (dst.audioId == src.audioId) {
+            dst.halfWidthTitle = src.halfWidthTitle;
+            dst.fullWidthTitle = src.fullWidthTitle;
+            dst.artist = src.artist;
+            dst.album = src.album;
+            dst.codecOverride = src.codecOverride;
+            dst.writeProtected = src.writeProtected;
+            dst.scmsCopyProtected = src.scmsCopyProtected;
+            dst.emphasis = src.emphasis;
+            dst.timestamp = src.timestamp;
+            dst.parts = src.parts;
+        }
+    }
+}
+
+bool aliasMdTrackAtPosition(MdDisc& disc, int srcIndex0, int destIndex0, std::string& error) {
+    error.clear();
+    const int count = static_cast<int>(disc.tracks.size());
+    const int maxTracks = mdMaxTracks(disc.medium);
+    if (srcIndex0 < 0 || srcIndex0 >= count) {
+        error = "Source track index out of range.";
+        return false;
+    }
+    if (destIndex0 < 0 || destIndex0 > count) {
+        error = "Destination track index out of range.";
+        return false;
+    }
+    if (count >= maxTracks) {
+        error = isHiMdMedium(disc.medium)
+                    ? ("Hi-MD already has the maximum " + std::to_string(maxTracks) + " tracks.")
+                    : ("MiniDisc already has the maximum " + std::to_string(maxTracks) +
+                       " tracks.");
+        return false;
+    }
+
+    MdDisc candidate = disc;
+    auto& src = candidate.tracks[static_cast<std::size_t>(srcIndex0)];
+    if (src.audioId.empty()) {
+        src.audioId = makeMdAudioId();
+    }
+    MdTrack copy = src;
+    copy.id = makeMdTrackId();
+    const int oneBasedPos = destIndex0 + 1;
+    shiftGroupsForInsert(candidate.groups, oneBasedPos, false);
+    candidate.tracks.insert(candidate.tracks.begin() + destIndex0, std::move(copy));
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
+bool insertMdAliasByAudioId(MdDisc& disc, const std::string& audioKey, int destIndex0,
+                            std::string& error) {
+    error.clear();
+    if (audioKey.empty()) {
+        error = "Audio Pool ID must not be empty.";
+        return false;
+    }
+    for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
+        if (effectiveMdAudioId(disc.tracks[i]) == audioKey) {
+            return aliasMdTrackAtPosition(disc, static_cast<int>(i), destIndex0, error);
+        }
+    }
+    error = "Audio Pool item '" + audioKey + "' not found.";
+    return false;
+}
+
+bool detachMdTrackAlias(MdDisc& disc, int trackIndex0, std::string& error) {
+    error.clear();
+    if (trackIndex0 < 0 || trackIndex0 >= static_cast<int>(disc.tracks.size())) {
+        error = "Track index out of range.";
+        return false;
+    }
+    const auto& src = disc.tracks[static_cast<std::size_t>(trackIndex0)];
+    const std::string key = effectiveMdAudioId(src);
+    if (countMdAudioRefs(disc, key) <= 1) {
+        error = "Track " + std::to_string(trackIndex0 + 1) + " is already unique.";
+        return false;
+    }
+    std::set<std::string> uniqueKeys;
+    for (const auto& tr : disc.tracks) {
+        uniqueKeys.insert(effectiveMdAudioId(tr));
+    }
+    const int maxAudio = mdMaxAudioTracks(disc.medium);
+    if (static_cast<int>(uniqueKeys.size()) >= maxAudio) {
+        error = "Cannot make track unique: maximum unique audio items (" +
+                std::to_string(maxAudio) + ") reached.";
+        return false;
+    }
+
+    MdDisc candidate = disc;
+    candidate.tracks[static_cast<std::size_t>(trackIndex0)].audioId.clear();
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
+bool setMdTrackRange(MdDisc& disc, int trackIndex0, std::int64_t startSample,
+                     std::int64_t endSample, std::string& error) {
+    error.clear();
+    if (trackIndex0 < 0 || trackIndex0 >= static_cast<int>(disc.tracks.size())) {
+        error = "Track index out of range.";
+        return false;
+    }
+    if (startSample < 0 || endSample <= startSample) {
+        error = "Track range must have 0 <= startSample < endSample.";
+        return false;
+    }
+    MdDisc candidate = disc;
+    auto& tr = candidate.tracks[static_cast<std::size_t>(trackIndex0)];
+    if (mdTrackUsesOnDiscAudio(candidate, tr)) {
+        error = "Cannot replace range of an on-disc track; trim or split on-disc audio instead.";
+        return false;
+    }
+    tr.parts = {{startSample, endSample}};
+    syncAliasedMdTracks(candidate, trackIndex0);
     if (!validateMdDisc(candidate, error)) {
         return false;
     }
@@ -1460,17 +1748,25 @@ bool slideMdPartRange(MdDisc& disc, int trackIndex0, int partIndex0, std::int64_
 bool duplicateMdTrack(MdDisc& disc, int trackIndex0, std::string& error) {
     error.clear();
     const int count = static_cast<int>(disc.tracks.size());
+    const int maxTracks = mdMaxTracks(disc.medium);
     if (trackIndex0 < 0 || trackIndex0 >= count) {
         error = "Track index out of range.";
         return false;
     }
-    if (count >= kMdMaxTracks) {
-        error = "MiniDisc already has the maximum 255 tracks.";
+    if (count >= maxTracks) {
+        error = isHiMdMedium(disc.medium)
+                    ? ("Hi-MD already has the maximum " + std::to_string(maxTracks) + " tracks.")
+                    : ("MiniDisc already has the maximum " + std::to_string(maxTracks) +
+                       " tracks.");
         return false;
     }
 
     MdDisc candidate = disc;
-    MdTrack copy = candidate.tracks[static_cast<std::size_t>(trackIndex0)];
+    auto& src = candidate.tracks[static_cast<std::size_t>(trackIndex0)];
+    if (src.audioId.empty()) {
+        src.audioId = makeMdAudioId();
+    }
+    MdTrack copy = src;
     copy.id = makeMdTrackId();
     const int insertPos1 = trackIndex0 + 2;
     shiftGroupsForInsert(candidate.groups, insertPos1, true);
@@ -1483,47 +1779,7 @@ bool duplicateMdTrack(MdDisc& disc, int trackIndex0, std::string& error) {
 }
 
 bool cloneMdTrackToPosition(MdDisc& disc, int srcIndex0, int destIndex0, std::string& error) {
-    error.clear();
-    const int count = static_cast<int>(disc.tracks.size());
-    if (srcIndex0 < 0 || srcIndex0 >= count) {
-        error = "Source track index out of range.";
-        return false;
-    }
-    if (destIndex0 < 0 || destIndex0 > count) {
-        error = "Destination track index out of range.";
-        return false;
-    }
-    MdTrack copy = disc.tracks[static_cast<std::size_t>(srcIndex0)];
-    copy.id = makeMdTrackId();
-    return insertMdTrack(disc, destIndex0 + 1, std::move(copy), error);
-}
-
-bool moveMdTrackPart(MdDisc& disc, int trackIndex0, int fromPart0, int toPart0, std::string& error) {
-    error.clear();
-    if (trackIndex0 < 0 || trackIndex0 >= static_cast<int>(disc.tracks.size())) {
-        error = "Track index out of range.";
-        return false;
-    }
-    const int partCount =
-        static_cast<int>(disc.tracks[static_cast<std::size_t>(trackIndex0)].parts.size());
-    if (fromPart0 < 0 || fromPart0 >= partCount || toPart0 < 0 || toPart0 >= partCount) {
-        error = "Part index out of range.";
-        return false;
-    }
-    if (fromPart0 == toPart0) {
-        return true;
-    }
-
-    MdDisc candidate = disc;
-    auto& parts = candidate.tracks[static_cast<std::size_t>(trackIndex0)].parts;
-    MdPart moved = parts[static_cast<std::size_t>(fromPart0)];
-    parts.erase(parts.begin() + fromPart0);
-    parts.insert(parts.begin() + toPart0, moved);
-    if (!validateMdDisc(candidate, error)) {
-        return false;
-    }
-    disc = std::move(candidate);
-    return true;
+    return aliasMdTrackAtPosition(disc, srcIndex0, destIndex0, error);
 }
 
 bool moveMdTrackBlock(MdDisc& disc, int fromStart0, int fromEnd0, int destStart0,
@@ -1880,9 +2136,12 @@ bool syncTracksFromClips(const Session& session, MdDisc& disc, std::string& erro
                 return false;
             }
         } else {
-            if (static_cast<int>(chain.size()) > kMdMaxTracks) {
-                error = "Selected clips produce more than 255 tracks; MiniDisc supports at most "
-                        "255 tracks.";
+            const int maxTracks = mdMaxTracks(candidate.medium);
+            if (static_cast<int>(chain.size()) > maxTracks) {
+                error = "Selected clips produce more than " + std::to_string(maxTracks) +
+                        " tracks; " +
+                        (isHiMdMedium(candidate.medium) ? "Hi-MD" : "MiniDisc") +
+                        " supports at most " + std::to_string(maxTracks) + " tracks.";
                 return false;
             }
             for (std::size_t i = 0; i < chain.size(); ++i) {
@@ -1947,8 +2206,11 @@ bool syncTracksFromLayerClips(const Session& session, MdDisc& disc, std::string&
                 return false;
             }
         } else {
-            if (static_cast<int>(items.size()) > kMdMaxTracks) {
-                error = "Layer 1 has more than 255 clips; MiniDisc supports at most 255 tracks.";
+            const int maxTracks = mdMaxTracks(candidate.medium);
+            if (static_cast<int>(items.size()) > maxTracks) {
+                error = "Layer 1 has more than " + std::to_string(maxTracks) + " clips; " +
+                        (isHiMdMedium(candidate.medium) ? "Hi-MD" : "MiniDisc") +
+                        " supports at most " + std::to_string(maxTracks) + " tracks.";
                 return false;
             }
             for (std::size_t idx = 0; idx < items.size(); ++idx) {
@@ -2046,9 +2308,11 @@ bool syncTracksFromMarkers(const Session& session, MdDisc& disc, std::string& er
         }
     }
 
-    if (static_cast<int>(candidate.tracks.size()) > kMdMaxTracks) {
-        error =
-            "Timeline markers produce more than 255 tracks; MiniDisc supports at most 255 tracks.";
+    const int maxTracks = mdMaxTracks(candidate.medium);
+    if (static_cast<int>(candidate.tracks.size()) > maxTracks) {
+        error = "Timeline markers produce more than " + std::to_string(maxTracks) + " tracks; " +
+                (isHiMdMedium(candidate.medium) ? "Hi-MD" : "MiniDisc") + " supports at most " +
+                std::to_string(maxTracks) + " tracks.";
         return false;
     }
     if (!validateMdDisc(candidate, error)) {

@@ -1531,8 +1531,13 @@ void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt)
     if (discIsHiMd) {
         const auto estPre = carta::preflightHiMdRecording(session.mdDisc, nullptr);
         const double estMb = static_cast<double>(estPre.requiredBytes) / (1024.0 * 1024.0);
-        utocSummary = "Hi-MD FAT16" + dot +
-                      juce::String(static_cast<int>(session.mdDisc.tracks.size())) + " trk" + dot +
+        const juce::String trkStr =
+            (estPre.uniqueAudioTracksToUpload > 0 &&
+             estPre.uniqueAudioTracksToUpload < estPre.tracksToUpload)
+                ? (juce::String(estPre.tracksToUpload) + " trk (" +
+                   juce::String(estPre.uniqueAudioTracksToUpload) + " uniq)")
+                : (juce::String(static_cast<int>(session.mdDisc.tracks.size())) + " trk");
+        utocSummary = "Hi-MD FAT16" + dot + trkStr + dot +
                       juce::String(estMb, estMb >= 100.0 ? 0 : 1) + " MB";
     } else if (compiled) {
         utocSummary = juce::String(budget.usedTracks) + "/" + juce::String(budget.maxTracks) +
@@ -1606,8 +1611,13 @@ void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt)
                 const double reqMb =
                     static_cast<double>(pre.requiredBytes) / (1024.0 * 1024.0);
                 snap.statusText =
-                    "Ready to record " + juce::String(pre.tracksToUpload) + " track(s) (" +
-                    juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB) to Hi-MD.";
+                    (pre.uniqueAudioTracksToUpload < pre.tracksToUpload)
+                        ? ("Ready to record " + juce::String(pre.tracksToUpload) +
+                           " Play Order track(s) (" + juce::String(pre.uniqueAudioTracksToUpload) +
+                           " unique audio, " + juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) +
+                           " MB) to Hi-MD.")
+                        : ("Ready to record " + juce::String(pre.tracksToUpload) + " track(s) (" +
+                           juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB) to Hi-MD.");
             }
         } else if (!cachedHiMdDevices.empty()) {
             if (hiMdNeedsElevation) {

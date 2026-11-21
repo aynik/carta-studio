@@ -876,6 +876,51 @@ int main() {
                 "stopHiMdElevatedSession should clear active session flag");
     }
 
+    // 11. Offline Hi-MD Play Order preflight deduplication (240 tracks / 125 unique / 24 groups).
+    {
+        carta::MdDisc hclk;
+        hclk.medium = carta::MdMedium::himd300;
+        hclk.defaultCodec = carta::MdCodecMode::hiLp;
+        hclk.halfWidthTitle = "24HCLK Hi-MD";
+
+        std::int64_t cursor = 0;
+        std::vector<carta::MdTrack> sharedMusic(5);
+        for (int m = 0; m < 5; ++m) {
+            sharedMusic[static_cast<std::size_t>(m)].audioId = carta::makeMdAudioId();
+            sharedMusic[static_cast<std::size_t>(m)].halfWidthTitle =
+                "Loop " + std::to_string(m + 1);
+            sharedMusic[static_cast<std::size_t>(m)].parts = {{cursor, cursor + 88200}};
+            cursor += 88200;
+        }
+        for (int h = 0; h < 24; ++h) {
+            const int start1 = static_cast<int>(hclk.tracks.size()) + 1;
+            for (int s = 0; s < 5; ++s) {
+                carta::MdTrack sp;
+                sp.id = carta::makeMdTrackId();
+                sp.halfWidthTitle = "Sp " + std::to_string(h) + ":" + std::to_string(s);
+                sp.parts = {{cursor, cursor + 44100}};
+                cursor += 44100;
+                hclk.tracks.push_back(std::move(sp));
+
+                carta::MdTrack mu = sharedMusic[static_cast<std::size_t>(s)];
+                mu.id = carta::makeMdTrackId();
+                hclk.tracks.push_back(std::move(mu));
+            }
+            hclk.groups.push_back(
+                {start1, static_cast<int>(hclk.tracks.size()), "Hr " + std::to_string(h), {}});
+        }
+
+        carta::HiMdDeviceStatus blankHiSt{};
+        blankHiSt.fsTotalBytes = carta::hiMdMediumCapacityBytes(carta::MdMedium::himd300);
+        blankHiSt.fsFreeBytes = blankHiSt.fsTotalBytes;
+        const auto pre = carta::preflightHiMdRecording(hclk, &blankHiSt);
+        REQUIRE(pre.valid && pre.tracksToUpload == 240 && pre.uniqueAudioTracksToUpload == 125 &&
+                    pre.savedBytes > 0 && pre.estimatedAudioBytes < pre.unaliasedAudioBytes &&
+                    pre.requiredBytes < pre.discFreeBytes,
+                "Hi-MD preflight deduplicates 240 Play Order tracks onto 125 unique audio items: " +
+                    pre.error);
+    }
+
     std::cout << "[HiMdBridgeTests] All Hi-MD bridge, payload encoder, guard, and lifecycle tests passed.\n";
     return 0;
 }

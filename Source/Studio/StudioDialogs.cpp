@@ -1627,7 +1627,7 @@ KeyboardHelp::KeyboardHelp() {
         "Command+Shift+S   Save project as\n"
         "Command+Z / Command+Shift+Z   Undo / redo\n\n"
         "Command+Shift+P   Search menu commands\n\n"
-        "Command+Shift+I / J   Insert an MD track / add an MD part from the timeline selection\n\n"
+        "Command+Shift+I / J   Insert an MD track / set MD track range from selection\n\n"
         "EDITING\n"
         "Command+X / C   Cut / copy selected clips, or time selection\n"
         "Command+V   Paste at playhead\n"

@@ -135,10 +135,23 @@ with tempfile.TemporaryDirectory(prefix='carta-md-authoring-ipc-') as directory:
         call('edit', 'undo')
         assert call('disc', 'status')['track_count'] == 5
 
-        # 4. Shared part coalescing + UTOC export / import
-        repeated = call('disc', 'track', 'part', 'repeat', '0', '0', '1')
-        assert repeated['physical_plan']['saved_clusters'] > 0, repeated
-        assert repeated['budget']['shared_fragment_count'] > 0, repeated
+        # 4. Play Order aliasing coalescing + UTOC export / import + Hi-MD alias stats
+        duped = call('disc', 'track', 'duplicate', '0', '1')
+        assert duped['track_count'] == 6 and duped['aliased_track_count'] >= 1, duped
+        assert duped['physical_plan']['saved_clusters'] > 0, duped
+        assert duped['budget']['shared_fragment_count'] > 0, duped
+
+        # Canonical rename propagates across aliases; detach isolates an alias for range edits
+        aid = duped['tracks'][0]['audio_id']
+        aliased_res = call('disc', 'track', 'rename', '0', 'Shared Theme')
+        assert aliased_res['tracks'][1]['half_width_title'] == 'Shared Theme', aliased_res
+        detached = call('disc', 'track', 'detach', '1')
+        assert detached['tracks'][1]['audio_id'] != aid and detached['tracks'][0]['alias_count'] == 1, detached
+        ranged = call('disc', 'track', 'range', '1', '0', '22016')
+        assert ranged['tracks'][1]['parts'][0]['end_sample'] == 22016, ranged
+        call('edit', 'undo')
+        call('edit', 'undo')
+        call('edit', 'undo')
 
         utoc_path = os.path.join(directory, 'album.utoc')
         exp = call('utoc', 'export', utoc_path)
@@ -146,7 +159,13 @@ with tempfile.TemporaryDirectory(prefix='carta-md-authoring-ipc-') as directory:
 
         call('disc', 'title', 'TEMP')
         imp = call('utoc', 'import', utoc_path)
-        assert imp['tracks'] == 5 and call('disc', 'status')['half_width_title'] == '', imp
+        assert imp['tracks'] == 6 and call('disc', 'status')['half_width_title'] == '', imp
+
+        # Hi-MD Play Order aliasing saves estimated bytes without touching hardware
+        himd_st = call('disc', 'medium', 'himd300')
+        assert himd_st['is_himd'] is True and himd_st['max_tracks'] == 2047, himd_st
+        assert himd_st['unique_audio_count'] < himd_st['track_count'] and himd_st['saved_bytes'] > 0, himd_st
+        call('disc', 'medium', 'md80')
 
         # 5. Record & Device tab routing, NetMD status/devices, and hardware guard checks
         assert call('disc', 'view', 'map') == 'record'
@@ -161,6 +180,7 @@ with tempfile.TemporaryDirectory(prefix='carta-md-authoring-ipc-') as directory:
             payload = json.loads(res.stdout)
             assert res.returncode != 0 and payload.get('ok') is False, (args, res.returncode, payload)
 
+        expect_fail('disc', 'track', 'part', 'add', '0', '0', '1024')
         expect_fail('netmd', 'use-mock', 'mz-n920')
         expect_fail('netmd', 'erase', 'usb:054c:0188')
         expect_fail('netmd', 'write-utoc', 'usb:054c:0188')

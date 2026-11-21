@@ -1209,27 +1209,28 @@ juce::ApplicationCommandTarget* Studio::getNextCommandTarget() {
     return nullptr;
 }
 
-bool Studio::canUseSelectionForDisc(bool appendPart) {
+bool Studio::canUseSelectionForDisc(bool updateRange) {
     return timeSelection.hasRange() &&
-           (!appendPart || (discWorkspaceVisible && discWorkspace.singleSelectedTrackIndex() >= 0));
+           (!updateRange || (discWorkspaceVisible && discWorkspace.singleSelectedTrackIndex() >= 0));
 }
 
-void Studio::useSelectionForDisc(bool appendPart) {
-    if (!canUseSelectionForDisc(appendPart)) {
-        status.setText(appendPart ? "Select a timeline time range and one MiniDisc track first."
-                                  : "Select a timeline time range first.",
+void Studio::useSelectionForDisc(bool updateRange) {
+    if (!canUseSelectionForDisc(updateRange)) {
+        status.setText(updateRange ? "Select a timeline time range and one MiniDisc track first."
+                                   : "Select a timeline time range first.",
                        juce::dontSendNotification);
         return;
     }
 
     setDiscWorkspaceVisible(true);
-    if (appendPart) {
+    if (updateRange) {
         const int idx0 = discWorkspace.singleSelectedTrackIndex();
         const auto result =
-            ipcCommand({"disc", "track", "part", "add", juce::String(idx0),
+            ipcCommand({"disc", "track", "range", juce::String(idx0),
                         juce::String(timeSelection.start), juce::String(timeSelection.end)});
-        status.setText(static_cast<bool>(result["ok"]) ? "Added timeline selection as MD part."
-                                                       : result["error"].toString(),
+        status.setText(static_cast<bool>(result["ok"])
+                           ? "Updated MiniDisc audio range from timeline selection."
+                           : result["error"].toString(),
                        juce::dontSendNotification);
     } else {
         const auto result = ipcCommand({"disc", "track", "add-selection"});
@@ -2005,7 +2006,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         mdMenu.addCommandItem(&commandManager, MenuId::mdInsertTrackFromSelection,
                               "Insert MD track from timeline selection");
         mdMenu.addCommandItem(&commandManager, MenuId::mdAppendPartFromSelection,
-                              "Append timeline selection as MD part");
+                              "Set selected MD track range from timeline selection");
         mdMenu.addSeparator();
         mdMenu.addItem(MenuId::mdPreviewFromSelected, "Preview from selected MD track",
                        singleMdTrack);

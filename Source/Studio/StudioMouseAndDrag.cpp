@@ -52,6 +52,7 @@ constexpr int auditionFromHere = 6;
 constexpr int renameTrack = 7;
 constexpr int removeTrack = 8;
 constexpr int syncFromClips = 9;
+constexpr int makeUnique = 10;
 } // namespace MdRibbonMenuId
 
 } // namespace
@@ -169,8 +170,15 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
         return false;
     };
 
-    const bool canSplitHere = hasTrack && coversStrict(info.trackIndex, clickSample);
-    const bool canSplitPlayhead = hasTrack && coversStrict(info.trackIndex, playheadSample);
+    const bool isAliased =
+        hasTrack &&
+        carta::countMdAudioRefs(
+            session.mdDisc,
+            carta::effectiveMdAudioId(session.mdDisc.tracks[static_cast<size_t>(info.trackIndex)])) >
+            1;
+    const bool canSplitHere = hasTrack && !isAliased && coversStrict(info.trackIndex, clickSample);
+    const bool canSplitPlayhead =
+        hasTrack && !isAliased && coversStrict(info.trackIndex, playheadSample);
     int mergeLeftIdx = -1;
     if (info.gesture == MdRibbonGesture::sharedSplit && hasTrack &&
         info.rightTrackIndex == info.trackIndex + 1) {
@@ -178,6 +186,16 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
     } else if (hasTrack && info.trackIndex + 1 < static_cast<int>(session.mdDisc.tracks.size())) {
         mergeLeftIdx = info.trackIndex;
     }
+    const bool canMerge =
+        mergeLeftIdx >= 0 &&
+        carta::countMdAudioRefs(
+            session.mdDisc,
+            carta::effectiveMdAudioId(session.mdDisc.tracks[static_cast<size_t>(mergeLeftIdx)])) <=
+            1 &&
+        carta::countMdAudioRefs(
+            session.mdDisc,
+            carta::effectiveMdAudioId(
+                session.mdDisc.tracks[static_cast<size_t>(mergeLeftIdx + 1)])) <= 1;
 
     struct StackedRibbonCandidate {
         int trackIndex = -1;
@@ -237,8 +255,9 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
     menu.addItem(MdRibbonMenuId::merge,
                  info.gesture == MdRibbonGesture::sharedSplit ? "Merge Split"
                                                               : "Merge with Next Track",
-                 mergeLeftIdx >= 0);
-    menu.addItem(MdRibbonMenuId::duplicateShared, "Duplicate as Shared Track", hasTrack);
+                 canMerge);
+    menu.addItem(MdRibbonMenuId::duplicateShared, "Insert Play Order Alias", hasTrack);
+    menu.addItem(MdRibbonMenuId::makeUnique, "Make Unique (Detach Alias)", isAliased);
     menu.addSeparator();
     menu.addItem(MdRibbonMenuId::auditionTrack, "Audition Track", hasTrack);
     menu.addItem(MdRibbonMenuId::auditionFromHere, "Audition from Here", hasTrack);
@@ -301,6 +320,12 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
                 if (safe->discWorkspace.onCommand) {
                     safe->discWorkspace.onCommand(
                         {"disc", "track", "duplicate", juce::String(trackIdx)}, revision);
+                }
+                break;
+            case MdRibbonMenuId::makeUnique:
+                if (safe->discWorkspace.onCommand) {
+                    safe->discWorkspace.onCommand(
+                        {"disc", "track", "detach", juce::String(trackIdx)}, revision);
                 }
                 break;
             case MdRibbonMenuId::auditionTrack:
@@ -473,6 +498,7 @@ void Studio::updateDraggedMdRibbon(const juce::ModifierKeys& mods) {
             const auto& srcTrack = mdDragBeforeDisc.tracks[static_cast<size_t>(mdDragTrack0)];
             carta::MdTrack copyTrack = srcTrack;
             copyTrack.id = carta::makeMdTrackId();
+            copyTrack.audioId.clear();
             const auto baseTitle = srcTrack.halfWidthTitle.empty()
                                        ? ("Track " + std::to_string(mdDragTrack0 + 1))
                                        : srcTrack.halfWidthTitle;
@@ -701,17 +727,39 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
             snapSession.mdDisc = mdDragBeforeDisc;
             if (mdDragGesture == MdRibbonGesture::sharedSplit && mdDragTrack0 >= 0 &&
                 mdDragRightTrack0 >= 0) {
+                const auto leftKey = carta::effectiveMdAudioId(
+                    mdDragBeforeDisc.tracks[static_cast<size_t>(mdDragTrack0)]);
+                const auto rightKey = carta::effectiveMdAudioId(
+                    mdDragBeforeDisc.tracks[static_cast<size_t>(mdDragRightTrack0)]);
                 auto& lParts = snapSession.mdDisc.tracks[static_cast<size_t>(mdDragTrack0)].parts;
                 auto& rParts =
                     snapSession.mdDisc.tracks[static_cast<size_t>(mdDragRightTrack0)].parts;
                 lParts[static_cast<size_t>(mdDragPart0)].endSample =
                     rParts[static_cast<size_t>(mdDragRightPart0)].endSample;
                 rParts.erase(rParts.begin() + mdDragRightPart0);
+                for (size_t ti = 0; ti < snapSession.mdDisc.tracks.size(); ++ti) {
+                    if (static_cast<int>(ti) == mdDragTrack0 ||
+                        static_cast<int>(ti) == mdDragRightTrack0) {
+                        continue;
+                    }
+                    const auto key = carta::effectiveMdAudioId(snapSession.mdDisc.tracks[ti]);
+                    if (key == leftKey || key == rightKey) {
+                        snapSession.mdDisc.tracks[ti].parts.clear();
+                    }
+                }
             } else if (mdDragGesture == MdRibbonGesture::leftEdge ||
                        mdDragGesture == MdRibbonGesture::rightEdge ||
                        mdDragGesture == MdRibbonGesture::slideBody) {
+                const auto draggedKey = carta::effectiveMdAudioId(
+                    mdDragBeforeDisc.tracks[static_cast<size_t>(mdDragTrack0)]);
                 auto& parts = snapSession.mdDisc.tracks[static_cast<size_t>(mdDragTrack0)].parts;
                 parts.erase(parts.begin() + mdDragPart0);
+                for (size_t ti = 0; ti < snapSession.mdDisc.tracks.size(); ++ti) {
+                    if (static_cast<int>(ti) != mdDragTrack0 &&
+                        carta::effectiveMdAudioId(snapSession.mdDisc.tracks[ti]) == draggedKey) {
+                        snapSession.mdDisc.tracks[ti].parts.clear();
+                    }
+                }
             }
             const auto snapSel = timeSelection;
             const double snapPos = position;

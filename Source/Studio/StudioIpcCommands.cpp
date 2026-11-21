@@ -63,16 +63,12 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
     const auto budget =
         utocOk ? carta::computeUtocBudget(utoc, carta::mdMediumToString(d.medium), physTotal)
                : carta::UtocBudget{};
-    std::int64_t hiMdEstBytes = 0;
-    if (isHiMd) {
-        for (const auto& tr : d.tracks) {
-            hiMdEstBytes +=
-                carta::estimateHiMdTrackBytes(carta::effectiveTrackCodec(d, tr), tr.totalSamples());
-        }
-        if (!d.tracks.empty()) {
-            hiMdEstBytes += static_cast<std::int64_t>(d.tracks.size()) * 32768LL + 65536LL;
-        }
-    }
+    const std::int64_t hiMdEstBytes =
+        isHiMd ? (plan.hiMdUniqueBytes +
+                  (plan.uniqueAudioTrackCount > 0
+                       ? static_cast<std::int64_t>(plan.uniqueAudioTrackCount) * 32768LL + 65536LL
+                       : 0LL))
+               : 0LL;
 
     auto* b = buildUtocBudgetObject(budget);
 
@@ -122,15 +118,28 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
     planObj->setProperty("logical_play_samples", static_cast<juce::int64>(plan.logicalPlaySamples));
     planObj->setProperty("unique_physical_samples",
                          static_cast<juce::int64>(plan.uniquePhysicalSamples));
+    planObj->setProperty("play_order_tracks", plan.playOrderTrackCount);
+    planObj->setProperty("unique_audio_tracks", plan.uniqueAudioTrackCount);
+    planObj->setProperty("aliased_tracks", plan.aliasedTrackCount);
+    planObj->setProperty("hi_md_unique_bytes", static_cast<juce::int64>(plan.hiMdUniqueBytes));
+    planObj->setProperty("hi_md_unaliased_bytes",
+                         static_cast<juce::int64>(plan.hiMdUnaliasedBytes));
+    planObj->setProperty("hi_md_saved_bytes", static_cast<juce::int64>(plan.hiMdSavedBytes));
     planObj->setProperty("spans", juce::var(spanArr));
     planObj->setProperty("placements", juce::var(placeArr));
 
     juce::Array<juce::var> tracksArr;
     for (size_t ti = 0; ti < d.tracks.size(); ++ti) {
         const auto& tr = d.tracks[ti];
+        const std::string effAudioId = carta::effectiveMdAudioId(tr);
+        const int aliasRefs = carta::countMdAudioRefs(d, effAudioId);
         auto* to = new juce::DynamicObject();
         to->setProperty("index", static_cast<int>(ti));
         to->setProperty("id", juce::String::fromUTF8(tr.id.c_str()));
+        to->setProperty("audio_id", juce::String::fromUTF8(effAudioId.c_str()));
+        to->setProperty("alias_count", aliasRefs);
+        to->setProperty("is_aliased", aliasRefs > 1);
+        to->setProperty("fragment_count", static_cast<int>(tr.parts.size()));
         to->setProperty("half_width_title", juce::String::fromUTF8(tr.halfWidthTitle.c_str()));
         to->setProperty("full_width_title", juce::String::fromUTF8(tr.fullWidthTitle.c_str()));
         to->setProperty("artist", juce::String::fromUTF8(tr.artist.c_str()));
@@ -178,6 +187,8 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
         root->setProperty("capacity_bytes",
                           static_cast<juce::int64>(carta::hiMdMediumCapacityBytes(d.medium)));
         root->setProperty("estimated_bytes", static_cast<juce::int64>(hiMdEstBytes));
+        root->setProperty("unaliased_bytes", static_cast<juce::int64>(plan.hiMdUnaliasedBytes));
+        root->setProperty("saved_bytes", static_cast<juce::int64>(plan.hiMdSavedBytes));
     }
     root->setProperty("default_codec", juce::String(carta::mdCodecModeToString(d.defaultCodec)));
     root->setProperty("auto_track_on_import", d.autoTrackOnImport);
@@ -185,6 +196,9 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
     root->setProperty("full_width_title", juce::String::fromUTF8(d.fullWidthTitle.c_str()));
     root->setProperty("timestamp", juce::String::fromUTF8(d.discTimestamp.c_str()));
     root->setProperty("track_count", static_cast<int>(d.tracks.size()));
+    root->setProperty("max_tracks", carta::mdMaxTracks(d.medium));
+    root->setProperty("unique_audio_count", plan.uniqueAudioTrackCount);
+    root->setProperty("aliased_track_count", plan.aliasedTrackCount);
     root->setProperty("group_count", static_cast<int>(d.groups.size()));
     root->setProperty("plan_valid", planOk);
     root->setProperty("plan_error", juce::String::fromUTF8(planErr.c_str()));
@@ -369,16 +383,16 @@ juce::var handleSchemaCommand(const juce::StringArray& args) {
     domains->setProperty(
         "disc",
         makeDomain(
-            "MiniDisc & Hi-MD tracks, sequential parts, coalesced spans, groups, titles, "
-            "metadata, and Disc workspace tabs",
+            "MiniDisc & Hi-MD Audio Pool, Play Order aliasing, coalesced spans, groups, titles, "
+            "metadata, and Disc workspace views",
             {"disc status", "disc view tracks|record|open|close|status",
              "disc medium md60|md74|md80|himd300|himd1gb",
              "disc codec sp-stereo|sp-mono|lp2|lp4|hi-sp|hi-lp|pcm",
              "disc auto-track on|off", "disc title HALF [FULL]", "disc title-forms HALF FULL",
              "disc timestamp [ISO|clear]", "disc sync clips|layer1|markers",
-             "disc track add|add-selection|remove|move|duplicate|split|merge|rename|title-forms|"
-             "metadata|flags|part",
-             "disc group set|clear", "disc focus TRACK_INDEX [PART_INDEX]",
+             "disc track add|add-selection|remove|move|duplicate|alias|alias-audio|detach|range|"
+             "split|merge|rename|title-forms|metadata|flags",
+             "disc group set|clear", "disc focus TRACK_INDEX",
              "disc preview [TRACK_INDEX | from TRACK_INDEX]"}));
     domains->setProperty(
         "utoc",
@@ -496,7 +510,7 @@ struct Studio::IpcRouter {
                                  std::string& mdErr,
                                  const std::function<bool(const std::string&)>& fail,
                                  const carta::TimeSelection& capturedSelection) {
-        if (args[2] == "add" && (args.size() == 5 || args.size() == 6 || args.size() == 7)) {
+        if (args[2] == "add" && args.size() >= 5 && args.size() <= 8) {
             juce::int64 start = 0;
             juce::int64 end = 0;
             juce::int64 ins = static_cast<juce::int64>(d.tracks.size());
@@ -505,12 +519,23 @@ struct Studio::IpcRouter {
                 return fail("Track START and END must specify a valid positive range.");
             }
             const std::string title = args.size() >= 6 ? args[5].toStdString() : std::string{};
-            if (args.size() == 7 && !parseNonNegativeIpcInt(args[6], ins)) {
+            if (args.size() >= 7 && !parseNonNegativeIpcInt(args[6], ins)) {
                 return fail("Insert index must be a nonnegative integer.");
             }
             carta::MdTrack track;
             track.id = carta::makeMdTrackId();
             track.halfWidthTitle = title;
+            if (args.size() == 8) {
+                const auto codecTok = args[7].trim();
+                if (codecTok.isNotEmpty() && codecTok != "default" && codecTok != "clear") {
+                    carta::MdCodecMode mode = d.defaultCodec;
+                    if (!carta::parseMdCodecMode(codecTok.toStdString(), mode)) {
+                        return fail("Track codec must be sp-stereo, sp-mono, lp2, lp4, hi-sp, "
+                                    "hi-lp, pcm, or default.");
+                    }
+                    track.codecOverride = mode;
+                }
+            }
             track.parts.push_back({start, end});
             preferredTrackId = juce::String::fromUTF8(track.id.c_str());
             actionLabel = "Add MiniDisc track";
@@ -595,51 +620,89 @@ struct Studio::IpcRouter {
             actionLabel = "Clone MiniDisc track";
             return true;
         }
-        if (args[2] == "add-parts" && args.size() >= 8 && (args.size() - 6) % 2 == 0) {
+        if (args[2] == "alias" && args.size() == 5) {
+            juce::int64 src = 0;
             juce::int64 dest = 0;
-            if (!parseNonNegativeIpcInt(args[3], dest) ||
+            if (!parseNonNegativeIpcInt(args[3], src) || !parseNonNegativeIpcInt(args[4], dest) ||
+                src >= static_cast<juce::int64>(d.tracks.size()) ||
                 dest > static_cast<juce::int64>(d.tracks.size())) {
-                return fail("Insert index must be between 0 and track count.");
+                return fail("MD track alias index out of range.");
             }
-            carta::MdTrack track;
-            track.id = carta::makeMdTrackId();
-            track.halfWidthTitle = args[4].toStdString();
-            const auto codecTok = args[5].trim();
-            if (codecTok.isNotEmpty() && codecTok != "default" && codecTok != "clear") {
-                carta::MdCodecMode mode = d.defaultCodec;
-                if (!carta::parseMdCodecMode(codecTok.toStdString(), mode)) {
-                    return fail(
-                        "Track codec must be sp-stereo, sp-mono, lp2, lp4, hi-sp, hi-lp, pcm, or "
-                        "default.");
-                }
-                track.codecOverride = mode;
+            if (!carta::aliasMdTrackAtPosition(d, static_cast<int>(src), static_cast<int>(dest),
+                                               mdErr)) {
+                return fail(mdErr);
             }
-            for (int a = 6; a + 1 < args.size(); a += 2) {
-                juce::int64 s0 = 0;
-                juce::int64 e0 = 0;
-                if (!carta::parseSampleOrTime(args[a], s0) ||
-                    !carta::parseSampleOrTime(args[a + 1], e0) || e0 <= s0) {
-                    return fail("Each part must specify valid START < END.");
-                }
-                track.parts.push_back({s0, e0});
+            if (dest >= 0 && dest < static_cast<juce::int64>(d.tracks.size())) {
+                preferredTrackId =
+                    juce::String::fromUTF8(d.tracks[static_cast<size_t>(dest)].id.c_str());
             }
-            preferredTrackId = juce::String::fromUTF8(track.id.c_str());
-            actionLabel = "Paste MiniDisc track";
-            return carta::insertMdTrack(d, static_cast<int>(dest) + 1, std::move(track), mdErr) ||
-                   fail(mdErr);
+            actionLabel = "Insert Play Order alias";
+            return true;
+        }
+        if (args[2] == "alias-audio" && args.size() == 5) {
+            juce::int64 dest = 0;
+            if (!parseNonNegativeIpcInt(args[4], dest) ||
+                dest > static_cast<juce::int64>(d.tracks.size())) {
+                return fail("Destination track index out of range.");
+            }
+            if (!carta::insertMdAliasByAudioId(d, args[3].toStdString(), static_cast<int>(dest),
+                                               mdErr)) {
+                return fail(mdErr);
+            }
+            if (dest >= 0 && dest < static_cast<juce::int64>(d.tracks.size())) {
+                preferredTrackId =
+                    juce::String::fromUTF8(d.tracks[static_cast<size_t>(dest)].id.c_str());
+            }
+            actionLabel = "Insert Play Order alias";
+            return true;
+        }
+        if (args[2] == "detach" && args.size() == 4) {
+            juce::int64 idx = 0;
+            if (!parseNonNegativeIpcInt(args[3], idx) ||
+                idx >= static_cast<juce::int64>(d.tracks.size())) {
+                return fail("MD track index out of range.");
+            }
+            if (!carta::detachMdTrackAlias(d, static_cast<int>(idx), mdErr)) {
+                return fail(mdErr);
+            }
+            preferredTrackId =
+                juce::String::fromUTF8(d.tracks[static_cast<size_t>(idx)].id.c_str());
+            actionLabel = "Make MiniDisc track unique";
+            return true;
+        }
+        if (args[2] == "range" && args.size() == 6) {
+            juce::int64 idx = 0;
+            juce::int64 s0 = 0;
+            juce::int64 e0 = 0;
+            if (!parseNonNegativeIpcInt(args[3], idx) ||
+                idx >= static_cast<juce::int64>(d.tracks.size())) {
+                return fail("MD track index out of range.");
+            }
+            if (!carta::parseSampleOrTime(args[4], s0) || !carta::parseSampleOrTime(args[5], e0) ||
+                e0 <= s0) {
+                return fail("Track range must satisfy START < END.");
+            }
+            if (!carta::setMdTrackRange(d, static_cast<int>(idx), s0, e0, mdErr)) {
+                return fail(mdErr);
+            }
+            preferredTrackId =
+                juce::String::fromUTF8(d.tracks[static_cast<size_t>(idx)].id.c_str());
+            actionLabel = "Set MiniDisc track range";
+            return true;
         }
         if (args[2] == "duplicate" && (args.size() == 4 || args.size() == 5)) {
             juce::int64 idx = 0;
             juce::int64 count = 1;
+            const int maxCount = carta::mdMaxTracks(d.medium);
             if (!parseNonNegativeIpcInt(args[3], idx) ||
                 idx >= static_cast<juce::int64>(d.tracks.size())) {
                 return fail("MD track index out of range.");
             }
             if (args.size() == 5 &&
-                (!parseNonNegativeIpcInt(args[4], count) || count < 1 || count > 64)) {
-                return fail("Duplicate count must be 1..64.");
+                (!parseNonNegativeIpcInt(args[4], count) || count < 1 || count > maxCount)) {
+                return fail("Duplicate count must be 1.." + std::to_string(maxCount) + ".");
             }
-            actionLabel = "Duplicate MiniDisc track";
+            actionLabel = "Alias MiniDisc track";
             for (juce::int64 c = 0; c < count; ++c) {
                 if (!carta::duplicateMdTrack(d, static_cast<int>(idx + c), mdErr)) {
                     return fail(mdErr);
@@ -697,6 +760,7 @@ struct Studio::IpcRouter {
                 return fail("Track title is unchanged.");
             }
             tr.halfWidthTitle = next;
+            carta::syncAliasedMdTracks(d, static_cast<int>(idx));
             preferredTrackId = juce::String::fromUTF8(tr.id.c_str());
             actionLabel = "Rename MiniDisc track";
             return carta::validateMdDisc(d, mdErr) || fail(mdErr);
@@ -715,6 +779,7 @@ struct Studio::IpcRouter {
             }
             tr.halfWidthTitle = half;
             tr.fullWidthTitle = full;
+            carta::syncAliasedMdTracks(d, static_cast<int>(idx));
             preferredTrackId = juce::String::fromUTF8(tr.id.c_str());
             actionLabel = "Set MD track title forms";
             return carta::validateMdDisc(d, mdErr) || fail(mdErr);
@@ -733,6 +798,7 @@ struct Studio::IpcRouter {
             }
             tr.artist = artist;
             tr.album = album;
+            carta::syncAliasedMdTracks(d, static_cast<int>(idx));
             preferredTrackId = juce::String::fromUTF8(tr.id.c_str());
             actionLabel = "Set MD track metadata";
             return carta::validateMdDisc(d, mdErr) || fail(mdErr);
@@ -817,93 +883,10 @@ struct Studio::IpcRouter {
                 return fail("MD track flags are unchanged.");
             }
             d.tracks[static_cast<size_t>(idx)] = nextTr;
+            carta::syncAliasedMdTracks(d, static_cast<int>(idx));
             preferredTrackId = juce::String::fromUTF8(nextTr.id.c_str());
             actionLabel = "Update MD track flags";
             return carta::validateMdDisc(d, mdErr) || fail(mdErr);
-        }
-        if (args[2] == "part" && args.size() >= 6) {
-            juce::int64 idx = 0;
-            if (!parseNonNegativeIpcInt(args[4], idx) ||
-                idx >= static_cast<juce::int64>(d.tracks.size())) {
-                return fail("MD track index out of range.");
-            }
-            auto& tr = d.tracks[static_cast<size_t>(idx)];
-            preferredTrackId = juce::String::fromUTF8(tr.id.c_str());
-            if (args[3] == "add" && (args.size() == 7 || args.size() == 8)) {
-                juce::int64 s0 = 0;
-                juce::int64 e0 = 0;
-                juce::int64 pIns = static_cast<juce::int64>(tr.parts.size());
-                if (!carta::parseSampleOrTime(args[5], s0) ||
-                    !carta::parseSampleOrTime(args[6], e0) || e0 <= s0) {
-                    return fail("Part range must satisfy START < END.");
-                }
-                if (args.size() == 8 && (!parseNonNegativeIpcInt(args[7], pIns) ||
-                                         pIns > static_cast<juce::int64>(tr.parts.size()))) {
-                    return fail("Part insert index out of range.");
-                }
-                tr.parts.insert(tr.parts.begin() + static_cast<ptrdiff_t>(pIns), {s0, e0});
-                actionLabel = "Add UTOC part";
-                return carta::validateMdDisc(d, mdErr) || fail(mdErr);
-            }
-            if (args[3] == "set" && args.size() == 8) {
-                juce::int64 pIdx = 0;
-                juce::int64 s0 = 0;
-                juce::int64 e0 = 0;
-                if (!parseNonNegativeIpcInt(args[5], pIdx) ||
-                    pIdx >= static_cast<juce::int64>(tr.parts.size())) {
-                    return fail("Part index out of range.");
-                }
-                if (!carta::parseSampleOrTime(args[6], s0) ||
-                    !carta::parseSampleOrTime(args[7], e0) || e0 <= s0) {
-                    return fail("Part range must satisfy START < END.");
-                }
-                tr.parts[static_cast<size_t>(pIdx)] = {s0, e0};
-                actionLabel = "Set UTOC part range";
-                return carta::validateMdDisc(d, mdErr) || fail(mdErr);
-            }
-            if (args[3] == "repeat" && args.size() == 7) {
-                juce::int64 pIdx = 0;
-                juce::int64 count = 1;
-                if (!parseNonNegativeIpcInt(args[5], pIdx) ||
-                    pIdx >= static_cast<juce::int64>(tr.parts.size())) {
-                    return fail("Part index out of range.");
-                }
-                if (!parseNonNegativeIpcInt(args[6], count) || count < 1 || count > 64) {
-                    return fail("Repeat count must be 1..64.");
-                }
-                const auto copyPart = tr.parts[static_cast<size_t>(pIdx)];
-                tr.parts.insert(tr.parts.begin() + static_cast<ptrdiff_t>(pIdx + 1),
-                                static_cast<size_t>(count), copyPart);
-                actionLabel = "Repeat UTOC part";
-                return carta::validateMdDisc(d, mdErr) || fail(mdErr);
-            }
-            if (args[3] == "remove" && args.size() == 6) {
-                juce::int64 pIdx = 0;
-                if (!parseNonNegativeIpcInt(args[5], pIdx) ||
-                    pIdx >= static_cast<juce::int64>(tr.parts.size())) {
-                    return fail("Part index out of range.");
-                }
-                if (tr.parts.size() <= 1) {
-                    return fail("A MiniDisc track must keep at least one part.");
-                }
-                tr.parts.erase(tr.parts.begin() + static_cast<ptrdiff_t>(pIdx));
-                actionLabel = "Remove UTOC part";
-                return carta::validateMdDisc(d, mdErr) || fail(mdErr);
-            }
-            if (args[3] == "move" && args.size() == 7) {
-                juce::int64 fromP = 0;
-                juce::int64 toP = 0;
-                if (!parseNonNegativeIpcInt(args[5], fromP) ||
-                    !parseNonNegativeIpcInt(args[6], toP) ||
-                    fromP >= static_cast<juce::int64>(tr.parts.size()) ||
-                    toP >= static_cast<juce::int64>(tr.parts.size())) {
-                    return fail("Part index out of range.");
-                }
-                actionLabel = "Move UTOC part";
-                return carta::moveMdTrackPart(d, static_cast<int>(idx), static_cast<int>(fromP),
-                                              static_cast<int>(toP), mdErr) ||
-                       fail(mdErr);
-            }
         }
         return fail("Unknown or invalid ipc disc track command.");
     }
@@ -5067,8 +5050,12 @@ struct Studio::IpcRouter {
             auto* preObj = new juce::DynamicObject();
             preObj->setProperty("valid", pre.valid);
             preObj->setProperty("tracks_to_upload", pre.tracksToUpload);
+            preObj->setProperty("unique_audio_tracks_to_upload", pre.uniqueAudioTracksToUpload);
             preObj->setProperty("estimated_audio_bytes",
                                 static_cast<juce::int64>(pre.estimatedAudioBytes));
+            preObj->setProperty("unaliased_audio_bytes",
+                                static_cast<juce::int64>(pre.unaliasedAudioBytes));
+            preObj->setProperty("saved_bytes", static_cast<juce::int64>(pre.savedBytes));
             preObj->setProperty("required_bytes", static_cast<juce::int64>(pre.requiredBytes));
             preObj->setProperty("disc_total_bytes", static_cast<juce::int64>(pre.discTotalBytes));
             preObj->setProperty("disc_free_bytes", static_cast<juce::int64>(pre.discFreeBytes));

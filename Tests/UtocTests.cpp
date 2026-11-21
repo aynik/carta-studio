@@ -760,6 +760,62 @@ void testComplexLoadedDisc240TracksAndReclaim() {
     }
 }
 
+void testPlayOrderAliasUtocAndRoundtrip() {
+    std::string err;
+    carta::MdDisc disc;
+    disc.medium = carta::MdMedium::md80;
+    disc.defaultCodec = carta::MdCodecMode::lp4;
+    disc.halfWidthTitle = "24HCLK UTOC";
+
+    // 120 unique speech announcements (short <=7-char title -> 1 cell each = 120 cells) +
+    // 5 unique shared music loops (12-char multi-cell titles -> 2 cells each = 10 cells) aliased
+    // 24 times each (120 tracks) = 240 total tracks, 125 unique items, 24 groups. Without Sector 1
+    // title sharing by audioId, 120 * 2 + 120 = 360 > 255 title cells and compilation would fail.
+    std::int64_t pos = 0;
+    std::vector<carta::MdTrack> sharedMusic(5);
+    for (int m = 0; m < 5; ++m) {
+        sharedMusic[static_cast<std::size_t>(m)].audioId = carta::makeMdAudioId();
+        sharedMusic[static_cast<std::size_t>(m)].halfWidthTitle =
+            "Music Theme " + std::to_string(m + 1);
+        sharedMusic[static_cast<std::size_t>(m)].parts = {{pos, pos + 44032}};
+        pos += 44032;
+    }
+    for (int h = 0; h < 24; ++h) {
+        const int start1 = static_cast<int>(disc.tracks.size()) + 1;
+        for (int s = 0; s < 5; ++s) {
+            carta::MdTrack sp;
+            sp.id = carta::makeMdTrackId();
+            sp.halfWidthTitle = "T" + std::to_string(h) + "_" + std::to_string(s);
+            sp.parts = {{pos, pos + 11264}};
+            pos += 11264;
+            disc.tracks.push_back(std::move(sp));
+
+            carta::MdTrack mu = sharedMusic[static_cast<std::size_t>(s)];
+            mu.id = carta::makeMdTrackId();
+            disc.tracks.push_back(std::move(mu));
+        }
+        disc.groups.push_back({start1, static_cast<int>(disc.tracks.size()),
+                               "H" + std::to_string(h), {}});
+    }
+
+    carta::UtocDiscState utoc{};
+    check(carta::compileMdDiscToUtoc(disc, utoc, err),
+          "compileMdDiscToUtoc compiles 240-track 24HCLK with shared Sector 1 title slots: " + err);
+    const auto budget = carta::computeUtocBudget(utoc, "md80");
+    check(budget.fits() && budget.usedTracks == 240 && budget.usedHalfWidthCells <= 255 &&
+              budget.sharedFragmentCount > 0,
+          "24HCLK UTOC fits within 255 tracks and 255 Sector 1 cells via title & fragment sharing");
+
+    carta::MdDisc roundtripped;
+    check(carta::mdDiscFromUtoc(utoc, roundtripped, err),
+          "mdDiscFromUtoc roundtrips 240-track 24HCLK disc cleanly: " + err);
+    check(roundtripped.tracks.size() == 240 && roundtripped.groups.size() == 24,
+          "Roundtripped 24HCLK preserves all 240 Play Order tracks and 24 groups");
+    const std::string decodedMusicId = carta::effectiveMdAudioId(roundtripped.tracks[1]);
+    check(carta::countMdAudioRefs(roundtripped, decodedMusicId) == 24,
+          "mdDiscFromUtoc reconstructs 24-way shared audioId across aliased music tracks");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -775,6 +831,7 @@ int main(int argc, char** argv) {
     testMdFlagsAndImportedUtocPreservation();
     testOverflowLimits();
     testComplexLoadedDisc240TracksAndReclaim();
+    testPlayOrderAliasUtocAndRoundtrip();
     if (gFailures == 0) {
         std::cout << "UtocTests passed.\n";
         return 0;

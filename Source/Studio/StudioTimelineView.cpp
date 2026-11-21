@@ -111,7 +111,17 @@ std::vector<Studio::MdRibbonHit> Studio::layoutMdRibbonHits(juce::Rectangle<int>
     }
 
     std::map<std::pair<std::int64_t, std::int64_t>, int> spanCounts;
-    for (const auto& tr : session.mdDisc.tracks) {
+    std::map<std::string, int> audioAliasCounts;
+    std::map<std::string, size_t> repTrackForAudio;
+    const auto primaryId = discWorkspace.primaryTrackId();
+    for (size_t ti = 0; ti < session.mdDisc.tracks.size(); ++ti) {
+        const auto& tr = session.mdDisc.tracks[ti];
+        const std::string audioKey = carta::effectiveMdAudioId(tr);
+        ++audioAliasCounts[audioKey];
+        if (!repTrackForAudio.count(audioKey) ||
+            (primaryId.isNotEmpty() && tr.id == primaryId.toStdString())) {
+            repTrackForAudio[audioKey] = ti;
+        }
         for (const auto& part : tr.parts) {
             ++spanCounts[{part.startSample, part.endSample}];
         }
@@ -119,6 +129,10 @@ std::vector<Studio::MdRibbonHit> Studio::layoutMdRibbonHits(juce::Rectangle<int>
 
     for (size_t ti = 0; ti < session.mdDisc.tracks.size(); ++ti) {
         const auto& tr = session.mdDisc.tracks[ti];
+        const std::string audioKey = carta::effectiveMdAudioId(tr);
+        if (repTrackForAudio[audioKey] != ti) {
+            continue;
+        }
         const auto id = juce::String::fromUTF8(tr.id.c_str());
         auto title = juce::String::fromUTF8(tr.halfWidthTitle.c_str()).trim();
         if (title.isEmpty()) {
@@ -128,6 +142,7 @@ std::vector<Studio::MdRibbonHit> Studio::layoutMdRibbonHits(juce::Rectangle<int>
             title = "Track " + juce::String(static_cast<int>(ti + 1));
         }
 
+        const int aliasCount = audioAliasCounts[audioKey];
         for (size_t pi = 0; pi < tr.parts.size(); ++pi) {
             const auto& part = tr.parts[pi];
             const int x0 =
@@ -139,7 +154,7 @@ std::vector<Studio::MdRibbonHit> Studio::layoutMdRibbonHits(juce::Rectangle<int>
             if (clamped1 <= clamped0) {
                 continue;
             }
-            const int count = spanCounts[{part.startSample, part.endSample}];
+            const int count = std::max(spanCounts[{part.startSample, part.endSample}], aliasCount);
             const bool shared = count > 1;
             hits.push_back({static_cast<int>(ti),
                             static_cast<int>(pi),
@@ -216,8 +231,21 @@ Studio::MdRibbonPointerInfo Studio::classifyMdRibbonPointer(juce::Point<int> poi
         return title;
     };
 
+    std::map<std::string, size_t> repTrackForAudio;
     for (size_t ti = 0; ti < session.mdDisc.tracks.size(); ++ti) {
         const auto& tr = session.mdDisc.tracks[ti];
+        const std::string audioKey = carta::effectiveMdAudioId(tr);
+        if (!repTrackForAudio.count(audioKey) ||
+            (primary.isNotEmpty() && tr.id == primary.toStdString())) {
+            repTrackForAudio[audioKey] = ti;
+        }
+    }
+
+    for (size_t ti = 0; ti < session.mdDisc.tracks.size(); ++ti) {
+        const auto& tr = session.mdDisc.tracks[ti];
+        if (repTrackForAudio[carta::effectiveMdAudioId(tr)] != ti) {
+            continue;
+        }
         const auto id = juce::String::fromUTF8(tr.id.c_str());
         const auto title = titleFor(ti);
         for (size_t pi = 0; pi < tr.parts.size(); ++pi) {

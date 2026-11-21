@@ -523,30 +523,30 @@ struct StudioComponentTests {
                       !dock.leftCardBounds.isEmpty() && !dock.rightCardBounds.isEmpty(),
                   "Tracks tab split pane cards do not overlap");
             check(!rectsOverlap(
-                      {dock.insertTrackButton.getBounds(), dock.duplicateTrackButton.getBounds(),
-                       dock.splitTrackButton.getBounds(), dock.moveUpButton.getBounds(),
-                       dock.moveDownButton.getBounds(), dock.removeTrackButton.getBounds(),
-                       dock.groupMenuButton.getBounds()}),
-                  "Left track action bar buttons do not overlap");
-            check(!rectsOverlap({dock.partsHeaderLabel.getBounds(), dock.addPartButton.getBounds(),
-                                 dock.partBankButton.getBounds()}),
-                  "Right inspector part header and bank buttons do not overlap");
-            check(!rectsOverlap(
-                      {dock.partUpButton.getBounds(), dock.partDownButton.getBounds(),
-                       dock.setPartSelButton.getBounds(), dock.repeatPartButton.getBounds(),
-                       dock.delPartButton.getBounds(), dock.seekPartButton.getBounds()}),
-                  "Right inspector part action bar buttons do not overlap");
-            check(!rectsOverlap({dock.partsList.getBounds(), dock.partBankButton.getBounds(),
-                                 dock.partUpButton.getBounds()}),
-                  "Parts list does not overlap part action buttons");
+                      {dock.insertTrackButton.getBounds(), dock.insertAliasButton.getBounds(),
+                       dock.duplicateTrackButton.getBounds(), dock.splitTrackButton.getBounds(),
+                       dock.moveUpButton.getBounds(), dock.moveDownButton.getBounds(),
+                       dock.removeTrackButton.getBounds(), dock.groupMenuButton.getBounds()}),
+                  "Left Play Order action bar buttons do not overlap");
             check(rectsInsideBounds(
-                      {dock.partBankButton.getBounds(), dock.addPartButton.getBounds(),
-                       dock.partUpButton.getBounds(), dock.partDownButton.getBounds(),
-                       dock.setPartSelButton.getBounds(), dock.repeatPartButton.getBounds(),
-                       dock.delPartButton.getBounds(), dock.seekPartButton.getBounds(),
-                       dock.partsList.getBounds()},
-                      dock.rightCardBounds),
-                  "Single-track inspector part controls stay inside right card at all widths");
+                      {dock.insertTrackButton.getBounds(), dock.insertAliasButton.getBounds(),
+                       dock.duplicateTrackButton.getBounds(), dock.splitTrackButton.getBounds(),
+                       dock.moveUpButton.getBounds(), dock.moveDownButton.getBounds(),
+                       dock.removeTrackButton.getBounds(), dock.groupMenuButton.getBounds()},
+                      dock.leftCardBounds),
+                  "Left Play Order action buttons stay inside left card at all widths");
+            check(!rectsOverlap({dock.seekAudioButton.getBounds(),
+                                 dock.setAudioSelButton.getBounds(),
+                                 dock.detachAliasButton.getBounds()}),
+                  "Audio Pool Source action bar buttons do not overlap");
+            check(rectsInsideBounds({dock.audioSourceHeaderLabel.getBounds(),
+                                     dock.seekAudioButton.getBounds(),
+                                     dock.setAudioSelButton.getBounds(),
+                                     dock.detachAliasButton.getBounds()},
+                                    dock.audioSourceCardBounds) &&
+                      rectsInsideBounds({dock.audioSourceCardBounds}, dock.rightCardBounds),
+                  "Single-track inspector Audio Source card and controls stay inside right card "
+                  "at all widths");
             if (w == 1180) {
                 check(rectsInsideBounds(
                           {dock.mdLabel.getBounds(), dock.discTitleEditor.getBounds(),
@@ -558,21 +558,17 @@ struct StudioComponentTests {
                            dock.previewFromButton.getBounds(), dock.reviewWavButton.getBounds()},
                           local),
                       "All Row 1 and Row 2 controls stay inside 1180px panel bounds");
-                check(rectsInsideBounds(
-                          {dock.insertTrackButton.getBounds(),
-                           dock.duplicateTrackButton.getBounds(), dock.splitTrackButton.getBounds(),
-                           dock.moveUpButton.getBounds(), dock.moveDownButton.getBounds(),
-                           dock.removeTrackButton.getBounds(), dock.groupMenuButton.getBounds()},
-                          dock.leftCardBounds),
-                      "Left track action buttons stay inside left card at 1180px");
             }
         }
 
         check(dock.trackTitleEditor.isVisible() && dock.trackFormsButton.isVisible() &&
                   dock.trackFlagsButton.isVisible() && dock.trackCodecBox.isVisible() &&
-                  dock.trackGroupButton.isVisible() && dock.partsList.isVisible() &&
-                  !dock.emptyTitleLabel.isVisible() && !dock.multiHeaderLabel.isVisible(),
-              "Single selected MD track shows inspector and hides empty/multi views");
+                  dock.trackGroupButton.isVisible() && dock.audioSourceHeaderLabel.isVisible() &&
+                  dock.seekAudioButton.isVisible() && dock.setAudioSelButton.isVisible() &&
+                  dock.detachAliasButton.isVisible() && !dock.emptyTitleLabel.isVisible() &&
+                  !dock.multiHeaderLabel.isVisible(),
+              "Single selected Play Order track shows inspector Audio Source card and hides "
+              "empty/multi views");
 
         juce::SparseSet<int> multiRows;
         multiRows.addRange({0, 2});
@@ -700,7 +696,8 @@ struct StudioComponentTests {
                       static_cast<int>(dock.planRows.size()),
               "IPC disc view playback switches Tab 2 back to logical Playback view");
 
-        // Verify loaded on-disc PartRow addresses, shared ref counts, and reclaimed AudioBankRows
+        // Verify loaded on-disc TrackRow ref counts, fragmented track summary, and reclaimed
+        // AudioBankRows
         {
             Studio loadedStudio;
             loadedStudio.setSize(1180, 760);
@@ -722,17 +719,21 @@ struct StudioComponentTests {
                 {carta::makeMdTrackId(), "Alias T2", {}, {}, false, false, false, {},
                  {{0, 90112}}},
                 {carta::makeMdTrackId(), "Disc T3", {}, {}, false, false, false, {},
-                 {{90112, 180224}}}};
+                 {{90112, 135168}, {135168, 180224}}}};
             carta::populateLoadedDiscSession(loadedDisc, loadedStudio.session);
             loadedStudio.refreshCommittedMasterRange();
             loadedStudio.setDiscWorkspaceVisible(true);
             loadedStudio.refreshDiscWorkspace(true);
 
             const auto& ldDock = loadedStudio.discWorkspace;
-            check(ldDock.partRows.size() == 1 && ldDock.partRows[0].isOnDisc &&
-                      ldDock.partRows[0].sharedRefCount == 2 && ldDock.partRows[0].sharedSpan &&
-                      ldDock.trackRows[0].maxSharedRefs == 2,
-                  "Loaded on-disc partRows report isOnDisc and accurate sharedRefCount == 2");
+            check(ldDock.trackRows.size() == 3 && ldDock.trackRows[0].onDisc &&
+                      ldDock.trackRows[0].maxSharedRefs == 2 &&
+                      ldDock.trackRows[0].sharesPhysicalSpan &&
+                      ldDock.trackRows[2].partCount == 2 &&
+                      ldDock.planRows[2].partHopsText.isNotEmpty() &&
+                      ldDock.audioSourceHeaderLabel.isVisible(),
+                  "Loaded on-disc trackRows report onDisc/sharedRefs and fragmented 2-part track "
+                  "displays fragment count + hop text cleanly");
             check(static_cast<bool>(
                       loadedStudio.ipcCommand({"disc", "track", "remove", "2"})["ok"]),
                   "Remove Disc T3 to orphan on-disc region od-1");
@@ -1251,7 +1252,8 @@ struct StudioComponentTests {
                     studio.session.mdDisc.groups.empty(),
                 "Ungroup range clears all MD groups");
 
-            // 3b. Non-linear IPC commands: clone, move-block, add-parts, part move + undo/redo
+            // 3b. Play Order aliasing IPC commands: clone/alias, alias-audio, sync rename,
+            // detach, range, move-block + retired command rejection + undo/redo
             {
                 const int beforeNewClusters = static_cast<int>(
                     studio.ipcCommand({"disc", "status"})["result"]["physical_plan"]
@@ -1261,9 +1263,12 @@ struct StudioComponentTests {
                           studio.ipcCommand({"disc", "track", "clone", "0", "1"})["ok"]) &&
                           static_cast<int>(studio.session.mdDisc.tracks.size()) ==
                               countBeforeClone + 1 &&
+                          !studio.session.mdDisc.tracks[0].audioId.empty() &&
+                          studio.session.mdDisc.tracks[1].audioId ==
+                              studio.session.mdDisc.tracks[0].audioId &&
                           studio.session.mdDisc.tracks[1].parts ==
                               studio.session.mdDisc.tracks[0].parts,
-                      "IPC disc track clone inserts shared clone at target index");
+                      "IPC disc track clone inserts Play Order alias sharing audioId at target");
                 const int afterNewClusters = static_cast<int>(
                     studio.ipcCommand({"disc", "status"})["result"]["physical_plan"]
                                      ["new_upload_clusters"]);
@@ -1276,23 +1281,33 @@ struct StudioComponentTests {
                 check(static_cast<int>(studio.session.mdDisc.tracks.size()) == countBeforeClone + 1,
                       "Redo restores IPC disc track clone cleanly");
 
+                const auto pooledAudioId =
+                    juce::String::fromUTF8(studio.session.mdDisc.tracks[0].audioId.c_str());
                 check(static_cast<bool>(studio.ipcCommand(
-                          {"disc", "track", "add-parts", "2", "MultiPaste", "default", "0", "22016",
-                           "44032", "66048"})["ok"]) &&
-                          studio.session.mdDisc.tracks[2].halfWidthTitle == "MultiPaste" &&
-                          studio.session.mdDisc.tracks[2].parts.size() == 2 &&
-                          studio.session.mdDisc.tracks[2].parts[0].startSample == 0 &&
-                          studio.session.mdDisc.tracks[2].parts[1].startSample == 44032,
-                      "IPC disc track add-parts creates multi-part track cleanly");
+                          {"disc", "track", "alias-audio", pooledAudioId, "2"})["ok"]) &&
+                          studio.session.mdDisc.tracks[2].audioId == pooledAudioId.toStdString(),
+                      "IPC disc track alias-audio inserts Play Order alias by audioId cleanly");
+                check(static_cast<bool>(studio.ipcCommand(
+                          {"disc", "track", "rename", "0", "SyncedTheme"})["ok"]) &&
+                          studio.session.mdDisc.tracks[1].halfWidthTitle == "SyncedTheme" &&
+                          studio.session.mdDisc.tracks[2].halfWidthTitle == "SyncedTheme",
+                      "Renaming one alias propagates canonically across Play Order aliases");
+                check(static_cast<bool>(studio.ipcCommand({"disc", "track", "detach", "2"})["ok"]) &&
+                          studio.session.mdDisc.tracks[2].audioId.empty() &&
+                          studio.session.mdDisc.tracks[0].audioId == pooledAudioId.toStdString(),
+                      "IPC disc track detach makes entry unique cleanly");
                 check(static_cast<bool>(
-                          studio.ipcCommand({"disc", "track", "part", "move", "2", "0", "1"})["ok"]) &&
-                          studio.session.mdDisc.tracks[2].parts[0].startSample == 44032 &&
-                          studio.session.mdDisc.tracks[2].parts[1].startSample == 0,
-                      "IPC disc track part move swaps parts cleanly");
-                studio.restoreHistory(false);
-                check(studio.session.mdDisc.tracks[2].parts[0].startSample == 0 &&
-                          studio.session.mdDisc.tracks[2].parts[1].startSample == 44032,
-                      "Undo reverts IPC disc track part move cleanly");
+                          studio.ipcCommand({"disc", "track", "range", "2", "1024", "22016"})["ok"]) &&
+                          studio.session.mdDisc.tracks[2].parts[0].startSample == 1024 &&
+                          studio.session.mdDisc.tracks[2].parts[0].endSample == 22016 &&
+                          studio.session.mdDisc.tracks[0].parts[0].startSample != 1024,
+                      "IPC disc track range updates unique entry without affecting former aliases");
+                check(!static_cast<bool>(studio.ipcCommand(
+                          {"disc", "track", "part", "add", "0", "0", "1024"})["ok"]) &&
+                          !static_cast<bool>(studio.ipcCommand(
+                              {"disc", "track", "add-parts", "0", "Bad", "default", "0",
+                               "1024"})["ok"]),
+                      "Retired IPC disc track part and add-parts commands are rejected cleanly");
 
                 const auto id0 = studio.session.mdDisc.tracks[0].id;
                 const auto id1 = studio.session.mdDisc.tracks[1].id;
@@ -1310,15 +1325,17 @@ struct StudioComponentTests {
                                    juce::String(static_cast<int>(studio.session.mdDisc.tracks.size()))});
             }
 
-            // 4. Shared physical span coalescing & UTOC Export/Import
+            // 4. Shared Play Order aliasing coalescing & UTOC Export/Import
             check(static_cast<bool>(
-                      studio.ipcCommand({"disc", "track", "part", "repeat", "0", "0", "1"})["ok"]),
-                  "Repeat shared part on Track 1 to test physical span coalescing");
+                      studio.ipcCommand({"disc", "track", "duplicate", "0", "1"})["ok"]),
+                  "Duplicate Play Order alias on Track 1 to test physical span coalescing");
             const auto coalStatus = studio.ipcCommand({"disc", "status"})["result"];
             check(
                 static_cast<int>(coalStatus["physical_plan"]["saved_clusters"]) > 0 &&
-                    static_cast<int>(coalStatus["budget"]["shared_fragment_count"]) > 0,
-                "Repeated/shared range produces saved clusters and shared UTOC fragment count > 0");
+                    static_cast<int>(coalStatus["budget"]["shared_fragment_count"]) > 0 &&
+                    static_cast<int>(coalStatus["aliased_track_count"]) > 0,
+                "Play Order alias produces saved clusters, aliased count, and shared UTOC fragment "
+                "count > 0");
 
             const auto utocFile = dir.getChildFile("exported.utoc");
             const auto expRes = studio.ipcCommand({"utoc", "export", utocFile.getFullPathName()});
@@ -1381,8 +1398,8 @@ struct StudioComponentTests {
             // confirm-hardware)
             check(static_cast<bool>(studio.ipcCommand({"disc", "sync", "layer1"})["ok"]) &&
                       static_cast<bool>(studio.ipcCommand(
-                          {"disc", "track", "part", "add", "0", "44032", "88064"})["ok"]),
-                  "Prepare abutting and shared Layer-1 tracks before NetMD IPC safety checks");
+                          {"disc", "track", "alias", "0", "1"})["ok"]),
+                  "Prepare abutting and aliased Layer-1 tracks before NetMD IPC safety checks");
             check(!static_cast<bool>(studio.ipcCommand({"netmd", "use-mock", "mz-n920"})["ok"]),
                   "Legacy netmd use-mock command is removed");
             const auto netStatus = studio.ipcCommand({"netmd", "status"});
@@ -1583,6 +1600,115 @@ struct StudioComponentTests {
                           static_cast<int>(probeAfterWipe["result"]["track_count"]) == 0,
                       "Async himd wipe leaves mock:mz-rh1 blank");
             }
+        }
+
+        // 5c. .carta v25 vs v27 Play Order persistence & 240-track 24HCLK Hi-MD UI layout check
+        {
+            const juce::File tmpIoDir =
+                juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("carta_comp_playorder_" +
+                                  juce::String(juce::Time::getHighResolutionTicks()));
+            check(tmpIoDir.createDirectory(), "Create temp dir for Play Order SessionIO check");
+            struct DirGuard final {
+                juce::File d;
+                ~DirGuard() { d.deleteRecursively(); }
+            } ioGuard{tmpIoDir};
+
+            carta::Session plainSess;
+            plainSess.minimumEndSample = 88200;
+            plainSess.tracks.push_back({"Audio", {}});
+            plainSess.mdDisc.medium = carta::MdMedium::md80;
+            plainSess.mdDisc.defaultCodec = carta::MdCodecMode::spStereo;
+            plainSess.mdDisc.tracks = {
+                {carta::makeMdTrackId(), "Track 1", {}, {}, false, false, false, {}, {{0, 44100}}}};
+            const auto v25Path = tmpIoDir.getChildFile("plain_std.carta");
+            juce::String ioErr;
+            check(carta::saveSession(plainSess, 2, v25Path, ioErr),
+                  ("Save plain Standard MD session: " + ioErr.toStdString()).c_str());
+            const auto v25Parsed = juce::JSON::parse(v25Path.loadFileAsString());
+            check(static_cast<int>(v25Parsed["version"]) == 25,
+                  "Plain Standard MD without Play Order aliases stays at project version 25");
+
+            carta::Session poSess = plainSess;
+            std::string poErr;
+            check(carta::duplicateMdTrack(poSess.mdDisc, 0, poErr),
+                  ("Create Play Order alias before v27 save: " + poErr).c_str());
+            const auto v27Path = tmpIoDir.getChildFile("aliased_std.carta");
+            check(carta::saveSession(poSess, 2, v27Path, ioErr),
+                  ("Save Play Order aliased Standard MD session: " + ioErr.toStdString()).c_str());
+            const auto v27Parsed = juce::JSON::parse(v27Path.loadFileAsString());
+            check(static_cast<int>(v27Parsed["version"]) == 27,
+                  "Play Order aliased disc serializes at project version 27");
+
+            juce::AudioFormatManager ioFormats;
+            ioFormats.registerBasicFormats();
+            carta::Session reloadedPo;
+            int reloadedCh = 0;
+            check(carta::loadSession(reloadedPo, reloadedCh, ioFormats, v27Path, ioErr) &&
+                      reloadedPo.mdDisc == poSess.mdDisc &&
+                      !reloadedPo.mdDisc.tracks[0].audioId.empty() &&
+                      reloadedPo.mdDisc.tracks[0].audioId == reloadedPo.mdDisc.tracks[1].audioId,
+                  "loadSession v27 roundtrips Play Order audioId cleanly");
+
+            Studio hiClk;
+            hiClk.setSize(1180, 760);
+            auto clkAudio = std::make_shared<carta::Audio>();
+            clkAudio->sampleRate = carta::sessionRate;
+            clkAudio->samples.setSize(2, 44100 * 120);
+            clkAudio->samples.clear();
+            hiClk.session.minimumEndSample = 44100 * 120;
+            hiClk.session.tracks = {{"Clock", {{clkAudio, 0, 0, 120.0}}}};
+            hiClk.session.mdDisc.medium = carta::MdMedium::himd300;
+            hiClk.session.mdDisc.defaultCodec = carta::MdCodecMode::hiLp;
+            hiClk.session.mdDisc.halfWidthTitle = "24HCLK";
+            std::vector<carta::MdTrack> poolMusic(5);
+            std::int64_t pos = 0;
+            for (int m = 0; m < 5; ++m) {
+                poolMusic[static_cast<std::size_t>(m)].audioId = carta::makeMdAudioId();
+                poolMusic[static_cast<std::size_t>(m)].halfWidthTitle =
+                    "Music " + std::to_string(m + 1);
+                poolMusic[static_cast<std::size_t>(m)].parts = {{pos, pos + 44100}};
+                pos += 44100;
+            }
+            for (int h = 0; h < 24; ++h) {
+                const int s1 = static_cast<int>(hiClk.session.mdDisc.tracks.size()) + 1;
+                for (int q = 0; q < 5; ++q) {
+                    carta::MdTrack sp;
+                    sp.id = carta::makeMdTrackId();
+                    sp.halfWidthTitle = "H" + std::to_string(h) + ":" + std::to_string(q);
+                    sp.parts = {{pos, pos + 22050}};
+                    pos += 22050;
+                    hiClk.session.mdDisc.tracks.push_back(std::move(sp));
+
+                    carta::MdTrack mu = poolMusic[static_cast<std::size_t>(q)];
+                    mu.id = carta::makeMdTrackId();
+                    hiClk.session.mdDisc.tracks.push_back(std::move(mu));
+                }
+                hiClk.session.mdDisc.groups.push_back(
+                    {s1, static_cast<int>(hiClk.session.mdDisc.tracks.size()),
+                     "H" + std::to_string(h), {}});
+            }
+            hiClk.setDiscWorkspaceVisible(true);
+            hiClk.refreshDiscWorkspace(true);
+            auto& hDock = hiClk.discWorkspace;
+            for (int w : {780, 1180}) {
+                hDock.setSize(w, 280);
+                hDock.resized();
+                check(!rectsOverlap({hDock.insertTrackButton.getBounds(),
+                                     hDock.insertAliasButton.getBounds(),
+                                     hDock.duplicateTrackButton.getBounds(),
+                                     hDock.splitTrackButton.getBounds(),
+                                     hDock.moveUpButton.getBounds(),
+                                     hDock.moveDownButton.getBounds(),
+                                     hDock.removeTrackButton.getBounds(),
+                                     hDock.groupMenuButton.getBounds()}),
+                      "Hi-MD 240-track 24HCLK Play Order controls do not overlap at 780/1180px");
+            }
+            check(hDock.trackRows.size() == 240 && hDock.planRows.size() == 240 &&
+                      hDock.audioBankRows.size() == 125 && hDock.budgetPillText.contains("125 uniq") &&
+                      hDock.planHintLabel.getText().contains("saved"),
+                  "Hi-MD 240-track 24HCLK displays 240 Play Order rows, 125 Audio Bank rows, "
+                  "unique badge, and alias savings in UI");
         }
 
         // 6. Interactive MD Tracks mouse manipulation, magnetic snapping, Shift bypass, Escape

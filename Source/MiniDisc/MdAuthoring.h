@@ -38,6 +38,9 @@ struct Session;
 
 inline constexpr std::int64_t kMdSampleRate = 44100;
 inline constexpr int kMdMaxTracks = 255;
+inline constexpr int kMdMaxStandardTracks = 255;
+inline constexpr int kHiMdMaxTracks = 2047;
+inline constexpr int kHiMdMaxAudioSlots = 2047;
 inline constexpr int kMdMaxGroups = 255;
 inline constexpr int kMdSectorsPerCluster = 32;
 inline constexpr int kMdUnitsPerSector = 11;
@@ -179,6 +182,7 @@ struct MdTrack {
     std::vector<MdPart> parts;
     std::string artist{};
     std::string album{};
+    std::string audioId{};
 
     std::int64_t totalSamples() const noexcept {
         std::int64_t total = 0;
@@ -201,7 +205,7 @@ struct MdTrack {
     bool operator==(const MdTrack& o) const noexcept {
         return id == o.id && halfWidthTitle == o.halfWidthTitle &&
                fullWidthTitle == o.fullWidthTitle && artist == o.artist && album == o.album &&
-               codecOverride == o.codecOverride &&
+               audioId == o.audioId && codecOverride == o.codecOverride &&
                writeProtected == o.writeProtected && scmsCopyProtected == o.scmsCopyProtected &&
                emphasis == o.emphasis && timestamp == o.timestamp && parts == o.parts;
     }
@@ -288,6 +292,12 @@ struct MdPhysicalPlan {
     int initialFreeClusters = 0;
     int freeClustersAfterReclaim = 0;
     std::vector<MdPhysRange> reclaimedFreeRanges;
+    int playOrderTrackCount = 0;
+    int uniqueAudioTrackCount = 0;
+    int aliasedTrackCount = 0;
+    std::int64_t hiMdUniqueBytes = 0;
+    std::int64_t hiMdUnaliasedBytes = 0;
+    std::int64_t hiMdSavedBytes = 0;
 };
 
 // ============================================================================
@@ -320,6 +330,12 @@ std::int64_t estimateHiMdTrackBytes(MdCodecMode mode, std::int64_t samples) noex
 
 /** Returns standard writable user cluster capacity for `medium` (0 for Hi-MD). */
 int mdTotalClusters(MdMedium medium) noexcept;
+
+/** Returns maximum Play Order tracks supported on `medium` (255 Standard MD, 2047 Hi-MD). */
+int mdMaxTracks(MdMedium medium) noexcept;
+
+/** Returns maximum unique physical audio items supported on `medium` (255 Standard MD, 2047 Hi-MD). */
+int mdMaxAudioTracks(MdMedium medium) noexcept;
 
 /** Returns canonical codec mode tag ("sp-stereo", "sp-mono", "lp2", "lp4", "hi-sp", "hi-lp", "pcm"). */
 std::string mdCodecModeToString(MdCodecMode mode);
@@ -366,6 +382,18 @@ int countWholeFreeClusters(const std::vector<MdPhysRange>& ranges) noexcept;
 /** Generates a globally unique stable track ID ("md-<uuid8>-<seq>"). */
 std::string makeMdTrackId();
 
+/** Generates a globally unique Audio Pool item ID ("mda-<uuid8>-<seq>"). */
+std::string makeMdAudioId();
+
+/** Returns the effective Audio Pool key for `track` (`audioId` when set, else `id`). */
+std::string effectiveMdAudioId(const MdTrack& track);
+
+/** Returns the number of Play Order entries referencing `audioKey` in `disc`. */
+int countMdAudioRefs(const MdDisc& disc, const std::string& audioKey) noexcept;
+
+/** Returns all 0-based Play Order indices referencing `audioKey` in `disc`. */
+std::vector<int> findMdPlayOrderIndicesForAudio(const MdDisc& disc, const std::string& audioKey);
+
 /** Validates timestamps, unique IDs, part ranges, and disjoint groups; populates `error` on
  * failure. */
 bool validateMdDisc(const MdDisc& disc, std::string& error);
@@ -411,9 +439,26 @@ bool mergeMdTrackWithNext(MdDisc& disc, int trackIndex0, std::string& error);
  * error. */
 bool duplicateMdTrack(MdDisc& disc, int trackIndex0, std::string& error);
 
-/** Clones `srcIndex0` to 0-based `destIndex0` (`0..count`) with a fresh ID; leaves `disc`
- * unchanged on error. */
+/** Clones `srcIndex0` to 0-based `destIndex0` (`0..count`) as a Play Order alias sharing `audioId`;
+ * leaves `disc` unchanged on error. */
 bool cloneMdTrackToPosition(MdDisc& disc, int srcIndex0, int destIndex0, std::string& error);
+
+/** Synchronizes audio-item fields from `sourceTrackIndex0` across all aliases sharing its `audioId`. */
+void syncAliasedMdTracks(MdDisc& disc, int sourceTrackIndex0);
+
+/** Inserts a Play Order alias of `srcIndex0` at 0-based `destIndex0` (`0..count`) sharing `audioId`. */
+bool aliasMdTrackAtPosition(MdDisc& disc, int srcIndex0, int destIndex0, std::string& error);
+
+/** Inserts a Play Order alias for Audio Pool key `audioKey` at 0-based `destIndex0`. */
+bool insertMdAliasByAudioId(MdDisc& disc, const std::string& audioKey, int destIndex0,
+                            std::string& error);
+
+/** Detaches aliased Play Order entry `trackIndex0` into its own independent audio item ("Make Unique"). */
+bool detachMdTrackAlias(MdDisc& disc, int trackIndex0, std::string& error);
+
+/** Sets the timeline range `[startSample, endSample)` of `trackIndex0` and syncs any aliases. */
+bool setMdTrackRange(MdDisc& disc, int trackIndex0, std::int64_t startSample,
+                     std::int64_t endSample, std::string& error);
 
 /** Reorders `fromIndex0` to `toIndex0` while maintaining valid disjoint groups; leaves `disc`
  * unchanged on error. */
@@ -423,9 +468,6 @@ bool moveMdTrack(MdDisc& disc, int fromIndex0, int toIndex0, std::string& error)
  * preserving valid disjoint groups; leaves `disc` unchanged on error. */
 bool moveMdTrackBlock(MdDisc& disc, int fromStart0, int fromEnd0, int destStart0,
                       std::string& error);
-
-/** Reorders `fromPart0` to `toPart0` within `trackIndex0`; leaves `disc` unchanged on error. */
-bool moveMdTrackPart(MdDisc& disc, int trackIndex0, int fromPart0, int toPart0, std::string& error);
 
 /** Removes `trackIndex0` and shifts group indices; leaves `disc` unchanged on error. */
 bool removeMdTrack(MdDisc& disc, int trackIndex0, std::string& error);

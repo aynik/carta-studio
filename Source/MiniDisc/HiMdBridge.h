@@ -94,7 +94,10 @@ struct HiMdDeviceStatus {
 struct HiMdPreflightReport {
     bool valid = false;
     int tracksToUpload = 0;
+    int uniqueAudioTracksToUpload = 0;
     std::int64_t estimatedAudioBytes = 0;
+    std::int64_t unaliasedAudioBytes = 0;
+    std::int64_t savedBytes = 0;
     std::int64_t requiredBytes = 0;
     std::int64_t discTotalBytes = 0;
     std::int64_t discFreeBytes = 0;

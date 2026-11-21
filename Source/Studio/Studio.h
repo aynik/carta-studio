@@ -427,8 +427,8 @@ class Studio final : public juce::AudioAppComponent,
     // ------------------------------------------------------------------------
     juce::StringArray getMenuBarNames() override;
     juce::ApplicationCommandTarget* getNextCommandTarget() override;
-    bool canUseSelectionForDisc(bool appendPart);
-    void useSelectionForDisc(bool appendPart);
+    bool canUseSelectionForDisc(bool updateRange);
+    void useSelectionForDisc(bool updateRange);
     void getAllCommands(juce::Array<juce::CommandID>& ids) override;
     void getCommandInfo(juce::CommandID id, juce::ApplicationCommandInfo& info) override;
     bool perform(const InvocationInfo& info) override;

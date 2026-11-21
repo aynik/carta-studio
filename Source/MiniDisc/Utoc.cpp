@@ -1461,26 +1461,66 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         }
     }
 
+    std::map<std::string, std::uint8_t> sharedHwTitleSlotByAudio;
+    std::map<std::string, std::uint8_t> sharedFwTitleSlotByAudio;
     for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
         const auto& tr = disc.tracks[t];
-        const std::string hwSrc =
-            !tr.halfWidthTitle.empty() ? tr.halfWidthTitle : tr.fullWidthTitle;
-        const auto hwBytes = encodeHalfWidthBytes(hwSrc);
-        if (!allocateTitleCells(out.halfTitleCells, out.nextFreeHalfTitleSlot, hwBytes,
-                                out.halfTitleMap[t + 1], error)) {
-            error = "UTOC Sector 1 half-width title cells exceeded 255 slots.";
-            return false;
-        }
-        if (needFullWidth && !tr.fullWidthTitle.empty()) {
-            out.hasSector4 = true;
-            const auto fwBytes = encodeFullWidthShiftJis(tr.fullWidthTitle, error);
-            if (!error.empty()) {
+        const bool shareByAudio = !tr.audioId.empty();
+
+        if (shareByAudio) {
+            if (const auto it = sharedHwTitleSlotByAudio.find(tr.audioId);
+                it != sharedHwTitleSlotByAudio.end()) {
+                out.halfTitleMap[t + 1] = it->second;
+            } else {
+                const std::string hwSrc =
+                    !tr.halfWidthTitle.empty() ? tr.halfWidthTitle : tr.fullWidthTitle;
+                const auto hwBytes = encodeHalfWidthBytes(hwSrc);
+                if (!allocateTitleCells(out.halfTitleCells, out.nextFreeHalfTitleSlot, hwBytes,
+                                        out.halfTitleMap[t + 1], error)) {
+                    error = "UTOC Sector 1 half-width title cells exceeded 255 slots.";
+                    return false;
+                }
+                sharedHwTitleSlotByAudio.emplace(tr.audioId, out.halfTitleMap[t + 1]);
+            }
+        } else {
+            const std::string hwSrc =
+                !tr.halfWidthTitle.empty() ? tr.halfWidthTitle : tr.fullWidthTitle;
+            const auto hwBytes = encodeHalfWidthBytes(hwSrc);
+            if (!allocateTitleCells(out.halfTitleCells, out.nextFreeHalfTitleSlot, hwBytes,
+                                    out.halfTitleMap[t + 1], error)) {
+                error = "UTOC Sector 1 half-width title cells exceeded 255 slots.";
                 return false;
             }
-            if (!allocateTitleCells(out.fullTitleCells, out.nextFreeFullTitleSlot, fwBytes,
-                                    out.fullTitleMap[t + 1], error)) {
-                error = "UTOC Sector 4 full-width title cells exceeded 255 slots.";
-                return false;
+        }
+
+        if (needFullWidth && !tr.fullWidthTitle.empty()) {
+            out.hasSector4 = true;
+            if (shareByAudio) {
+                if (const auto it = sharedFwTitleSlotByAudio.find(tr.audioId);
+                    it != sharedFwTitleSlotByAudio.end()) {
+                    out.fullTitleMap[t + 1] = it->second;
+                } else {
+                    const auto fwBytes = encodeFullWidthShiftJis(tr.fullWidthTitle, error);
+                    if (!error.empty()) {
+                        return false;
+                    }
+                    if (!allocateTitleCells(out.fullTitleCells, out.nextFreeFullTitleSlot, fwBytes,
+                                            out.fullTitleMap[t + 1], error)) {
+                        error = "UTOC Sector 4 full-width title cells exceeded 255 slots.";
+                        return false;
+                    }
+                    sharedFwTitleSlotByAudio.emplace(tr.audioId, out.fullTitleMap[t + 1]);
+                }
+            } else {
+                const auto fwBytes = encodeFullWidthShiftJis(tr.fullWidthTitle, error);
+                if (!error.empty()) {
+                    return false;
+                }
+                if (!allocateTitleCells(out.fullTitleCells, out.nextFreeFullTitleSlot, fwBytes,
+                                        out.fullTitleMap[t + 1], error)) {
+                    error = "UTOC Sector 4 full-width title cells exceeded 255 slots.";
+                    return false;
+                }
             }
         }
     }
@@ -1570,6 +1610,58 @@ void readTrackTitleAndTimestamp(const UtocDiscState& state, int oneBasedTrack, M
             state.timestamps[state.timestampMap[static_cast<std::size_t>(oneBasedTrack)]];
         if (ts.isValid()) {
             tr.timestamp = formatUtocTimestampString(ts);
+        }
+    }
+}
+
+void assignSharedAudioIdsFromIdenticalTracks(MdDisc& disc) {
+    struct CanonicalKey {
+        MdCodecMode codec = MdCodecMode::spStereo;
+        bool writeProtected = false;
+        bool scmsCopyProtected = false;
+        bool emphasis = false;
+        std::string hw;
+        std::string fw;
+        std::string artist;
+        std::string album;
+        std::string ts;
+        std::vector<std::pair<std::int64_t, std::int64_t>> parts;
+
+        bool operator<(const CanonicalKey& o) const noexcept {
+            return std::tie(codec, writeProtected, scmsCopyProtected, emphasis, hw, fw, artist,
+                            album, ts, parts) <
+                   std::tie(o.codec, o.writeProtected, o.scmsCopyProtected, o.emphasis, o.hw, o.fw,
+                            o.artist, o.album, o.ts, o.parts);
+        }
+    };
+
+    std::map<CanonicalKey, std::vector<std::size_t>> grouped;
+    for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
+        const auto& tr = disc.tracks[i];
+        CanonicalKey key;
+        key.codec = effectiveTrackCodec(disc, tr);
+        key.writeProtected = tr.writeProtected;
+        key.scmsCopyProtected = tr.scmsCopyProtected;
+        key.emphasis = tr.emphasis;
+        key.hw = tr.halfWidthTitle;
+        key.fw = tr.fullWidthTitle;
+        key.artist = tr.artist;
+        key.album = tr.album;
+        key.ts = tr.timestamp;
+        key.parts.reserve(tr.parts.size());
+        for (const auto& p : tr.parts) {
+            key.parts.emplace_back(p.startSample, p.endSample);
+        }
+        grouped[key].push_back(i);
+    }
+
+    for (const auto& [key, indices] : grouped) {
+        if (indices.size() <= 1) {
+            continue;
+        }
+        const std::string aid = makeMdAudioId();
+        for (const std::size_t idx : indices) {
+            disc.tracks[idx].audioId = aid;
         }
     }
 }
@@ -1702,6 +1794,7 @@ bool mdDiscFromUtoc(const UtocDiscState& state, MdDisc& out, std::string& error)
         out.importedUtocSectors[3].assign(s4.begin(), s4.end());
     }
 
+    assignSharedAudioIdsFromIdenticalTracks(out);
     return validateMdDisc(out, error);
 }
 
@@ -1934,6 +2027,7 @@ bool loadMdDiscFromDeviceUtoc(
         out.defaultCodec = bestCodec;
     }
 
+    assignSharedAudioIdsFromIdenticalTracks(out);
     if (!validateMdDisc(out, error)) {
         out = {};
         return false;

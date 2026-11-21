@@ -1511,15 +1511,19 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
 
     juce::Array<juce::var> tracks;
     for (const auto& track : disc.tracks) {
-        if (!validDiscText(track.id) || !validDiscText(track.halfWidthTitle) ||
-            !validDiscText(track.fullWidthTitle) || !validDiscText(track.artist) ||
-            !validDiscText(track.album) || !validDiscText(track.timestamp)) {
+        if (!validDiscText(track.id) || !validDiscText(track.audioId) ||
+            !validDiscText(track.halfWidthTitle) || !validDiscText(track.fullWidthTitle) ||
+            !validDiscText(track.artist) || !validDiscText(track.album) ||
+            !validDiscText(track.timestamp)) {
             error = "MD track text contains invalid UTF-8 text.";
             return false;
         }
         auto item = object();
         auto* p = item.getDynamicObject();
         p->setProperty("id", juce::String::fromUTF8(track.id.c_str()));
+        if (!track.audioId.empty()) {
+            p->setProperty("audioId", juce::String::fromUTF8(track.audioId.c_str()));
+        }
         if (!track.halfWidthTitle.empty()) {
             p->setProperty("halfWidthTitle", juce::String::fromUTF8(track.halfWidthTitle.c_str()));
         }
@@ -1718,7 +1722,7 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
     }
 
     const auto* tracksArr = value["tracks"].getArray();
-    if (tracksArr->size() > kMdMaxTracks) {
+    if (tracksArr->size() > mdMaxTracks(next.medium)) {
         error = "Too many MD tracks.";
         return false;
     }
@@ -1730,6 +1734,13 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
         const auto* tp = item.getDynamicObject();
         MdTrack trk;
         trk.id = item["id"].toString().toStdString();
+        if (tp->hasProperty("audioId")) {
+            if (!item["audioId"].isString()) {
+                error = "Invalid MD track audioId.";
+                return false;
+            }
+            trk.audioId = item["audioId"].toString().toStdString();
+        }
         if (tp->hasProperty("halfWidthTitle")) {
             if (!item["halfWidthTitle"].isString()) {
                 error = "Invalid MD track title.";
@@ -2405,6 +2416,10 @@ bool determineProjectVersion(const Session& session, WavRange savedLoop, bool& h
             });
         });
 
+    const bool hasPlayOrderFeatures =
+        static_cast<int>(session.mdDisc.tracks.size()) > kMdMaxStandardTracks ||
+        std::any_of(session.mdDisc.tracks.begin(), session.mdDisc.tracks.end(),
+                    [](const MdTrack& track) { return !track.audioId.empty(); });
     const bool hasHiMdFeatures =
         isHiMdMedium(session.mdDisc.medium) || isHiMdOnlyCodec(session.mdDisc.defaultCodec) ||
         std::any_of(session.mdDisc.tracks.begin(), session.mdDisc.tracks.end(),
@@ -2414,7 +2429,7 @@ bool determineProjectVersion(const Session& session, WavRange savedLoop, bool& h
                                !track.artist.empty() || !track.album.empty();
                     });
 
-    if (hasHiMdFeatures) {
+    if (hasHiMdFeatures || hasPlayOrderFeatures) {
         projectVersion = 27;
     } else if (hasLoadedOnDisc) {
         projectVersion = 26;
@@ -3588,6 +3603,10 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
         if (!decodeMdDisc(root["mdDisc"], next.mdDisc, error)) {
             return false;
         }
+        const bool usesPlayOrderV27 =
+            static_cast<int>(next.mdDisc.tracks.size()) > kMdMaxStandardTracks ||
+            std::any_of(next.mdDisc.tracks.begin(), next.mdDisc.tracks.end(),
+                        [](const MdTrack& track) { return !track.audioId.empty(); });
         const bool usesHiMd =
             isHiMdMedium(next.mdDisc.medium) || isHiMdOnlyCodec(next.mdDisc.defaultCodec) ||
             std::any_of(next.mdDisc.tracks.begin(), next.mdDisc.tracks.end(),
@@ -3596,8 +3615,8 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
                                     isHiMdOnlyCodec(*track.codecOverride)) ||
                                    !track.artist.empty() || !track.album.empty();
                         });
-        if (usesHiMd && version < 27) {
-            error = "Hi-MD disc features require project version 27 or later.";
+        if ((usesHiMd || usesPlayOrderV27) && version < 27) {
+            error = "Hi-MD and Play Order aliasing features require project version 27 or later.";
             return false;
         }
     }

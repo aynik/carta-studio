@@ -4116,7 +4116,10 @@ size_t EditHistory::estimate(const EditorState& state) noexcept {
             addString(track.id);
             addString(track.halfWidthTitle);
             addString(track.fullWidthTitle);
+            addString(track.artist);
+            addString(track.album);
             addString(track.timestamp);
+            addString(track.audioId);
             addVector(track.parts.capacity(), sizeof(MdPart));
         }
         addVector(md.groups.capacity(), sizeof(MdGroup));

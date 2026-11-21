@@ -329,42 +329,6 @@ bool MdWorkspace::TrackListBox::keyPressed(const juce::KeyPress& key) {
     return juce::ListBox::keyPressed(key);
 }
 
-MdWorkspace::PartListModel::PartListModel(MdWorkspace& ownerRef) : owner(ownerRef) {
-}
-
-int MdWorkspace::PartListModel::getNumRows() {
-    return static_cast<int>(owner.partRows.size());
-}
-
-void MdWorkspace::PartListModel::paintListBoxItem(int row, juce::Graphics& g, int width, int height,
-                                                  bool selected) {
-    owner.paintPartRow(row, g, width, height, selected);
-}
-
-void MdWorkspace::PartListModel::selectedRowsChanged(int lastRowSelected) {
-    owner.handlePartSelectionChanged(lastRowSelected);
-}
-
-void MdWorkspace::PartListModel::listBoxItemClicked(int row, const juce::MouseEvent& event) {
-    owner.handlePartClick(row, event);
-}
-
-void MdWorkspace::PartListModel::listBoxItemDoubleClicked(int row, const juce::MouseEvent&) {
-    owner.triggerSeekPart(row);
-}
-
-void MdWorkspace::PartListModel::returnKeyPressed(int row) {
-    owner.triggerSeekPart(row);
-}
-
-void MdWorkspace::PartListModel::deleteKeyPressed(int row) {
-    owner.triggerDeletePart(row);
-}
-
-juce::String MdWorkspace::PartListModel::getTooltipForRow(int row) {
-    return owner.tooltipForPartRow(row);
-}
-
 MdWorkspace::PlanListModel::PlanListModel(MdWorkspace& ownerRef) : owner(ownerRef) {
 }
 
@@ -466,9 +430,8 @@ bool MdWorkspace::InlineTrackTitleEditor::keyPressed(const juce::KeyPress& key) 
 
 MdWorkspace::MdWorkspace()
     : trackModel(*this), trackList(*this, trackModel), inlineTrackTitleEditor(*this),
-      partModel(*this), partsList("UTOC parts", &partModel), deviceTrackModel(*this),
-      deviceTrackList("On-disc tracks", &deviceTrackModel), planModel(*this),
-      planList("Recording plan", &planModel) {
+      deviceTrackModel(*this), deviceTrackList("On-disc tracks", &deviceTrackModel),
+      planModel(*this), planList("Recording plan", &planModel) {
     // --- Persistent Header Bar ---
     addAndMakeVisible(mdLabel);
     mdLabel.setText("MiniDisc", juce::dontSendNotification);
@@ -598,15 +561,20 @@ MdWorkspace::MdWorkspace()
     planHintLabel.setFont(juce::FontOptions(11.5f));
     planHintLabel.setJustificationType(juce::Justification::centredRight);
 
-    // --- Tab 1 Left: Action Bar & Track List ---
+    // --- Tab 1 Left: Action Bar & Play Order List ---
     addAndMakeVisible(insertTrackButton);
     insertTrackButton.setTooltip(
-        "Insert an MD track for the current time selection or playhead-to-end range");
+        "Insert a new Play Order track for the current time selection or playhead-to-end range");
     insertTrackButton.onClick = [this] { triggerInsertTrack(); };
+
+    addAndMakeVisible(insertAliasButton);
+    insertAliasButton.setTooltip(
+        "Insert a Play Order alias pointing to an existing Audio Pool item (0 extra disc space)");
+    insertAliasButton.onClick = [this] { showInsertAliasMenu(); };
 
     addAndMakeVisible(duplicateTrackButton);
     duplicateTrackButton.setTooltip(
-        "Duplicate the selected MD track (shares physical clusters on disc)");
+        "Insert a Play Order alias of the selected track (shares physical audio on disc)");
     duplicateTrackButton.onClick = [this] { triggerDuplicateTrack(); };
 
     addAndMakeVisible(splitTrackButton);
@@ -757,51 +725,25 @@ MdWorkspace::MdWorkspace()
         "Assign this track to a MiniDisc group or remove it from its group");
     trackGroupButton.onClick = [this] { showGroupMenu(); };
 
-    addChildComponent(partsHeaderLabel);
-    partsHeaderLabel.setText("UTOC Parts (0)", juce::dontSendNotification);
-    partsHeaderLabel.setFont(juce::FontOptions(11.5f, juce::Font::bold));
+    addChildComponent(audioSourceHeaderLabel);
+    audioSourceHeaderLabel.setText("Audio Pool Source", juce::dontSendNotification);
+    audioSourceHeaderLabel.setFont(juce::FontOptions(11.5f, juce::Font::bold));
+    audioSourceHeaderLabel.setBorderSize(juce::BorderSize<int>(0));
 
-    addChildComponent(addPartButton);
-    addPartButton.setTooltip(
-        "Append timeline selection (or playhead-to-end) as a sequential part in this track");
-    addPartButton.onClick = [this] { triggerAddPart(); };
+    addChildComponent(seekAudioButton);
+    seekAudioButton.setTooltip("Seek playhead and select this audio source's range on Layer 1");
+    seekAudioButton.onClick = [this] { triggerSeekTrackRange(); };
 
-    addChildComponent(partBankButton);
-    partBankButton.setTooltip("Append an existing on-disc region or timeline clip as a part");
-    partBankButton.onClick = [this] { showPartBankMenu(); };
+    addChildComponent(setAudioSelButton);
+    setAudioSelButton.setTooltip(
+        "Update this audio source's timeline range to match the current time selection");
+    setAudioSelButton.onClick = [this] { triggerSetTrackToSelection(); };
 
-    addChildComponent(partUpButton);
-    partUpButton.setTooltip("Move the selected part earlier in this track");
-    partUpButton.onClick = [this] { triggerMovePart(-1); };
-
-    addChildComponent(partDownButton);
-    partDownButton.setTooltip("Move the selected part later in this track");
-    partDownButton.onClick = [this] { triggerMovePart(1); };
-
-    addChildComponent(setPartSelButton);
-    setPartSelButton.setTooltip("Update the selected part to match the current timeline selection");
-    setPartSelButton.onClick = [this] { triggerSetPartToSelection(); };
-
-    addChildComponent(repeatPartButton);
-    repeatPartButton.setTooltip(
-        "Repeat the selected part sequentially (shares existing physical clusters)");
-    repeatPartButton.onClick = [this] { showRepeatPartMenu(); };
-
-    addChildComponent(delPartButton);
-    delPartButton.setTooltip("Remove the selected part from this track");
-    delPartButton.onClick = [this] { triggerDeletePart(partsList.getSelectedRow()); };
-
-    addChildComponent(seekPartButton);
-    seekPartButton.setTooltip("Seek playhead and select this part's time range on Layer 1");
-    seekPartButton.onClick = [this] { triggerSeekPart(partsList.getSelectedRow()); };
-
-    addChildComponent(partsList);
-    partsList.setRowHeight(24);
-    partsList.setColour(juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
-    partsList.dragReorderEnabled = true;
-    partsList.onRowReorder = [this](int fromRow, int insertBeforeRow) {
-        handlePartReorderDrag(fromRow, insertBeforeRow);
-    };
+    addChildComponent(detachAliasButton);
+    detachAliasButton.setTooltip(
+        "Detach this Play Order entry from shared aliases into its own independent Audio Pool "
+        "item");
+    detachAliasButton.onClick = [this] { triggerMakeUnique(); };
 
     // --- Tab 1 Right: Multi-Selection Inspector ---
     addChildComponent(multiHeaderLabel);
@@ -811,6 +753,8 @@ MdWorkspace::MdWorkspace()
     addChildComponent(multiUngroupButton);
     multiUngroupButton.onClick = [this] { clearGroupsForSelection(); };
     addChildComponent(multiDuplicateButton);
+    multiDuplicateButton.setTooltip(
+        "Insert Play Order aliases after each selected track (shares existing audio)");
     multiDuplicateButton.onClick = [this] { triggerDuplicateTrack(); };
     addChildComponent(multiRemoveButton);
     multiRemoveButton.onClick = [this] { triggerRemoveSelectedTracks(); };
@@ -1093,7 +1037,6 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
                          double playheadSec, juce::uint64 generation,
                          const juce::String& preferredTrackId) {
     const auto prevPrimaryId = preferredTrackId.isNotEmpty() ? preferredTrackId : primaryTrackId();
-    const int prevPartRow = partsList.getSelectedRow();
 
     discState = session.mdDisc;
     timeSelection = selection;
@@ -1116,14 +1059,12 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
              recordUiState.hiMdStatus.fsTotalBytes > 0)
                 ? recordUiState.hiMdStatus.fsTotalBytes
                 : carta::hiMdMediumCapacityBytes(discState.medium);
-        hiMdUsedBytes = 0;
-        for (const auto& tr : discState.tracks) {
-            hiMdUsedBytes += carta::estimateHiMdTrackBytes(
-                carta::effectiveTrackCodec(discState, tr), tr.totalSamples());
-        }
-        if (!discState.tracks.empty()) {
-            hiMdUsedBytes += static_cast<std::int64_t>(discState.tracks.size()) * 32768LL + 65536LL;
-        }
+        hiMdUsedBytes = physicalPlan.hiMdUniqueBytes +
+                        (physicalPlan.uniqueAudioTrackCount > 0
+                             ? static_cast<std::int64_t>(physicalPlan.uniqueAudioTrackCount) *
+                                       32768LL +
+                                   65536LL
+                             : 0LL);
     } else {
         hiMdUsedBytes = 0;
         hiMdTotalBytes = 0;
@@ -1214,12 +1155,18 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
                   });
     }
 
+    std::map<std::string, int> uniqueSlotByAudioKey;
     trackRows.clear();
     trackRows.reserve(discState.tracks.size());
     for (std::size_t i = 0; i < discState.tracks.size(); ++i) {
         const auto& t = discState.tracks[i];
+        const std::string audioKey = carta::effectiveMdAudioId(t);
+        if (!uniqueSlotByAudioKey.count(audioKey)) {
+            uniqueSlotByAudioKey.emplace(audioKey, static_cast<int>(uniqueSlotByAudioKey.size()) + 1);
+        }
         TrackRow row;
         row.id = juce::String::fromUTF8(t.id.c_str());
+        row.audioId = juce::String::fromUTF8(audioKey.c_str());
         row.index0 = static_cast<int>(i);
         const auto titleStr = t.displayTitle();
         row.title = titleStr.empty() ? ("Track " + juce::String(static_cast<int>(i + 1)))
@@ -1234,6 +1181,7 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         row.emphasis = t.emphasis;
         row.hasTimestamp = !t.timestamp.empty();
         row.partCount = static_cast<int>(t.parts.size());
+        row.aliasRefCount = carta::countMdAudioRefs(discState, audioKey);
         row.totalSamples = t.totalSamples();
         if (!t.parts.empty()) {
             row.firstStartSample = t.parts.front().startSample;
@@ -1252,7 +1200,7 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
                 break;
             }
         }
-        row.maxSharedRefs = 1;
+        row.maxSharedRefs = row.aliasRefCount;
         row.onDisc = carta::mdTrackUsesOnDiscAudio(discState, t);
         for (const std::size_t pi : placementsByTrack[i]) {
             row.maxSharedRefs = std::max(row.maxSharedRefs, placementRefCounts[pi]);
@@ -1268,11 +1216,14 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         PlanRow pr;
         pr.trackIndex = tr.index0;
         pr.id = tr.id;
+        pr.audioId = tr.audioId;
         pr.title = tr.title;
         pr.groupName = tr.groupName;
         pr.groupColorIndex = tr.groupColorIndex;
         pr.codec = tr.effectiveCodec;
         pr.partCount = tr.partCount;
+        pr.aliasRefCount = tr.aliasRefCount;
+        pr.uniqueAudioSlot = uniqueSlotByAudioKey[tr.audioId.toStdString()];
         pr.totalSamples = tr.totalSamples;
         pr.sharesPhysicalSpan = tr.sharesPhysicalSpan;
         pr.onDisc = tr.onDisc;
@@ -1415,6 +1366,14 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         if (row.label.isEmpty()) {
             row.label = "New Span #" + juce::String(static_cast<int>(si + 1));
         }
+        row.hiMdBytes =
+            isHiMd ? carta::estimateHiMdTrackBytes(sp.codec, sp.endSample - sp.startSample) : 0;
+        if (!row.referencingTrackIndices0.empty()) {
+            const auto& firstTr =
+                trackRows[static_cast<std::size_t>(row.referencingTrackIndices0.front())];
+            row.audioId = firstTr.audioId;
+            row.uniqueAudioSlot = uniqueSlotByAudioKey[firstTr.audioId.toStdString()];
+        }
         audioBankRows.push_back(std::move(row));
     }
     std::sort(audioBankRows.begin(), audioBankRows.end(),
@@ -1482,7 +1441,7 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
     }
     syncingControls = false;
 
-    rebuildPartRows(prevPartRow);
+    syncTrackInspectorFields();
     refreshPlanSummaryLabels();
     if (inlineEditingRow >= 0 && !inlineTransitioning) {
         if (inlineEditingRow >= static_cast<int>(trackRows.size()) || activeTab != "tracks") {
@@ -1802,8 +1761,11 @@ void MdWorkspace::paint(juce::Graphics& g) {
             g.drawText("Track Title & Attributes", x + 118, y, std::max(40, w - 118 - rightCols), h,
                        juce::Justification::centredLeft, true);
             g.drawText("Codec", x + w - 160, y, 52, h, juce::Justification::centred, false);
-            g.drawText("Parts", x + w - 104, y, 36, h, juce::Justification::centred, false);
+            g.drawText("Uses", x + w - 104, y, 36, h, juce::Justification::centred, false);
             g.drawText("Dur", x + w - 66, y, 56, h, juce::Justification::centredRight, false);
+        }
+        if (selectedTrackIndices0().size() == 1 && !audioSourceCardBounds.isEmpty()) {
+            paintAudioSourceCard(g, dark);
         }
     } else {
         const bool devConnected =
@@ -1947,16 +1909,20 @@ void MdWorkspace::resized() {
         auto leftInner = leftCardBounds.reduced(6, 6);
         auto actionRow = leftInner.removeFromTop(24);
         int ax = actionRow.getX();
-        const int btnGap = 4;
-        const int insertW = 68;
-        const int dupW = 74;
-        const int splitW = 54;
-        const int upW = 42;
-        const int dnW = 50;
-        const int remW = 68;
-        const int grpW = 78;
+        const bool compactBar = actionRow.getWidth() < 540;
+        const int btnGap = compactBar ? 3 : 4;
+        const int insertW = compactBar ? 52 : 60;
+        const int aliasPoolW = compactBar ? 62 : 70;
+        const int dupW = compactBar ? 42 : 52;
+        const int splitW = compactBar ? 40 : 48;
+        const int upW = compactBar ? 30 : 36;
+        const int dnW = compactBar ? 30 : 36;
+        const int remW = compactBar ? 54 : 62;
+        const int grpW = compactBar ? 74 : 78;
         insertTrackButton.setBounds(ax, actionRow.getY(), insertW, 24);
         ax += insertW + btnGap;
+        insertAliasButton.setBounds(ax, actionRow.getY(), aliasPoolW, 24);
+        ax += aliasPoolW + btnGap;
         duplicateTrackButton.setBounds(ax, actionRow.getY(), dupW, 24);
         ax += dupW + btnGap;
         splitTrackButton.setBounds(ax, actionRow.getY(), splitW, 24);
@@ -1968,7 +1934,7 @@ void MdWorkspace::resized() {
         removeTrackButton.setBounds(ax, actionRow.getY(), remW, 24);
         ax += remW + btnGap;
         groupMenuButton.setBounds(ax, actionRow.getY(),
-                                  std::min(grpW, std::max(50, actionRow.getRight() - ax)), 24);
+                                  std::min(grpW, std::max(44, actionRow.getRight() - ax)), 24);
 
         leftInner.removeFromTop(4);
         trackHeaderBounds = leftInner.removeFromTop(20);
@@ -2079,38 +2045,21 @@ void MdWorkspace::layoutRightInspector(juce::Rectangle<int> area) {
     rowB.removeFromLeft(6);
     trackGroupButton.setBounds(rowB);
 
-    singleArea.removeFromTop(5);
-    auto rowC = singleArea.removeFromTop(22);
-    const int bankW = 90;
-    const int addW = 52;
-    partBankButton.setBounds(rowC.removeFromRight(bankW));
-    rowC.removeFromRight(3);
-    addPartButton.setBounds(rowC.removeFromRight(addW));
-    rowC.removeFromRight(4);
-    partsHeaderLabel.setBounds(rowC);
-
-    singleArea.removeFromTop(3);
-    auto rowD = singleArea.removeFromTop(22);
-    const int pUpW = 28;
-    const int pDnW = 28;
-    const int setW = 64;
-    const int repW = 64;
-    const int delW = 34;
-    const int seekW = 42;
-    seekPartButton.setBounds(rowD.removeFromRight(seekW));
-    rowD.removeFromRight(3);
-    delPartButton.setBounds(rowD.removeFromRight(delW));
-    rowD.removeFromRight(3);
-    repeatPartButton.setBounds(rowD.removeFromRight(repW));
-    rowD.removeFromRight(3);
-    setPartSelButton.setBounds(rowD.removeFromRight(setW));
-    rowD.removeFromRight(3);
-    partDownButton.setBounds(rowD.removeFromRight(pDnW));
-    rowD.removeFromRight(3);
-    partUpButton.setBounds(rowD.removeFromRight(pUpW));
-
-    singleArea.removeFromTop(4);
-    partsList.setBounds(singleArea);
+    singleArea.removeFromTop(8);
+    audioSourceCardBounds = singleArea;
+    auto srcInner = audioSourceCardBounds.reduced(8, 7);
+    audioSourceHeaderLabel.setBounds(srcInner.removeFromTop(20));
+    auto srcBtnRow = srcInner.removeFromBottom(24);
+    const bool narrowSrc = srcBtnRow.getWidth() < 260;
+    const int seekW = narrowSrc ? 54 : 66;
+    const int setW = narrowSrc ? 74 : 88;
+    const int uniqW = narrowSrc ? 88 : 102;
+    seekAudioButton.setBounds(srcBtnRow.removeFromLeft(seekW));
+    srcBtnRow.removeFromLeft(4);
+    setAudioSelButton.setBounds(srcBtnRow.removeFromLeft(setW));
+    srcBtnRow.removeFromLeft(4);
+    detachAliasButton.setBounds(srcBtnRow.removeFromLeft(
+        std::min(uniqW, std::max(40, srcBtnRow.getWidth()))));
 }
 
 void MdWorkspace::layoutDeviceCard(juce::Rectangle<int> area) {
@@ -2204,6 +2153,7 @@ void MdWorkspace::updateTabVisibility() {
     exportUtocButton.setEnabled(!isHiMd);
 
     insertTrackButton.setVisible(isTracks);
+    insertAliasButton.setVisible(isTracks);
     duplicateTrackButton.setVisible(isTracks);
     splitTrackButton.setVisible(isTracks);
     moveUpButton.setVisible(isTracks);
@@ -2224,16 +2174,10 @@ void MdWorkspace::updateTabVisibility() {
     trackCodecLabel.setVisible(oneSelected);
     trackCodecBox.setVisible(oneSelected);
     trackGroupButton.setVisible(oneSelected);
-    partsHeaderLabel.setVisible(oneSelected);
-    addPartButton.setVisible(oneSelected);
-    partBankButton.setVisible(oneSelected);
-    partUpButton.setVisible(oneSelected);
-    partDownButton.setVisible(oneSelected);
-    setPartSelButton.setVisible(oneSelected);
-    repeatPartButton.setVisible(oneSelected);
-    delPartButton.setVisible(oneSelected);
-    seekPartButton.setVisible(oneSelected);
-    partsList.setVisible(oneSelected);
+    audioSourceHeaderLabel.setVisible(oneSelected);
+    seekAudioButton.setVisible(oneSelected);
+    setAudioSelButton.setVisible(oneSelected);
+    detachAliasButton.setVisible(oneSelected);
 
     multiHeaderLabel.setVisible(multiSelected);
     multiGroupButton.setVisible(multiSelected);
@@ -2291,24 +2235,34 @@ void MdWorkspace::refreshPlanSummaryLabels() {
                                                 static_cast<double>(capBytes)))
                 : 0;
         const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
-        budgetPillText = juce::String(static_cast<int>(discState.tracks.size())) + " trk" + dot +
-                         juce::String(static_cast<int>(discState.groups.size())) + " grp" + dot +
-                         formatMegabytes(hiMdUsedBytes) + " / " + formatMegabytes(capBytes) +
-                         " (" + juce::String(pct) + "%)";
+        const juce::String uniqPart =
+            physicalPlan.aliasedTrackCount > 0
+                ? (" (" + juce::String(physicalPlan.uniqueAudioTrackCount) + " uniq)")
+                : juce::String();
+        budgetPillText = juce::String(static_cast<int>(discState.tracks.size())) + "/2047 trk" +
+                         uniqPart + dot + juce::String(static_cast<int>(discState.groups.size())) +
+                         " grp" + dot + formatMegabytes(hiMdUsedBytes) + " / " +
+                         formatMegabytes(capBytes) + " (" + juce::String(pct) + "%)";
 
         if (!planValid) {
             planHintLabel.setText(juce::String::fromUTF8(planErrorText.c_str()),
                                   juce::dontSendNotification);
+        } else if (physicalPlan.hiMdSavedBytes > 0) {
+            planHintLabel.setText("Hi-MD Play Order" + dot +
+                                      juce::String(physicalPlan.uniqueAudioTrackCount) +
+                                      " unique audio items" + dot + "saved " +
+                                      formatMegabytes(physicalPlan.hiMdSavedBytes) + " by aliases",
+                                  juce::dontSendNotification);
         } else if (!trackRows.empty()) {
-            planHintLabel.setText("Hi-MD FAT16" + dot +
+            planHintLabel.setText("Hi-MD Play Order" + dot +
                                       juce::String(static_cast<int>(trackRows.size())) +
                                       " track(s)" + dot + formatMegabytes(hiMdUsedBytes) + " / " +
                                       formatMegabytes(capBytes),
                                   juce::dontSendNotification);
         } else {
             planHintLabel.setText(
-                "Hi-MD mode: drag splits in MD Tracks lane or switch to Device & Record to "
-                "upload Hi-SP / Hi-LP / LP2 / LP4 / PCM",
+                "Hi-MD Play Order: alias Audio Pool tracks or switch to Device & Record for "
+                "Hi-SP / Hi-LP / LP2 / LP4 / PCM",
                 juce::dontSendNotification);
         }
         return;
@@ -2334,8 +2288,9 @@ void MdWorkspace::refreshPlanSummaryLabels() {
         planHintLabel.setText(juce::String::fromUTF8(planErrorText.c_str()),
                               juce::dontSendNotification);
     } else if (physicalPlan.savedClusters > 0) {
-        planHintLabel.setText(juce::String(static_cast<int>(physicalPlan.spans.size())) +
-                                  juce::String::fromUTF8(" physical spans \xc2\xb7 ") +
+        planHintLabel.setText(juce::String(physicalPlan.uniqueAudioTrackCount) + " unique / " +
+                                  juce::String(physicalPlan.playOrderTrackCount) +
+                                  juce::String::fromUTF8(" Play Order \xc2\xb7 ") +
                                   juce::String(physicalPlan.savedClusters) +
                                   " clusters saved by aliases",
                               juce::dontSendNotification);
@@ -2347,39 +2302,17 @@ void MdWorkspace::refreshPlanSummaryLabels() {
                               juce::dontSendNotification);
     } else {
         planHintLabel.setText(
-            "Drag splits or edges in the MD Tracks lane; repeated parts share physical clusters",
+            "Drag splits or edges in the MD Tracks lane; Play Order aliases share physical audio",
             juce::dontSendNotification);
     }
 }
 
-void MdWorkspace::rebuildPartRows(int preferredPartRow) {
-    partRows.clear();
+void MdWorkspace::syncTrackInspectorFields() {
     const bool isHiMd = carta::isHiMdMedium(discState.medium);
     const auto selected = selectedTrackIndices0();
     if (selected.size() == 1) {
         const int row = selected.front();
         const auto& track = discState.tracks[static_cast<std::size_t>(row)];
-
-        for (std::size_t p = 0; p < track.parts.size(); ++p) {
-            PartRow pr;
-            pr.index0 = static_cast<int>(p);
-            pr.startSample = track.parts[p].startSample;
-            pr.endSample = track.parts[p].endSample;
-            for (std::size_t pi = 0; pi < physicalPlan.placements.size(); ++pi) {
-                const auto& place = physicalPlan.placements[pi];
-                if (place.trackIndex == row && place.partIndex == static_cast<int>(p)) {
-                    pr.spanIndex = place.spanIndex;
-                    pr.isOnDisc = place.isOnDisc;
-                    pr.onDiscRegionIndex = place.onDiscRegionIndex;
-                    pr.startAddr = place.startAddr;
-                    pr.endAddr = place.endAddr;
-                    pr.sharedRefCount = countPlacementAudioRefs(physicalPlan, pi);
-                    pr.sharedSpan = pr.sharedRefCount > 1;
-                    break;
-                }
-            }
-            partRows.push_back(std::move(pr));
-        }
 
         syncingControls = true;
         const auto titleStr = track.halfWidthTitle;
@@ -2401,16 +2334,18 @@ void MdWorkspace::rebuildPartRows(int preferredPartRow) {
         trackCodecBox.setTooltip(
             onDiscTrack
                 ? "Encoding mode is fixed for existing on-disc audio (re-encoding not supported "
-                  "in UTOC-only mode)"
-                : "Override encoding mode for this track only, or inherit the disc default");
+                  "in non-destructive mode)"
+                : "Override encoding mode for this audio item, or inherit the disc default");
         const auto& rowMeta = trackRows[static_cast<std::size_t>(row)];
         trackGroupButton.setButtonText(rowMeta.groupName.empty()
                                            ? "Group: None..."
                                            : "Grp: " +
                                                  juce::String::fromUTF8(rowMeta.groupName.c_str()));
-        partsHeaderLabel.setText((isHiMd ? "Parts (" : "UTOC Parts (") +
-                                     juce::String(static_cast<int>(partRows.size())) + ")",
-                                 juce::dontSendNotification);
+        const juce::String poolLabel =
+            rowMeta.aliasRefCount > 1
+                ? ("Audio Pool Source  [" + juce::String(rowMeta.aliasRefCount) + " Uses]")
+                : juce::String("Audio Pool Source  (Unique)");
+        audioSourceHeaderLabel.setText(poolLabel, juce::dontSendNotification);
         syncingControls = false;
     } else if (selected.size() > 1) {
         multiHeaderLabel.setText(
@@ -2419,35 +2354,21 @@ void MdWorkspace::rebuildPartRows(int preferredPartRow) {
                 juce::String(selected.back() + 1) + ")",
             juce::dontSendNotification);
     }
-
-    syncingControls = true;
-    partsList.updateContent();
-    if (!partRows.empty()) {
-        const int chosen =
-            (preferredPartRow >= 0 && preferredPartRow < static_cast<int>(partRows.size()))
-                ? preferredPartRow
-                : 0;
-        partsList.selectRow(chosen, false, true);
-    } else {
-        partsList.deselectAllRows();
-    }
-    syncingControls = false;
 }
 
 void MdWorkspace::updateButtonStates() {
     const auto selected = selectedTrackIndices0();
     const int row = selected.size() == 1 ? selected.front() : -1;
-    const int partRow = partsList.getSelectedRow();
     const bool hasSel = timeSelection.hasRange();
-    const bool hasValidSinglePart = partRow >= 0 && partRow < static_cast<int>(partRows.size());
     const bool hasAudio = masterEndSample > 0;
     const bool contiguous = !selected.empty() && (selected.back() - selected.front() + 1 ==
                                                   static_cast<int>(selected.size()));
 
     insertTrackButton.setEnabled(hasSel || hasAudio);
+    insertAliasButton.setEnabled(!trackRows.empty());
     duplicateTrackButton.setEnabled(!selected.empty());
     bool canSplit = false;
-    if (row >= 0) {
+    if (row >= 0 && trackRows[static_cast<std::size_t>(row)].aliasRefCount <= 1) {
         const auto& tr = discState.tracks[static_cast<std::size_t>(row)];
         for (const auto& p : tr.parts) {
             if (playheadSample > p.startSample && playheadSample < p.endSample) {
@@ -2467,15 +2388,11 @@ void MdWorkspace::updateButtonStates() {
     previewFromButton.setEnabled(row >= 0);
     reviewWavButton.setEnabled(!trackRows.empty());
 
-    addPartButton.setEnabled(row >= 0 && (hasSel || hasAudio));
-    partBankButton.setEnabled(row >= 0 && !audioBankClipEntries.empty());
-    partUpButton.setEnabled(row >= 0 && hasValidSinglePart && partRow > 0);
-    partDownButton.setEnabled(row >= 0 && hasValidSinglePart &&
-                              partRow + 1 < static_cast<int>(partRows.size()));
-    setPartSelButton.setEnabled(row >= 0 && hasValidSinglePart && hasSel);
-    repeatPartButton.setEnabled(row >= 0 && hasValidSinglePart);
-    delPartButton.setEnabled(row >= 0 && hasValidSinglePart && partRows.size() > 1);
-    seekPartButton.setEnabled(row >= 0 && hasValidSinglePart);
+    const bool onDiscSingle = row >= 0 && trackRows[static_cast<std::size_t>(row)].onDisc;
+    seekAudioButton.setEnabled(row >= 0);
+    setAudioSelButton.setEnabled(row >= 0 && hasSel && !onDiscSingle);
+    detachAliasButton.setEnabled(
+        row >= 0 && trackRows[static_cast<std::size_t>(row)].aliasRefCount > 1);
 
     multiGroupButton.setEnabled(contiguous);
     multiUngroupButton.setEnabled(!selected.empty());
@@ -2502,7 +2419,7 @@ void MdWorkspace::handleTrackSelectionChanged(int lastRowSelected) {
         }
     }
     syncingControls = false;
-    rebuildPartRows();
+    syncTrackInspectorFields();
     updateTabVisibility();
     updateButtonStates();
     resized();
@@ -2536,7 +2453,7 @@ void MdWorkspace::handlePlanSelectionChanged(int lastRowSelected) {
     trackList.selectRow(lastRowSelected, false, true);
     trackList.scrollToEnsureRowIsOnscreen(lastRowSelected);
     syncingControls = false;
-    rebuildPartRows();
+    syncTrackInspectorFields();
     updateButtonStates();
     repaint();
     if (onTrackSelectionChanged) {
@@ -2606,18 +2523,6 @@ void MdWorkspace::handleTrackDoubleClick(int row) {
         return;
     }
     beginInlineTrackEdit(row);
-}
-
-void MdWorkspace::handlePartClick(int row, const juce::MouseEvent& event) {
-    if (row < 0 || row >= static_cast<int>(partRows.size())) {
-        return;
-    }
-    if (event.mods.isPopupMenu()) {
-        if (!partsList.isRowSelected(row)) {
-            partsList.selectRow(row, false, true);
-        }
-        showPartContextMenu(row);
-    }
 }
 
 void MdWorkspace::beginInlineTrackEdit(int row) {
@@ -2711,14 +2616,6 @@ void MdWorkspace::updateInlineTrackEditorBounds() {
     const int editorH = std::max(18, rowInList.getHeight() - 4);
     inlineTrackTitleEditor.setBounds(editorX, trackList.getY() + rowInList.getY() + 2, editorW,
                                      editorH);
-}
-
-void MdWorkspace::handlePartSelectionChanged(int) {
-    if (syncingControls) {
-        return;
-    }
-    updateButtonStates();
-    repaint();
 }
 
 void MdWorkspace::commitDiscTitle() {
@@ -2843,7 +2740,7 @@ void MdWorkspace::triggerMoveTrack(int delta) {
             }
         }
         syncingControls = false;
-        rebuildPartRows();
+        syncTrackInspectorFields();
         updateTabVisibility();
         updateButtonStates();
         repaint();
@@ -2866,7 +2763,7 @@ void MdWorkspace::triggerCopySelectedTracks() {
     if (onFeedback && !copiedTrackClipboard.empty()) {
         onFeedback("Copied " + juce::String(static_cast<int>(copiedTrackClipboard.size())) +
                    (copiedTrackClipboard.size() == 1 ? " MD track" : " MD tracks") +
-                   " (paste with Cmd/Ctrl+V for shared-audio aliases).");
+                   " (paste with Cmd/Ctrl+V for Play Order aliases).");
     }
 }
 
@@ -2882,22 +2779,28 @@ void MdWorkspace::triggerPasteTracksAfter(int afterRow) {
         if (tr.parts.empty()) {
             continue;
         }
-        juce::StringArray cmd;
-        cmd.add("disc");
-        cmd.add("track");
-        cmd.add("add-parts");
-        cmd.add(juce::String(dest));
-        const auto title = tr.halfWidthTitle.empty()
-                               ? juce::String::fromUTF8(tr.fullWidthTitle.c_str())
-                               : juce::String::fromUTF8(tr.halfWidthTitle.c_str());
-        cmd.add(title.isNotEmpty() ? title : ("Track " + juce::String(dest + 1)));
-        cmd.add(tr.codecOverride ? juce::String(carta::mdCodecModeToString(*tr.codecOverride))
-                                 : juce::String("default"));
-        for (const auto& p : tr.parts) {
-            cmd.add(juce::String(p.startSample));
-            cmd.add(juce::String(p.endSample));
+        const std::string audioKey = carta::effectiveMdAudioId(tr);
+        const bool poolAlive =
+            !audioKey.empty() && carta::countMdAudioRefs(discState, audioKey) > 0;
+        bool ok = false;
+        if (poolAlive) {
+            ok = onCommand({"disc", "track", "alias-audio",
+                            juce::String::fromUTF8(audioKey.c_str()), juce::String(dest)},
+                           revision);
+        } else {
+            const auto title = tr.halfWidthTitle.empty()
+                                   ? juce::String::fromUTF8(tr.fullWidthTitle.c_str())
+                                   : juce::String::fromUTF8(tr.halfWidthTitle.c_str());
+            const auto codecStr =
+                tr.codecOverride ? juce::String(carta::mdCodecModeToString(*tr.codecOverride))
+                                 : juce::String("default");
+            ok = onCommand({"disc", "track", "add", juce::String(tr.parts.front().startSample),
+                            juce::String(tr.parts.back().endSample),
+                            title.isNotEmpty() ? title : ("Track " + juce::String(dest + 1)),
+                            juce::String(dest), codecStr},
+                           revision);
         }
-        if (!onCommand(cmd, revision)) {
+        if (!ok) {
             break;
         }
         ++dest;
@@ -2905,7 +2808,7 @@ void MdWorkspace::triggerPasteTracksAfter(int afterRow) {
     }
     if (onFeedback && pastedCount > 0) {
         onFeedback("Pasted " + juce::String(pastedCount) +
-                   (pastedCount == 1 ? " shared-audio track." : " shared-audio tracks."));
+                   (pastedCount == 1 ? " Play Order alias." : " Play Order aliases."));
     }
 }
 
@@ -2993,7 +2896,7 @@ void MdWorkspace::handleTrackReorderDrag(int fromRow, int insertBeforeRow) {
                 }
             }
             syncingControls = false;
-            rebuildPartRows();
+            syncTrackInspectorFields();
             updateTabVisibility();
             updateButtonStates();
             repaint();
@@ -3005,28 +2908,6 @@ void MdWorkspace::handleTrackReorderDrag(int fromRow, int insertBeforeRow) {
     dest = juce::jlimit(0, count - 1, dest);
     if (dest != fromRow) {
         onCommand({"disc", "track", "move", juce::String(fromRow), juce::String(dest)}, revision);
-    }
-}
-
-void MdWorkspace::handlePartReorderDrag(int fromRow, int insertBeforeRow) {
-    commitPendingEdits();
-    const int row = singleSelectedTrackIndex();
-    const int count = static_cast<int>(partRows.size());
-    if (row < 0 || fromRow < 0 || fromRow >= count || !onCommand) {
-        return;
-    }
-    int dest = (insertBeforeRow > fromRow) ? (insertBeforeRow - 1) : insertBeforeRow;
-    dest = juce::jlimit(0, count - 1, dest);
-    if (dest == fromRow) {
-        return;
-    }
-    if (onCommand({"disc", "track", "part", "move", juce::String(row), juce::String(fromRow),
-                   juce::String(dest)},
-                  revision)) {
-        syncingControls = true;
-        partsList.selectRow(dest, false, true);
-        syncingControls = false;
-        updateButtonStates();
     }
 }
 
@@ -3089,83 +2970,112 @@ void MdWorkspace::triggerPreviewSelected(bool throughEnd) {
     onPreviewTrack(trackRows[static_cast<std::size_t>(row)].id, throughEnd);
 }
 
-void MdWorkspace::triggerAddPart() {
+void MdWorkspace::triggerSeekTrackRange() {
+    const int row = singleSelectedTrackIndex();
+    if (row < 0 || row >= static_cast<int>(trackRows.size())) {
+        return;
+    }
+    if (onSeekPart) {
+        onSeekPart(trackRows[static_cast<std::size_t>(row)].id, 0, revision);
+    }
+}
+
+void MdWorkspace::triggerSetTrackToSelection() {
+    commitPendingEdits();
+    const int row = singleSelectedTrackIndex();
+    if (row < 0 || !timeSelection.hasRange() || !onCommand) {
+        return;
+    }
+    onCommand({"disc", "track", "range", juce::String(row), juce::String(timeSelection.start),
+               juce::String(timeSelection.end)},
+              revision);
+}
+
+void MdWorkspace::triggerMakeUnique() {
     commitPendingEdits();
     const int row = singleSelectedTrackIndex();
     if (row < 0 || !onCommand) {
         return;
     }
-    juce::int64 start = 0;
-    juce::int64 end = 0;
-    if (!resolveSelectedOrPlayheadRange(timeSelection, playheadSample, masterEndSample, start,
-                                        end)) {
-        if (onFeedback) {
-            onFeedback("Select a timeline range first.");
-        }
-        return;
-    }
-    onCommand(
-        {"disc", "track", "part", "add", juce::String(row), juce::String(start), juce::String(end)},
-        revision);
-}
-
-void MdWorkspace::triggerSetPartToSelection() {
-    commitPendingEdits();
-    const int row = singleSelectedTrackIndex();
-    const int partRow = partsList.getSelectedRow();
-    if (row < 0 || partRow < 0 || !timeSelection.hasRange() || !onCommand) {
-        return;
-    }
-    onCommand({"disc", "track", "part", "set", juce::String(row), juce::String(partRow),
-               juce::String(timeSelection.start), juce::String(timeSelection.end)},
-              revision);
-}
-
-void MdWorkspace::triggerDeletePart(int partRow) {
-    commitPendingEdits();
-    const int row = singleSelectedTrackIndex();
-    if (row < 0 || partRow < 0 || partRow >= static_cast<int>(partRows.size()) || !onCommand) {
-        return;
-    }
-    onCommand({"disc", "track", "part", "remove", juce::String(row), juce::String(partRow)},
-              revision);
-}
-
-void MdWorkspace::triggerSeekPart(int partRow) {
-    const int row = singleSelectedTrackIndex();
-    if (row < 0 || partRow < 0 || partRow >= static_cast<int>(partRows.size())) {
-        return;
-    }
-    if (onSeekPart) {
-        onSeekPart(trackRows[static_cast<std::size_t>(row)].id, partRow, revision);
-    }
-}
-
-void MdWorkspace::triggerMovePart(int delta) {
-    commitPendingEdits();
-    const int row = singleSelectedTrackIndex();
-    const int partRow = partsList.getSelectedRow();
-    const int count = static_cast<int>(partRows.size());
-    if (row < 0 || partRow < 0 || partRow >= count || !onCommand || delta == 0) {
-        return;
-    }
-    const int dest = partRow + delta;
-    if (dest < 0 || dest >= count || dest == partRow) {
-        return;
-    }
-    if (onCommand({"disc", "track", "part", "move", juce::String(row), juce::String(partRow),
-                   juce::String(dest)},
-                  revision)) {
-        syncingControls = true;
-        partsList.selectRow(dest, false, true);
-        syncingControls = false;
-        updateButtonStates();
-    }
+    onCommand({"disc", "track", "detach", juce::String(row)}, revision);
 }
 
 // ============================================================================
 // Popup Menus & Group Assignment Dialog
 // ============================================================================
+
+void MdWorkspace::populateAudioPoolSubmenu(juce::PopupMenu& menu, int baseId, int chunkSize) const {
+    struct PoolChoice {
+        int srcTrackIdx = 0;
+        juce::String label;
+    };
+    std::vector<PoolChoice> pool;
+    std::set<std::string> seenKeys;
+    const auto enDash = juce::String::fromUTF8("\xe2\x80\x93");
+    for (int i = 0; i < static_cast<int>(trackRows.size()); ++i) {
+        const auto& tr = trackRows[static_cast<std::size_t>(i)];
+        const std::string key = tr.audioId.toStdString();
+        if (!seenKeys.insert(key).second) {
+            continue;
+        }
+        juce::String label =
+            tr.title + " (" + carta::md_ui::codecShortLabel(tr.effectiveCodec) + ", " +
+            carta::md_ui::formatClock(tr.firstStartSample) + enDash +
+            carta::md_ui::formatClock(tr.firstEndSample) + ")";
+        if (tr.aliasRefCount > 1) {
+            label += " [x" + juce::String(tr.aliasRefCount) + "]";
+        }
+        pool.push_back({i, label});
+    }
+
+    const int total = static_cast<int>(pool.size());
+    if (total <= 0) {
+        return;
+    }
+    const int pageLen = std::max(1, chunkSize);
+    if (total <= pageLen) {
+        for (int i = 0; i < total; ++i) {
+            menu.addItem(baseId + pool[static_cast<std::size_t>(i)].srcTrackIdx,
+                         pool[static_cast<std::size_t>(i)].label);
+        }
+        return;
+    }
+    for (int start = 0; start < total; start += pageLen) {
+        const int end = std::min(total, start + pageLen);
+        juce::PopupMenu sub;
+        for (int i = start; i < end; ++i) {
+            sub.addItem(baseId + pool[static_cast<std::size_t>(i)].srcTrackIdx,
+                        pool[static_cast<std::size_t>(i)].label);
+        }
+        menu.addSubMenu("Audio " + juce::String(start + 1) + enDash + juce::String(end), sub);
+    }
+}
+
+void MdWorkspace::showInsertAliasMenu() {
+    commitPendingEdits();
+    if (trackRows.empty() || !onCommand) {
+        return;
+    }
+    const auto sel = selectedTrackIndices0();
+    const int insertDest = !sel.empty() ? (sel.back() + 1) : static_cast<int>(trackRows.size());
+    juce::PopupMenu menu;
+    populateAudioPoolSubmenu(menu, 100, 30);
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetComponent(&insertAliasButton),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), insertDest,
+         rev = revision](int choice) {
+            if (safe == nullptr || choice < 100 || !safe->onCommand) {
+                return;
+            }
+            const int srcIdx = choice - 100;
+            if (srcIdx < 0 || srcIdx >= static_cast<int>(safe->trackRows.size())) {
+                return;
+            }
+            safe->onCommand({"disc", "track", "alias", juce::String(srcIdx),
+                             juce::String(insertDest)},
+                            rev);
+        });
+}
 
 void MdWorkspace::populateAudioBankSubmenu(juce::PopupMenu& menu, int baseId, int chunkSize) const {
     const int total = static_cast<int>(audioBankClipEntries.size());
@@ -3201,76 +3111,34 @@ void MdWorkspace::populateAudioBankSubmenu(juce::PopupMenu& menu, int baseId, in
     }
 }
 
-void MdWorkspace::showPartBankMenu() {
-    commitPendingEdits();
-    const int row = singleSelectedTrackIndex();
-    if (row < 0 || audioBankClipEntries.empty() || !onCommand) {
-        return;
-    }
-    juce::PopupMenu menu;
-    populateAudioBankSubmenu(menu, 100, 30);
-    menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(&partBankButton),
-        [safe = juce::Component::SafePointer<MdWorkspace>(this), row, rev = revision](int choice) {
-            if (safe == nullptr || choice < 100 || !safe->onCommand) {
-                return;
-            }
-            const int entryIdx = choice - 100;
-            if (entryIdx < 0 ||
-                entryIdx >= static_cast<int>(safe->audioBankClipEntries.size())) {
-                return;
-            }
-            const auto& entry = safe->audioBankClipEntries[static_cast<std::size_t>(entryIdx)];
-            safe->onCommand({"disc", "track", "part", "add", juce::String(row),
-                             juce::String(entry.startSample), juce::String(entry.endSample)},
-                            rev);
-        });
-}
-
-void MdWorkspace::showRepeatPartMenu() {
-    const int row = singleSelectedTrackIndex();
-    const int partRow = partsList.getSelectedRow();
-    if (row < 0 || partRow < 0) {
-        return;
-    }
-
-    juce::PopupMenu menu;
-    menu.addItem(1, "Repeat 1x (share physical clusters)");
-    menu.addItem(2, "Repeat 2x (3 plays total)");
-    menu.addItem(3, "Repeat 4x (5 plays total)");
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&repeatPartButton),
-                       [safe = juce::Component::SafePointer<MdWorkspace>(this), row, partRow,
-                        rev = revision](int choice) {
-                           if (safe == nullptr || choice <= 0 || !safe->onCommand) {
-                               return;
-                           }
-                           const int count = (choice == 1) ? 1 : (choice == 2 ? 2 : 4);
-                           safe->onCommand({"disc", "track", "part", "repeat", juce::String(row),
-                                            juce::String(partRow), juce::String(count)},
-                                           rev);
-                       });
-}
-
 void MdWorkspace::showTrackContextMenu(int row) {
     if (row < 0 || row >= static_cast<int>(trackRows.size())) {
         return;
     }
+    const bool isAliased = trackRows[static_cast<std::size_t>(row)].aliasRefCount > 1;
     juce::PopupMenu menu;
-    menu.addItem(1, "Rename Track...");
+    menu.addItem(1, "Rename Audio Item...");
     menu.addItem(2, "ASCII & Full-Width Titles...");
     menu.addItem(3, "Flags & Timestamp...");
     menu.addSeparator();
-    menu.addItem(4, "Duplicate Track (Shared Audio)");
+    menu.addItem(4, "Insert Play Order Alias After");
+    menu.addItem(14, "Make Unique (Detach Alias)", isAliased);
     menu.addItem(11, "Copy Track(s)");
-    menu.addItem(12, "Paste Track(s) After", !copiedTrackClipboard.empty());
+    menu.addItem(12, "Paste Alias(es) After", !copiedTrackClipboard.empty());
     menu.addItem(10, "Move Track to Position...", trackRows.size() > 1);
-    menu.addItem(8, "Merge with Next Track", row + 1 < static_cast<int>(trackRows.size()));
+    menu.addItem(8, "Merge with Next Track",
+                 !isAliased && row + 1 < static_cast<int>(trackRows.size()));
     menu.addItem(5, "Remove Track");
-    if (!audioBankClipEntries.empty()) {
+    {
         menu.addSeparator();
+        juce::PopupMenu poolSub;
+        populateAudioPoolSubmenu(poolSub, 2000, 30);
+        menu.addSubMenu("Insert Alias After from Audio Pool", poolSub);
+    }
+    if (!audioBankClipEntries.empty()) {
         juce::PopupMenu bankSub;
         populateAudioBankSubmenu(bankSub, 1000, 30);
-        menu.addSubMenu("Insert Track After from Audio Bank", bankSub);
+        menu.addSubMenu("Insert Standalone Track from Clips", bankSub);
     }
     menu.addSeparator();
     menu.addItem(6, "Preview Track");
@@ -3282,6 +3150,15 @@ void MdWorkspace::showTrackContextMenu(int row) {
         [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
             if (safe == nullptr || choice <= 0 || row < 0 ||
                 row >= static_cast<int>(safe->trackRows.size())) {
+                return;
+            }
+            if (choice >= 2000 && safe->onCommand) {
+                const int srcIdx = choice - 2000;
+                if (srcIdx >= 0 && srcIdx < static_cast<int>(safe->trackRows.size())) {
+                    safe->onCommand({"disc", "track", "alias", juce::String(srcIdx),
+                                     juce::String(row + 1)},
+                                    safe->revision);
+                }
                 return;
             }
             if (choice >= 1000 && safe->onCommand) {
@@ -3297,9 +3174,9 @@ void MdWorkspace::showTrackContextMenu(int row) {
                         (entry.isOnDisc && entry.codec != safe->discState.defaultCodec)
                             ? juce::String(carta::mdCodecModeToString(entry.codec))
                             : juce::String("default");
-                    safe->onCommand({"disc", "track", "add-parts", juce::String(row + 1), label,
-                                     codecStr, juce::String(entry.startSample),
-                                     juce::String(entry.endSample)},
+                    safe->onCommand({"disc", "track", "add", juce::String(entry.startSample),
+                                     juce::String(entry.endSample), label,
+                                     juce::String(row + 1), codecStr},
                                     safe->revision);
                 }
                 return;
@@ -3318,6 +3195,8 @@ void MdWorkspace::showTrackContextMenu(int row) {
                 safe->onEditTrackFlags();
             } else if (choice == 4) {
                 safe->triggerDuplicateTrack();
+            } else if (choice == 14) {
+                safe->triggerMakeUnique();
             } else if (choice == 11) {
                 safe->triggerCopySelectedTracks();
             } else if (choice == 12) {
@@ -3351,46 +3230,6 @@ void MdWorkspace::showTrackContextMenu(int row) {
                     safe->planList.selectRow(bankTarget, false, true);
                     safe->planList.scrollToEnsureRowIsOnscreen(bankTarget);
                 }
-            }
-        });
-}
-
-void MdWorkspace::showPartContextMenu(int partRow) {
-    const int row = singleSelectedTrackIndex();
-    if (row < 0 || partRow < 0 || partRow >= static_cast<int>(partRows.size())) {
-        return;
-    }
-    juce::PopupMenu menu;
-    menu.addItem(1, "Move Part Up", partRow > 0);
-    menu.addItem(2, "Move Part Down", partRow + 1 < static_cast<int>(partRows.size()));
-    menu.addSeparator();
-    menu.addItem(3, "Repeat Part (1x Shared)");
-    menu.addItem(4, "Set to Timeline Selection", timeSelection.hasRange());
-    menu.addItem(5, "Seek on Timeline");
-    menu.addSeparator();
-    menu.addItem(6, "Delete Part", partRows.size() > 1);
-    menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(&partsList),
-        [safe = juce::Component::SafePointer<MdWorkspace>(this), row, partRow,
-         rev = revision](int choice) {
-            if (safe == nullptr || choice <= 0) {
-                return;
-            }
-            safe->partsList.selectRow(partRow, false, true);
-            if (choice == 1) {
-                safe->triggerMovePart(-1);
-            } else if (choice == 2) {
-                safe->triggerMovePart(1);
-            } else if (choice == 3 && safe->onCommand) {
-                safe->onCommand({"disc", "track", "part", "repeat", juce::String(row),
-                                 juce::String(partRow), "1"},
-                                rev);
-            } else if (choice == 4) {
-                safe->triggerSetPartToSelection();
-            } else if (choice == 5) {
-                safe->triggerSeekPart(partRow);
-            } else if (choice == 6) {
-                safe->triggerDeletePart(partRow);
             }
         });
 }
@@ -3447,13 +3286,14 @@ void MdWorkspace::showAudioBankContextMenu(int row) {
     }
     const auto& br = audioBankRows[static_cast<std::size_t>(row)];
     const bool hasRange = br.timelineEndSample > br.timelineStartSample;
-    const int selTrack = singleSelectedTrackIndex();
+    const bool hasRefTrack = !br.referencingTrackIndices0.empty();
 
     juce::PopupMenu menu;
     menu.addItem(1, "Seek Audio on Timeline", hasRange && onSeekRange != nullptr);
-    menu.addItem(2, "Add New Track from This Audio", hasRange && onCommand != nullptr);
-    menu.addItem(3, "Append as Part to Selected Track",
-                 hasRange && selTrack >= 0 && onCommand != nullptr);
+    menu.addItem(2,
+                 hasRefTrack ? "Insert Play Order Alias (at End)"
+                             : "Add New Standalone Track from This Audio",
+                 (hasRefTrack || hasRange) && onCommand != nullptr);
 
     if (!br.referencingTrackIndices0.empty()) {
         menu.addSeparator();
@@ -3502,23 +3342,23 @@ void MdWorkspace::showAudioBankContextMenu(int row) {
                 }
             } else if (choice == 2 && safe->onCommand) {
                 const int dest = static_cast<int>(safe->trackRows.size());
-                const auto label = bankRow.label.isNotEmpty()
-                                       ? bankRow.label
-                                       : ("Track " + juce::String(dest + 1));
-                const auto codecStr =
-                    (bankRow.isOnDisc && bankRow.codec != safe->discState.defaultCodec)
-                        ? juce::String(carta::mdCodecModeToString(bankRow.codec))
-                        : juce::String("default");
-                safe->onCommand({"disc", "track", "add-parts", juce::String(dest), label, codecStr,
-                                 juce::String(bankRow.timelineStartSample),
-                                 juce::String(bankRow.timelineEndSample)},
-                                safe->revision);
-            } else if (choice == 3 && safe->onCommand) {
-                const int sel = safe->singleSelectedTrackIndex();
-                if (sel >= 0) {
-                    safe->onCommand({"disc", "track", "part", "add", juce::String(sel),
+                if (!bankRow.referencingTrackIndices0.empty()) {
+                    safe->onCommand({"disc", "track", "alias",
+                                     juce::String(bankRow.referencingTrackIndices0.front()),
+                                     juce::String(dest)},
+                                    safe->revision);
+                } else {
+                    const auto label = bankRow.label.isNotEmpty()
+                                           ? bankRow.label
+                                           : ("Track " + juce::String(dest + 1));
+                    const auto codecStr =
+                        (bankRow.isOnDisc && bankRow.codec != safe->discState.defaultCodec)
+                            ? juce::String(carta::mdCodecModeToString(bankRow.codec))
+                            : juce::String("default");
+                    safe->onCommand({"disc", "track", "add",
                                      juce::String(bankRow.timelineStartSample),
-                                     juce::String(bankRow.timelineEndSample)},
+                                     juce::String(bankRow.timelineEndSample), label,
+                                     juce::String(dest), codecStr},
                                     safe->revision);
                 }
             } else if (choice >= 100) {
@@ -3704,8 +3544,8 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
     if (tr.fullWidthTitle.isNotEmpty()) {
         attrs.add("FW");
     }
-    if (tr.sharesPhysicalSpan) {
-        attrs.add("ALIAS x" + juce::String(tr.maxSharedRefs));
+    if (tr.partCount > 1) {
+        attrs.add("FRAG " + juce::String(tr.partCount));
     }
     const auto attrText = attrs.joinIntoString(" ");
     const int attrWidth =
@@ -3758,12 +3598,13 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
     g.drawText((tr.hasCodecOverride ? "*" : "") + carta::md_ui::codecShortLabel(tr.effectiveCodec),
                codecRect, juce::Justification::centred, false);
 
-    // Parts count
-    g.setColour(tr.partCount > 1 ? (dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e))
-                                 : textMuted);
-    g.setFont(juce::FontOptions(11.3f, tr.partCount > 1 ? juce::Font::bold : juce::Font::plain));
-    g.drawText(juce::String(tr.partCount) + (tr.partCount > 1 ? "p" : ""), width - 104, 0, 34,
-               height, juce::Justification::centred, false);
+    // Play Order uses count
+    const bool aliased = tr.aliasRefCount > 1;
+    g.setColour(aliased ? (dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e))
+                        : textMuted);
+    g.setFont(juce::FontOptions(11.3f, aliased ? juce::Font::bold : juce::Font::plain));
+    g.drawText(aliased ? ("x" + juce::String(tr.aliasRefCount)) : juce::String("1"), width - 104,
+               0, 34, height, juce::Justification::centred, false);
 
     // Duration
     g.setColour(textPrimary);
@@ -3772,55 +3613,103 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
                juce::Justification::centredRight, false);
 }
 
-void MdWorkspace::paintPartRow(int row, juce::Graphics& g, int width, int height,
-                               bool selected) const {
-    if (row < 0 || row >= static_cast<int>(partRows.size())) {
+void MdWorkspace::paintAudioSourceCard(juce::Graphics& g, bool dark) const {
+    if (audioSourceCardBounds.isEmpty()) {
         return;
     }
-    const auto& pr = partRows[static_cast<std::size_t>(row)];
-    const bool dark = juce::Desktop::getInstance().isDarkModeActive();
+    const int row = singleSelectedTrackIndex();
+    if (row < 0 || row >= static_cast<int>(trackRows.size()) ||
+        row >= static_cast<int>(discState.tracks.size())) {
+        return;
+    }
+
+    const auto& tr = trackRows[static_cast<std::size_t>(row)];
+    const auto& rawTrack = discState.tracks[static_cast<std::size_t>(row)];
+    const bool isHiMd = carta::isHiMdMedium(discState.medium);
+    const auto cardBg = dark ? juce::Colour(0xff1e1e1e) : juce::Colour(0xfff4f4f4);
+    const auto cardBorder = dark ? juce::Colour(0xff3a3a3a) : juce::Colour(0xffd0d0d0);
     const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
     const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
-    paintAlternatingRowBackground(g, row, width, height, selected, dark);
+    const auto teal = dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e);
 
-    g.setColour(textMuted);
-    g.setFont(juce::FontOptions(10.8f, juce::Font::bold));
-    g.drawText("P" + juce::String(row + 1), 6, 0, 24, height, juce::Justification::centredLeft,
-               false);
+    g.setColour(cardBg);
+    g.fillRoundedRectangle(audioSourceCardBounds.toFloat(), 5.0f);
+    g.setColour(cardBorder);
+    g.drawRoundedRectangle(audioSourceCardBounds.toFloat().reduced(0.5f), 5.0f, 1.0f);
 
-    const auto rangeStr = carta::md_ui::formatClock(pr.startSample) +
-                          juce::String::fromUTF8(" \xe2\x80\x93 ") +
-                          carta::md_ui::formatClock(pr.endSample);
+    auto body = audioSourceCardBounds.reduced(8, 7);
+    body.removeFromTop(24);
+    body.removeFromBottom(28);
+    if (body.getHeight() < 16 || body.getWidth() < 40) {
+        return;
+    }
+
+    const auto enDash = juce::String::fromUTF8(" \xe2\x80\x93 ");
+    const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+
+    const auto rangeText = carta::md_ui::formatClock(tr.firstStartSample) + enDash +
+                           carta::md_ui::formatClock(
+                               rawTrack.parts.empty() ? tr.firstEndSample
+                                                      : rawTrack.parts.back().endSample) +
+                           dot + "Dur " + carta::md_ui::formatClock(tr.totalSamples);
     g.setColour(textPrimary);
-    g.setFont(juce::FontOptions(10.8f));
-    g.drawText(rangeStr, 30, 0, 90, height, juce::Justification::centredLeft, true);
+    g.setFont(juce::FontOptions(11.3f, juce::Font::bold));
+    g.drawText(rangeText, body.removeFromTop(18), juce::Justification::centredLeft, true);
 
-    const bool hasAddr = pr.isOnDisc || pr.spanIndex >= 0;
-    const auto addrStr =
-        hasAddr
-            ? (carta::md_ui::formatAddr(pr.startAddr) + ".." + carta::md_ui::formatAddr(pr.endAddr))
-            : juce::String("(unplanned)");
-    const bool showTag = pr.isOnDisc || pr.sharedSpan;
-    const int tagW = showTag ? 64 : 0;
-    const int addrX = 122;
-    const int addrW = std::max(36, width - addrX - (showTag ? (tagW + 8) : 6));
-    g.setColour(textMuted);
-    g.setFont(juce::FontOptions(10.2f));
-    g.drawText(addrStr, addrX, 0, addrW, height, juce::Justification::centredLeft, true);
+    juce::String physDetail;
+    if (isHiMd) {
+        const auto estBytes = carta::estimateHiMdTrackBytes(tr.effectiveCodec, tr.totalSamples);
+        physDetail = (tr.onDisc ? "On-Disc Hi-MD Slot" : "Audio Pool") + dot +
+                     carta::md_ui::codecLongLabel(tr.effectiveCodec) + dot +
+                     formatMegabytes(estBytes);
+    } else {
+        int spanIdx = -1;
+        bool isOnDisc = false;
+        carta::MdPhysAddr startA{};
+        carta::MdPhysAddr endA{};
+        for (const auto& place : physicalPlan.placements) {
+            if (place.trackIndex == row && place.partIndex == 0) {
+                spanIdx = place.spanIndex;
+                isOnDisc = place.isOnDisc;
+                startA = place.startAddr;
+                endA = place.endAddr;
+                break;
+            }
+        }
+        if (isOnDisc) {
+            physDetail = "On-Disc UTOC " + carta::md_ui::formatAddr(startA) + ".." +
+                         carta::md_ui::formatAddr(endA);
+        } else if (spanIdx >= 0) {
+            physDetail = "Span #" + juce::String(spanIdx + 1) + " (" +
+                         carta::md_ui::formatAddr(startA) + ".." + carta::md_ui::formatAddr(endA) +
+                         ")";
+        } else {
+            physDetail = "(unplanned audio span)";
+        }
+    }
+    if (body.getHeight() >= 16) {
+        g.setColour(textMuted);
+        g.setFont(juce::FontOptions(10.6f));
+        g.drawText(physDetail, body.removeFromTop(16), juce::Justification::centredLeft, true);
+    }
 
-    if (showTag) {
-        const auto tag = juce::Rectangle<int>(width - tagW - 4, 4, tagW, height - 8);
-        const auto teal = dark ? juce::Colour(0xff34a39e) : juce::Colour(0xff0f766e);
-        const auto badgeText =
-            pr.isOnDisc
-                ? (pr.sharedSpan ? ("DISC x" + juce::String(pr.sharedRefCount))
-                                 : juce::String("ON-DISC"))
-                : ("SHARED x" + juce::String(pr.sharedRefCount));
-        g.setColour(teal.withAlpha(dark ? 0.25f : 0.14f));
-        g.fillRoundedRectangle(tag.toFloat(), 3.0f);
-        g.setColour(teal);
-        g.setFont(juce::FontOptions(9.4f, juce::Font::bold));
-        g.drawText(badgeText, tag, juce::Justification::centred, false);
+    if (body.getHeight() >= 16) {
+        const juce::String usageText =
+            tr.aliasRefCount > 1
+                ? ("Shared across " + juce::String(tr.aliasRefCount) +
+                   " Play Order tracks (0 extra disc space for aliases)")
+                : juce::String("Single unique audio item (0 aliases)");
+        g.setColour(tr.aliasRefCount > 1 ? teal : textMuted);
+        g.setFont(juce::FontOptions(10.5f, tr.aliasRefCount > 1 ? juce::Font::bold : juce::Font::plain));
+        g.drawText(usageText, body.removeFromTop(16), juce::Justification::centredLeft, true);
+    }
+
+    if (rawTrack.parts.size() > 1 && body.getHeight() >= 16) {
+        g.setColour(textMuted);
+        g.setFont(juce::FontOptions(10.3f));
+        g.drawText("Physical fragments: " + juce::String(static_cast<int>(rawTrack.parts.size())) +
+                       " UTOC ranges (casually recorded MD)",
+                   body.removeFromTop(16), juce::Justification::centredLeft, true);
     }
 }
 
@@ -3829,7 +3718,7 @@ juce::String MdWorkspace::tooltipForTrackRow(int row) const {
         return {};
     }
     const auto& tr = trackRows[static_cast<std::size_t>(row)];
-    juce::String tip = "Track " + juce::String(row + 1) + ": " + tr.title;
+    juce::String tip = "Play Order #" + juce::String(row + 1) + ": " + tr.title;
     if (tr.fullWidthTitle.isNotEmpty()) {
         tip += " [" + tr.fullWidthTitle + "]";
     }
@@ -3840,36 +3729,16 @@ juce::String MdWorkspace::tooltipForTrackRow(int row) const {
         tip += juce::String::fromUTF8(" \xc2\xb7 Album: ") + tr.album;
     }
     tip += juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::codecLongLabel(tr.effectiveCodec) +
-           juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::formatClock(tr.totalSamples) +
-           " (" + juce::String(tr.partCount) + (tr.partCount == 1 ? " part)" : " parts)");
-    if (tr.sharesPhysicalSpan) {
-        tip += juce::String::fromUTF8(" \xc2\xb7 Aliases existing physical clusters (x") +
-               juce::String(tr.maxSharedRefs) + ")";
+           juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::formatClock(tr.totalSamples);
+    if (tr.aliasRefCount > 1) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Play Order alias (") +
+               juce::String(tr.aliasRefCount) + " uses sharing 1 Audio Pool item)";
+    }
+    if (tr.partCount > 1) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 ") + juce::String(tr.partCount) +
+               " physical fragments";
     }
     tip += juce::String::fromUTF8(" \xc2\xb7 Double-click to edit title in place");
-    return tip;
-}
-
-juce::String MdWorkspace::tooltipForPartRow(int row) const {
-    if (row < 0 || row >= static_cast<int>(partRows.size())) {
-        return {};
-    }
-    const auto& pr = partRows[static_cast<std::size_t>(row)];
-    juce::String tip = "Part " + juce::String(row + 1) + ": samples [" +
-                       juce::String(pr.startSample) + ", " + juce::String(pr.endSample) + ")";
-    if (pr.isOnDisc) {
-        tip += juce::String::fromUTF8(" \xc2\xb7 On-disc Region #") +
-               juce::String(pr.onDiscRegionIndex + 1) + " (" + carta::md_ui::formatAddr(pr.startAddr) +
-               " to " + carta::md_ui::formatAddr(pr.endAddr) + ")";
-    } else if (pr.spanIndex >= 0) {
-        tip += juce::String::fromUTF8(" \xc2\xb7 Physical span #") +
-               juce::String(pr.spanIndex + 1) + " (" + carta::md_ui::formatAddr(pr.startAddr) +
-               " to " + carta::md_ui::formatAddr(pr.endAddr) + ")";
-    }
-    if (pr.sharedSpan) {
-        tip += juce::String::fromUTF8(" \xc2\xb7 Shared across ") +
-               juce::String(pr.sharedRefCount) + " part references (0 extra disc clusters)";
-    }
     return tip;
 }
 
@@ -3885,8 +3754,9 @@ void MdWorkspace::updatePanelHoverTooltip(juce::Point<int> point) {
                                       ? hiMdTotalBytes
                                       : carta::hiMdMediumCapacityBytes(discState.medium);
             lastHoverTooltip =
-                "Hi-MD Disc Layout: " + juce::String(static_cast<int>(discState.tracks.size())) +
-                " track(s), est. " + formatMegabytes(hiMdUsedBytes) + " / " +
+                "Hi-MD Disc Layout: " + juce::String(physicalPlan.uniqueAudioTrackCount) +
+                " unique audio items across " + juce::String(physicalPlan.playOrderTrackCount) +
+                " Play Order track(s), est. " + formatMegabytes(hiMdUsedBytes) + " / " +
                 formatMegabytes(capBytes) +
                 (discState.loadedDisc.active ? " (loaded Hi-MD disc)" : "") + ".";
         } else {
@@ -3910,10 +3780,15 @@ void MdWorkspace::updatePanelHoverTooltip(juce::Point<int> point) {
                 std::max<std::int64_t>(1, hiMdTotalBytes > 0
                                               ? hiMdTotalBytes
                                               : carta::hiMdMediumCapacityBytes(discState.medium));
-            lastHoverTooltip = "Target Hi-MD Capacity: " + formatMegabytes(hiMdUsedBytes) +
-                               " / " + formatMegabytes(capBytes) + " across " +
-                               juce::String(static_cast<int>(discState.tracks.size())) +
-                               " track(s).";
+            lastHoverTooltip =
+                "Target Hi-MD Capacity: " + formatMegabytes(hiMdUsedBytes) + " / " +
+                formatMegabytes(capBytes) + " (" +
+                juce::String(physicalPlan.uniqueAudioTrackCount) + " unique audio item(s) across " +
+                juce::String(physicalPlan.playOrderTrackCount) + " Play Order track(s)" +
+                (physicalPlan.hiMdSavedBytes > 0
+                     ? (", " + formatMegabytes(physicalPlan.hiMdSavedBytes) + " saved by aliases")
+                     : juce::String()) +
+                ").";
         } else {
             const int totalClu = std::max(1, discState.loadedDisc.active
                                                  ? discState.loadedDisc.physicalTotalClusters()
@@ -4170,10 +4045,11 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
     if (isHiMd) {
         const auto inner = bounds.reduced(1);
         std::int64_t cursorBytes = 0;
-        for (std::size_t i = 0; i < discState.tracks.size(); ++i) {
-            const auto& t = discState.tracks[i];
-            const auto codec = t.codecOverride.value_or(discState.defaultCodec);
-            const auto trackBytes = carta::estimateHiMdTrackBytes(codec, t.totalSamples());
+        for (std::size_t i = 0; i < physicalPlan.spans.size(); ++i) {
+            const auto& sp = physicalPlan.spans[i];
+            const auto codec = sp.codec;
+            const auto trackBytes =
+                carta::estimateHiMdTrackBytes(codec, sp.endSample - sp.startSample);
             if (trackBytes <= 0) {
                 continue;
             }
@@ -4202,7 +4078,7 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
             if (segRect.getWidth() >= 48) {
                 g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
                 g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                g.drawText("T" + juce::String(static_cast<int>(i + 1)) + " " +
+                g.drawText("A" + juce::String(static_cast<int>(i + 1)) + " " +
                                carta::md_ui::codecShortLabel(codec),
                            segRect.reduced(3, 0), juce::Justification::centred, true);
             }
@@ -4218,7 +4094,8 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
             juce::String(pct) + "%)" +
             (discState.tracks.empty()
                  ? juce::String()
-                 : (dot + juce::String(static_cast<int>(discState.tracks.size())) + " track(s)"));
+                 : (dot + juce::String(physicalPlan.uniqueAudioTrackCount) + " uniq / " +
+                    juce::String(physicalPlan.playOrderTrackCount) + " trk"));
         g.setFont(juce::FontOptions(10.2f, juce::Font::bold));
         const int labelW =
             std::min(bounds.getWidth() - 12, static_cast<int>(capText.length()) * 6 + 16);
@@ -4424,8 +4301,16 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
         pr.spanRefCount > 1 ? (" (x" + juce::String(pr.spanRefCount) + ")") : juce::String();
     if (carta::isHiMdMedium(discState.medium)) {
         const auto estBytes = carta::estimateHiMdTrackBytes(pr.codec, pr.totalSamples);
-        physText = (pr.onDisc ? "DISC " : (discState.loadedDisc.active ? "NEW " : "")) +
-                   formatMegabytes(estBytes);
+        const auto baseStr =
+            (pr.onDisc ? juce::String("DISC ") : (discState.loadedDisc.active ? juce::String("NEW ")
+                                                                              : juce::String())) +
+            formatMegabytes(estBytes);
+        if (pr.aliasRefCount > 1) {
+            physText = "Alias -> Pool #" + juce::String(pr.uniqueAudioSlot) + " (" + baseStr +
+                       ") x" + juce::String(pr.aliasRefCount);
+        } else {
+            physText = "Pool #" + juce::String(pr.uniqueAudioSlot) + " · " + baseStr;
+        }
     } else if (pr.partHopsText.isNotEmpty()) {
         const juce::String tagPrefix =
             (pr.onDisc && pr.primarySpanIndex >= 0)
@@ -4538,8 +4423,10 @@ void MdWorkspace::paintAudioBankRow(int row, juce::Graphics& g, int width, int h
     g.drawText(br.label, labelX, 0, labelW, height, juce::Justification::centredLeft, true);
 
     const auto cluStr =
-        compactClusterLabel(br.startCluster, br.endCluster) + " (" + juce::String(br.clusterCount) +
-        " cl)";
+        carta::isHiMdMedium(discState.medium)
+            ? formatMegabytes(br.hiMdBytes)
+            : (compactClusterLabel(br.startCluster, br.endCluster) + " (" +
+               juce::String(br.clusterCount) + " cl)");
     g.setColour(textMuted);
     g.setFont(juce::FontOptions(10.4f));
     g.drawText(cluStr, width - refsW - cluW - 12, 0, cluW, height,
@@ -4583,11 +4470,18 @@ juce::String MdWorkspace::tooltipForAudioBankRow(int row) const {
     }
     const auto& br = audioBankRows[static_cast<std::size_t>(row)];
     juce::String tip = br.isOnDisc ? ("On-Disc Region #" + juce::String(br.onDiscRegionIndex + 1))
-                                   : ("New Upload Span #" + juce::String(br.spanIndex + 1));
-    tip += ": " + br.label + juce::String::fromUTF8(" \xc2\xb7 ") +
-           carta::md_ui::codecLongLabel(br.codec) + juce::String::fromUTF8(" \xc2\xb7 Clusters ") +
-           juce::String(br.startCluster) + ".." + juce::String(br.endCluster) + " (" +
-           juce::String(br.clusterCount) + (br.clusterCount == 1 ? " cluster)" : " clusters)");
+                                   : ("Audio Pool Item #" + juce::String(br.spanIndex + 1));
+    if (carta::isHiMdMedium(discState.medium)) {
+        tip += ": " + br.label + juce::String::fromUTF8(" \xc2\xb7 ") +
+               carta::md_ui::codecLongLabel(br.codec) + juce::String::fromUTF8(" \xc2\xb7 ") +
+               formatMegabytes(br.hiMdBytes);
+    } else {
+        tip += ": " + br.label + juce::String::fromUTF8(" \xc2\xb7 ") +
+               carta::md_ui::codecLongLabel(br.codec) +
+               juce::String::fromUTF8(" \xc2\xb7 Clusters ") + juce::String(br.startCluster) +
+               ".." + juce::String(br.endCluster) + " (" + juce::String(br.clusterCount) +
+               (br.clusterCount == 1 ? " cluster)" : " clusters)");
+    }
     if (br.timelineEndSample > br.timelineStartSample) {
         tip += juce::String::fromUTF8(" \xc2\xb7 ") +
                carta::md_ui::formatClock(br.timelineEndSample - br.timelineStartSample);

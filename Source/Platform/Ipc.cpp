@@ -49,25 +49,36 @@ Usage:
   CartaStudio ipc layers|tracks      JSON layers and clips (zero-based indices)
                                     Clip sample bounds are half-open, or null if empty
   CartaStudio ipc markers            JSON marker list with sample positions and repair flags
-  CartaStudio ipc disc status        JSON UTOC plan, coalesced physical spans, tracks, and groups
+  CartaStudio ipc disc status        JSON Audio Pool, Play Order, coalesced spans, tracks, and groups
   CartaStudio ipc disc view tracks|map|status
-  CartaStudio ipc disc medium md60|md74|md80
-  CartaStudio ipc disc codec sp-stereo|sp-mono|lp2|lp4
+  CartaStudio ipc disc medium md60|md74|md80|himd300|himd1gb
+  CartaStudio ipc disc codec sp-stereo|sp-mono|lp2|lp4|hi-sp|hi-lp|pcm
   CartaStudio ipc disc auto-track on|off
   CartaStudio ipc disc title HALF_WIDTH [FULL_WIDTH]
   CartaStudio ipc disc title-forms HALF_WIDTH FULL_WIDTH
   CartaStudio ipc disc timestamp [ISO|clear]
   CartaStudio ipc disc sync clips|layer1|markers
-  CartaStudio ipc disc track add START END [TITLE] [INDEX]
+  CartaStudio ipc disc track add START END [TITLE] [INDEX] [CODEC]
   CartaStudio ipc disc track add-selection [INDEX]
   CartaStudio ipc disc track remove INDEX
   CartaStudio ipc disc track move INDEX DEST_INDEX
+  CartaStudio ipc disc track move-block FROM_START FROM_END DEST_START
   CartaStudio ipc disc track duplicate INDEX [COUNT]
+  CartaStudio ipc disc track clone INDEX DEST_INDEX
+  CartaStudio ipc disc track alias INDEX DEST_INDEX
+  CartaStudio ipc disc track alias-audio AUDIO_ID DEST_INDEX
+  CartaStudio ipc disc track detach INDEX
+  CartaStudio ipc disc track range INDEX START END
   CartaStudio ipc disc track split INDEX SAMPLE
   CartaStudio ipc disc track merge INDEX
   CartaStudio ipc disc track rename INDEX TITLE
   CartaStudio ipc disc track title-forms INDEX HALF_WIDTH FULL_WIDTH
+  CartaStudio ipc disc track metadata INDEX ARTIST ALBUM
   CartaStudio ipc disc track flags INDEX MODE|clear|keep WP|keep SCMS|keep EMP|keep [TS|clear|keep]
+  CartaStudio ipc disc group set START_TRACK END_TRACK TITLE [FULL_WIDTH]
+  CartaStudio ipc disc group clear START_TRACK END_TRACK
+  CartaStudio ipc disc focus TRACK_INDEX
+  CartaStudio ipc disc preview [TRACK_INDEX | from TRACK_INDEX]
   CartaStudio ipc disc track part add INDEX START END [PART_INDEX]
   CartaStudio ipc disc track part set INDEX PART_INDEX START END
   CartaStudio ipc disc track part repeat INDEX PART_INDEX COUNT
