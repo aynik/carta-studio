@@ -88,6 +88,17 @@ juce::String compactClusterLabel(int startCluster, int endCluster) {
     return "C" + juce::String(startCluster) + enDash + juce::String(endCluster);
 }
 
+juce::String formatMegabytes(std::int64_t bytes) {
+    if (bytes <= 0) {
+        return "0 MB";
+    }
+    if (bytes < 1024LL * 1024LL) {
+        return juce::String((bytes + 1023LL) / 1024LL) + " KB";
+    }
+    const double mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
+    return juce::String(mb, mb >= 100.0 ? 0 : 1) + " MB";
+}
+
 bool resolveSelectedOrPlayheadRange(const carta::TimeSelection& sel, juce::int64 playhead,
                                     juce::int64 masterEnd, juce::int64& outStart,
                                     juce::int64& outEnd) noexcept {
@@ -396,12 +407,25 @@ MdWorkspace::DeviceTrackListModel::DeviceTrackListModel(MdWorkspace& ownerRef) :
 }
 
 int MdWorkspace::DeviceTrackListModel::getNumRows() {
+    if (owner.recordUiState.activeDeviceIsHiMd && owner.recordUiState.hasHiMdStatus) {
+        return static_cast<int>(owner.recordUiState.hiMdStatus.tracks.size());
+    }
     return static_cast<int>(owner.recordUiState.deviceStatus.tracks.size());
 }
 
 void MdWorkspace::DeviceTrackListModel::paintListBoxItem(int row, juce::Graphics& g, int width,
                                                          int height, bool selected) {
     owner.paintDeviceTrackRow(row, g, width, height, selected);
+}
+
+void MdWorkspace::DeviceTrackListModel::listBoxItemClicked(int row, const juce::MouseEvent& event) {
+    owner.handleDeviceTrackClick(row, event);
+}
+
+void MdWorkspace::DeviceTrackListModel::listBoxItemDoubleClicked(int row, const juce::MouseEvent&) {
+    if (owner.recordUiState.activeDeviceIsHiMd && owner.onDumpHiMdTrack && !owner.recordBusy) {
+        owner.onDumpHiMdTrack(row);
+    }
 }
 
 juce::String MdWorkspace::DeviceTrackListModel::getTooltipForRow(int row) {
@@ -479,8 +503,10 @@ MdWorkspace::MdWorkspace()
     mediumBox.addItem("MD 60", 1);
     mediumBox.addItem("MD 74", 2);
     mediumBox.addItem("MD 80", 3);
+    mediumBox.addItem("Hi-MD 300M", 4);
+    mediumBox.addItem("Hi-MD 1GB", 5);
     mediumBox.setSelectedId(3, juce::dontSendNotification);
-    mediumBox.setTooltip("Target MiniDisc physical capacity");
+    mediumBox.setTooltip("Target MiniDisc / Hi-MD physical capacity");
     mediumBox.onChange = [this] {
         if (syncingControls) {
             return;
@@ -493,12 +519,7 @@ MdWorkspace::MdWorkspace()
     };
 
     addAndMakeVisible(codecBox);
-    codecBox.addItem("SP Stereo", 1);
-    codecBox.addItem("SP Mono", 2);
-    codecBox.addItem("LP2", 3);
-    codecBox.addItem("LP4", 4);
-    codecBox.setSelectedId(1, juce::dontSendNotification);
-    codecBox.setTooltip("Default ATRAC codec for tracks without a per-track override");
+    codecBox.setTooltip("Default codec for tracks without a per-track override");
     codecBox.onChange = [this] {
         if (syncingControls) {
             return;
@@ -707,12 +728,7 @@ MdWorkspace::MdWorkspace()
     trackCodecLabel.setFont(juce::FontOptions(11.5f));
 
     addChildComponent(trackCodecBox);
-    trackCodecBox.addItem("Default (Inherited)", 1);
-    trackCodecBox.addItem("SP Stereo", 2);
-    trackCodecBox.addItem("SP Mono", 3);
-    trackCodecBox.addItem("LP2", 4);
-    trackCodecBox.addItem("LP4", 5);
-    trackCodecBox.setSelectedId(1, juce::dontSendNotification);
+    syncCodecDropdownsForMedium(false);
     trackCodecBox.setTooltip(
         "Override encoding mode for this track only, or inherit the disc default");
     trackCodecBox.onChange = [this] {
@@ -837,7 +853,7 @@ MdWorkspace::MdWorkspace()
     deviceCardTitle.setBorderSize(juce::BorderSize<int>(0));
 
     addChildComponent(recordDeviceBox);
-    recordDeviceBox.setTooltip("Select connected NetMD USB recorder");
+    recordDeviceBox.setTooltip("Select connected NetMD or Hi-MD USB recorder");
     recordDeviceBox.onChange = [this] {
         if (!syncingControls && onRecordPreflight) {
             onRecordPreflight();
@@ -947,6 +963,47 @@ MdWorkspace::MdWorkspace()
     updateButtonStates();
 }
 
+void MdWorkspace::syncCodecDropdownsForMedium(bool isHiMd) {
+    const int desiredKind = isHiMd ? 1 : 0;
+    if (lastCodecMenuKind == desiredKind) {
+        return;
+    }
+    const bool prevSync = syncingControls;
+    syncingControls = true;
+
+    codecBox.clear(juce::dontSendNotification);
+    if (isHiMd) {
+        codecBox.addItem("Hi-SP", 5);
+        codecBox.addItem("Hi-LP", 6);
+        codecBox.addItem("LP2", 3);
+        codecBox.addItem("LP4", 4);
+        codecBox.addItem("Linear PCM", 7);
+    } else {
+        codecBox.addItem("SP Stereo", 1);
+        codecBox.addItem("SP Mono", 2);
+        codecBox.addItem("LP2", 3);
+        codecBox.addItem("LP4", 4);
+    }
+
+    trackCodecBox.clear(juce::dontSendNotification);
+    trackCodecBox.addItem("Default (Inherited)", 1);
+    if (isHiMd) {
+        trackCodecBox.addItem("Hi-SP", 6);
+        trackCodecBox.addItem("Hi-LP", 7);
+        trackCodecBox.addItem("LP2", 4);
+        trackCodecBox.addItem("LP4", 5);
+        trackCodecBox.addItem("Linear PCM", 8);
+    } else {
+        trackCodecBox.addItem("SP Stereo", 2);
+        trackCodecBox.addItem("SP Mono", 3);
+        trackCodecBox.addItem("LP2", 4);
+        trackCodecBox.addItem("LP4", 5);
+    }
+
+    lastCodecMenuKind = desiredKind;
+    syncingControls = prevSync;
+}
+
 juce::String MdWorkspace::getTooltip() {
     return lastHoverTooltip;
 }
@@ -1045,19 +1102,41 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
     masterEndSample = carta::projectEndSample(session);
     revision = generation;
 
+    const bool isHiMd = carta::isHiMdMedium(discState.medium);
     std::string planErr;
     planValid = carta::planMdPhysicalAudio(discState, physicalPlan, planErr);
     planErrorText = planErr;
 
-    carta::UtocDiscState compiledUtoc;
-    std::string utocErr;
-    utocValid = carta::compileMdDiscToUtoc(discState, compiledUtoc, utocErr);
-    utocErrorText = utocErr;
-    const int physTotal =
-        discState.loadedDisc.active ? discState.loadedDisc.physicalTotalClusters() : 0;
-    budget = utocValid ? carta::computeUtocBudget(
-                             compiledUtoc, carta::mdMediumToString(discState.medium), physTotal)
-                       : carta::UtocBudget{};
+    if (isHiMd) {
+        utocValid = true;
+        utocErrorText.clear();
+        budget = {};
+        hiMdTotalBytes =
+            (recordUiState.activeDeviceIsHiMd && recordUiState.hasHiMdStatus &&
+             recordUiState.hiMdStatus.fsTotalBytes > 0)
+                ? recordUiState.hiMdStatus.fsTotalBytes
+                : carta::hiMdMediumCapacityBytes(discState.medium);
+        hiMdUsedBytes = 0;
+        for (const auto& tr : discState.tracks) {
+            hiMdUsedBytes += carta::estimateHiMdTrackBytes(
+                carta::effectiveTrackCodec(discState, tr), tr.totalSamples());
+        }
+        if (!discState.tracks.empty()) {
+            hiMdUsedBytes += static_cast<std::int64_t>(discState.tracks.size()) * 32768LL + 65536LL;
+        }
+    } else {
+        hiMdUsedBytes = 0;
+        hiMdTotalBytes = 0;
+        carta::UtocDiscState compiledUtoc;
+        std::string utocErr;
+        utocValid = carta::compileMdDiscToUtoc(discState, compiledUtoc, utocErr);
+        utocErrorText = utocErr;
+        const int physTotal =
+            discState.loadedDisc.active ? discState.loadedDisc.physicalTotalClusters() : 0;
+        budget = utocValid ? carta::computeUtocBudget(
+                                 compiledUtoc, carta::mdMediumToString(discState.medium), physTotal)
+                           : carta::UtocBudget{};
+    }
 
     // Build per-placement reference counts so aliased/shared parts across both newly uploaded
     // spans and loaded on-disc regions are identified accurately without conflating coalesced
@@ -1146,6 +1225,8 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         row.title = titleStr.empty() ? ("Track " + juce::String(static_cast<int>(i + 1)))
                                      : juce::String::fromUTF8(titleStr.c_str());
         row.fullWidthTitle = juce::String::fromUTF8(t.fullWidthTitle.c_str());
+        row.artist = juce::String::fromUTF8(t.artist.c_str());
+        row.album = juce::String::fromUTF8(t.album.c_str());
         row.effectiveCodec = carta::effectiveTrackCodec(discState, t);
         row.hasCodecOverride = t.codecOverride.has_value();
         row.writeProtected = t.writeProtected;
@@ -1348,6 +1429,14 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
               });
 
     syncingControls = true;
+    if (lastCodecMenuKind != (isHiMd ? 1 : 0)) {
+        syncCodecDropdownsForMedium(isHiMd);
+    }
+    discTitleEditor.setTextToShowWhenEmpty(isHiMd ? "Disc title" : "Disc title (ASCII)",
+                                           juce::Colours::grey);
+    discTitleEditor.setTooltip(
+        isHiMd ? "Hi-MD disc title (Enter commits, Escape reverts)"
+               : "Disc title written to UTOC Sector 1 (Enter commits, Escape reverts)");
     discBaselineTitle = juce::String::fromUTF8(discState.halfWidthTitle.c_str());
     if (!discTitleEditor.hasKeyboardFocus(true)) {
         discTitleEditor.setText(discBaselineTitle, juce::dontSendNotification);
@@ -1413,21 +1502,37 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
     recordBusy = snapshot.busy || snapshot.progress.active;
     syncingControls = true;
     recordDeviceIds.clear();
+    recordDeviceIsHiMd.clear();
     recordDeviceBox.clear(juce::dontSendNotification);
     int selectedMenuId = 0;
-    for (std::size_t i = 0; i < snapshot.devices.size(); ++i) {
-        const auto& d = snapshot.devices[i];
-        const int menuId = static_cast<int>(i) + 1;
+    int nextId = 1;
+    for (const auto& d : snapshot.devices) {
         recordDeviceIds.push_back(d.id);
+        recordDeviceIsHiMd.push_back(false);
         const auto devName = juce::String::fromUTF8(d.name.c_str());
         const auto devId = juce::String::fromUTF8(d.id.c_str());
-        recordDeviceBox.addItem(devName + " [" + devId + "]", menuId);
-        if (!snapshot.activeDeviceId.empty() && d.id == snapshot.activeDeviceId) {
-            selectedMenuId = menuId;
+        recordDeviceBox.addItem(devName + " [" + devId + "]", nextId);
+        if (!snapshot.activeDeviceIsHiMd && !snapshot.activeDeviceId.empty() &&
+            d.id == snapshot.activeDeviceId) {
+            selectedMenuId = nextId;
         }
+        ++nextId;
+    }
+    for (const auto& d : snapshot.hiMdDevices) {
+        recordDeviceIds.push_back(d.id);
+        recordDeviceIsHiMd.push_back(true);
+        const auto devName = juce::String::fromUTF8(d.name.c_str());
+        const auto devId = juce::String::fromUTF8(d.id.c_str());
+        recordDeviceBox.addItem(devName + juce::String::fromUTF8(" [Hi-MD \xc2\xb7 ") + devId + "]",
+                                nextId);
+        if (snapshot.activeDeviceIsHiMd && !snapshot.activeDeviceId.empty() &&
+            d.id == snapshot.activeDeviceId) {
+            selectedMenuId = nextId;
+        }
+        ++nextId;
     }
     if (recordDeviceIds.empty()) {
-        recordDeviceBox.addItem("No NetMD device", 1);
+        recordDeviceBox.addItem("No NetMD / Hi-MD device", 1);
         recordDeviceBox.setSelectedId(1, juce::dontSendNotification);
         recordDeviceBox.setEnabled(false);
     } else {
@@ -1436,6 +1541,36 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
                                       juce::dontSendNotification);
     }
     syncingControls = false;
+
+    if (snapshot.activeDeviceIsHiMd) {
+        loadDiscButton.setButtonText("Load Disc");
+        loadDiscButton.setTooltip("Load Hi-MD disc tracks and groups into editor");
+        readDiscTocButton.setButtonText("Dump Track...");
+        readDiscTocButton.setTooltip("Extract selected on-disc Hi-MD track as .oma or .wav");
+        eraseDiscButton.setButtonText("Wipe Disc...");
+        eraseDiscButton.setTooltip("Wipe tracks or reformat Hi-MD FAT16 filesystem");
+        writeUtocButton.setButtonText("Disc Tools...");
+        writeUtocButton.setTooltip("Rename Hi-MD disc/tracks, reorder, delete, or sync groups");
+        recordDiscButton.setButtonText("Record Hi-MD...");
+        recordDiscButton.setTooltip("Encode and upload authored tracks to Hi-MD disc");
+    } else {
+        loadDiscButton.setButtonText("Load Disc");
+        loadDiscButton.setTooltip(
+            "Load existing MiniDisc UTOC into editor for non-destructive editing");
+        readDiscTocButton.setButtonText("Read Disc TOC...");
+        readDiscTocButton.setTooltip(
+            "Read physical UTOC Sectors 0/1/2/4 from the inserted MiniDisc");
+        eraseDiscButton.setButtonText("Erase Disc...");
+        eraseDiscButton.setTooltip(
+            "Erase all tracks (and switch Hi-MD formatted discs back to standard MD)");
+        writeUtocButton.setButtonText("Write UTOC Only...");
+        writeUtocButton.setTooltip(
+            "Update UTOC Sectors 0/1/2/4 on hardware without erasing recorded audio");
+        recordDiscButton.setButtonText("Record MiniDisc...");
+        recordDiscButton.setTooltip(
+            "Sync edited MiniDisc UTOC and upload any new audio spans without erasing preserved "
+            "on-disc audio");
+    }
 
     utocSummaryLabel.setText(snapshot.utocSummaryText, juce::dontSendNotification);
     recordBadgeLabel.setText(snapshot.badgeText, juce::dontSendNotification);
@@ -1446,9 +1581,12 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
     deviceTrackList.repaint();
     refreshRecordButton.setEnabled(!recordBusy);
     loadDiscButton.setEnabled(!recordBusy && snapshot.canLoadDisc);
-    readDiscTocButton.setEnabled(!recordBusy && snapshot.canReadToc);
+    readDiscTocButton.setEnabled(
+        !recordBusy && (snapshot.activeDeviceIsHiMd ? snapshot.canDumpTrack : snapshot.canReadToc));
     eraseDiscButton.setEnabled(!recordBusy && snapshot.canErase);
-    writeUtocButton.setEnabled(!recordBusy && snapshot.canWriteUtoc);
+    writeUtocButton.setEnabled(
+        !recordBusy &&
+        (snapshot.activeDeviceIsHiMd ? snapshot.canManageHiMd : snapshot.canWriteUtoc));
     recordDiscButton.setEnabled(!recordBusy && snapshot.canRecord);
     repaint();
 }
@@ -1459,6 +1597,64 @@ juce::String MdWorkspace::selectedRecordDeviceId() const {
         return juce::String::fromUTF8(recordDeviceIds[static_cast<std::size_t>(idx)].c_str());
     }
     return {};
+}
+
+bool MdWorkspace::selectedRecordDeviceIsHiMd() const noexcept {
+    const int idx = recordDeviceBox.getSelectedId() - 1;
+    if (idx >= 0 && idx < static_cast<int>(recordDeviceIsHiMd.size())) {
+        return recordDeviceIsHiMd[static_cast<std::size_t>(idx)];
+    }
+    return false;
+}
+
+int MdWorkspace::selectedDeviceTrackIndex0() const noexcept {
+    const int row = deviceTrackList.getSelectedRow();
+    if (recordUiState.activeDeviceIsHiMd && recordUiState.hasHiMdStatus) {
+        return (row >= 0 && row < static_cast<int>(recordUiState.hiMdStatus.tracks.size())) ? row
+                                                                                           : -1;
+    }
+    return (row >= 0 && row < static_cast<int>(recordUiState.deviceStatus.tracks.size())) ? row
+                                                                                          : -1;
+}
+
+void MdWorkspace::handleDeviceTrackClick(int row, const juce::MouseEvent& event) {
+    if (!recordUiState.activeDeviceIsHiMd || !recordUiState.hasHiMdStatus || recordBusy) {
+        return;
+    }
+    if (row < 0 || row >= static_cast<int>(recordUiState.hiMdStatus.tracks.size())) {
+        return;
+    }
+    if (!event.mods.isPopupMenu()) {
+        return;
+    }
+    deviceTrackList.selectRow(row, false, true);
+    const int nTracks = static_cast<int>(recordUiState.hiMdStatus.tracks.size());
+    juce::PopupMenu menu;
+    menu.addItem(1, "Dump Track...");
+    menu.addItem(2, "Edit Track Metadata...");
+    menu.addSeparator();
+    menu.addItem(3, "Move Track Up", row > 0);
+    menu.addItem(4, "Move Track Down", row + 1 < nTracks);
+    menu.addSeparator();
+    menu.addItem(5, "Delete Track...");
+    menu.showMenuAsync(
+        juce::PopupMenu::Options(),
+        [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
+            if (safe == nullptr || choice <= 0 || safe->recordBusy) {
+                return;
+            }
+            if (choice == 1 && safe->onDumpHiMdTrack) {
+                safe->onDumpHiMdTrack(row);
+            } else if (choice == 2 && safe->onRenameHiMdTrack) {
+                safe->onRenameHiMdTrack(row);
+            } else if (choice == 3 && safe->onMoveHiMdTrack) {
+                safe->onMoveHiMdTrack(row, -1);
+            } else if (choice == 4 && safe->onMoveHiMdTrack) {
+                safe->onMoveHiMdTrack(row, 1);
+            } else if (choice == 5 && safe->onDeleteHiMdTrack) {
+                safe->onDeleteHiMdTrack(row);
+            }
+        });
 }
 
 std::vector<int> MdWorkspace::selectedTrackIndices0() const {
@@ -1555,9 +1751,12 @@ void MdWorkspace::paint(juce::Graphics& g) {
         g.fillRect(activeTabBounds.getX() + 4, 69, std::max(0, activeTabBounds.getWidth() - 8), 2);
     }
 
-    // UTOC budget pill in header
+    // UTOC / Hi-MD capacity budget pill in header
     if (!budgetPillBounds.isEmpty()) {
-        const bool over = !utocValid || !budget.fits() || !planValid;
+        const bool isHiMd = carta::isHiMdMedium(discState.medium);
+        const bool over =
+            isHiMd ? (!planValid || (hiMdTotalBytes > 0 && hiMdUsedBytes > hiMdTotalBytes))
+                   : (!utocValid || !budget.fits() || !planValid);
         const auto pillFill = over ? (dark ? juce::Colour(0xff4a2326) : juce::Colour(0xfffee2e2))
                                    : (dark ? juce::Colour(0xff303030) : juce::Colour(0xffeaeaea));
         const auto pillStroke = over ? (dark ? juce::Colour(0xffd9534f) : juce::Colour(0xffb91c1c))
@@ -1599,7 +1798,9 @@ void MdWorkspace::paint(juce::Graphics& g) {
         }
     } else {
         const bool devConnected =
-            recordUiState.hasDeviceStatus && !recordUiState.deviceStatus.deviceId.empty();
+            recordUiState.activeDeviceIsHiMd
+                ? (recordUiState.hasHiMdStatus && !recordUiState.hiMdStatus.deviceId.empty())
+                : (recordUiState.hasDeviceStatus && !recordUiState.deviceStatus.deviceId.empty());
         carta::md_ui::paintPanelCard(g, deviceCardBounds, dark, devConnected);
         carta::md_ui::paintPanelCard(g, planCardBounds, dark);
         paintPhysicalDiscMeter(g, deviceDiscMeterBounds, dark);
@@ -1610,18 +1811,22 @@ void MdWorkspace::paint(juce::Graphics& g) {
             g.setColour(border);
             g.drawRoundedRectangle(devListBounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
             if (!deviceTrackList.isVisible()) {
-                const auto& st = recordUiState.deviceStatus;
-                juce::String emptyMsg = "Connect a NetMD recorder and click Refresh.";
+                juce::String emptyMsg = "Connect a NetMD / Hi-MD recorder and click Refresh.";
                 if (devConnected) {
-                    if (!st.discPresent) {
-                        emptyMsg = "No disc loaded in recorder";
-                    } else if (st.hiMdFormatted) {
-                        emptyMsg = "Hi-MD formatted disc — erase for Standard MD";
-                    } else if (st.trackCount > 0 && st.tracks.empty()) {
-                        emptyMsg = juce::String(st.trackCount) +
-                                   " tracks on disc — click Load Disc to view & edit";
+                    if (recordUiState.activeDeviceIsHiMd) {
+                        emptyMsg = "Blank Hi-MD disc — 0 tracks on device";
                     } else {
-                        emptyMsg = "Blank disc — 0 tracks on device";
+                        const auto& st = recordUiState.deviceStatus;
+                        if (!st.discPresent) {
+                            emptyMsg = "No disc loaded in recorder";
+                        } else if (st.hiMdFormatted) {
+                            emptyMsg = "Hi-MD formatted disc — select Hi-MD device or erase";
+                        } else if (st.trackCount > 0 && st.tracks.empty()) {
+                            emptyMsg = juce::String(st.trackCount) +
+                                       " tracks on disc — click Load Disc to view & edit";
+                        } else {
+                            emptyMsg = "Blank disc — 0 tracks on device";
+                        }
                     }
                 }
                 g.setColour(textMuted);
@@ -1639,8 +1844,7 @@ void MdWorkspace::paint(juce::Graphics& g) {
             g.drawText(
                 planViewMode == "bank"
                     ? "Load a disc or import timeline audio to view physical Audio Bank regions."
-                    : "Add MiniDisc tracks (Tracks & UTOC -> Tracks from Clips) to plan physical "
-                      "disc spans.",
+                    : "Add MiniDisc tracks (Tracks & UTOC -> Tracks from Clips) to plan recording.",
                 planList.getBounds().reduced(8, 0), juce::Justification::centred, true);
         }
         if (recordBusy || recordUiState.progress.active) {
@@ -1671,7 +1875,7 @@ void MdWorkspace::resized() {
 
     const int titleW = juce::jlimit(90, 190, controlsAvail * 24 / 100);
     const int formsW = 92;
-    const int medW = 84;
+    const int medW = 96;
     const int codecW = 112;
     const int autoW = 122;
     closeButton.setBounds(w - 10 - closeW, r1y, closeW, r1h);
@@ -1973,6 +2177,7 @@ void MdWorkspace::layoutPlanCard(juce::Rectangle<int> area) {
 void MdWorkspace::updateTabVisibility() {
     const bool isTracks = activeTab == "tracks";
     const bool isRecord = !isTracks;
+    const bool isHiMd = carta::isHiMdMedium(discState.medium);
     const auto selected = selectedTrackIndices0();
     const bool noneSelected = isTracks && selected.empty();
     const bool oneSelected = isTracks && selected.size() == 1;
@@ -1985,6 +2190,9 @@ void MdWorkspace::updateTabVisibility() {
     inspectUtocButton.setVisible(isRecord);
     importUtocButton.setVisible(isRecord);
     exportUtocButton.setVisible(isRecord);
+    inspectUtocButton.setEnabled(!isHiMd);
+    importUtocButton.setEnabled(!isHiMd);
+    exportUtocButton.setEnabled(!isHiMd);
 
     insertTrackButton.setVisible(isTracks);
     duplicateTrackButton.setVisible(isTracks);
@@ -2031,9 +2239,12 @@ void MdWorkspace::updateTabVisibility() {
     refreshRecordButton.setVisible(isRecord);
     recordBadgeLabel.setVisible(isRecord);
     const bool showDeviceTracks =
-        isRecord && !deviceTrackList.getBounds().isEmpty() && recordUiState.hasDeviceStatus &&
-        recordUiState.deviceStatus.discPresent && !recordUiState.deviceStatus.hiMdFormatted &&
-        !recordUiState.deviceStatus.tracks.empty();
+        isRecord && !deviceTrackList.getBounds().isEmpty() &&
+        ((recordUiState.activeDeviceIsHiMd && recordUiState.hasHiMdStatus &&
+          !recordUiState.hiMdStatus.tracks.empty()) ||
+         (!recordUiState.activeDeviceIsHiMd && recordUiState.hasDeviceStatus &&
+          recordUiState.deviceStatus.discPresent && !recordUiState.deviceStatus.hiMdFormatted &&
+          !recordUiState.deviceStatus.tracks.empty()));
     deviceTrackList.setVisible(showDeviceTracks);
     loadDiscButton.setVisible(isRecord);
     readDiscTocButton.setVisible(isRecord);
@@ -2062,6 +2273,38 @@ void MdWorkspace::updateTabVisibility() {
 }
 
 void MdWorkspace::refreshPlanSummaryLabels() {
+    if (carta::isHiMdMedium(discState.medium)) {
+        const std::int64_t capBytes =
+            hiMdTotalBytes > 0 ? hiMdTotalBytes : carta::hiMdMediumCapacityBytes(discState.medium);
+        const int pct =
+            capBytes > 0
+                ? static_cast<int>(std::llround((static_cast<double>(hiMdUsedBytes) * 100.0) /
+                                                static_cast<double>(capBytes)))
+                : 0;
+        const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+        budgetPillText = juce::String(static_cast<int>(discState.tracks.size())) + " trk" + dot +
+                         juce::String(static_cast<int>(discState.groups.size())) + " grp" + dot +
+                         formatMegabytes(hiMdUsedBytes) + " / " + formatMegabytes(capBytes) +
+                         " (" + juce::String(pct) + "%)";
+
+        if (!planValid) {
+            planHintLabel.setText(juce::String::fromUTF8(planErrorText.c_str()),
+                                  juce::dontSendNotification);
+        } else if (!trackRows.empty()) {
+            planHintLabel.setText("Hi-MD FAT16" + dot +
+                                      juce::String(static_cast<int>(trackRows.size())) +
+                                      " track(s)" + dot + formatMegabytes(hiMdUsedBytes) + " / " +
+                                      formatMegabytes(capBytes),
+                                  juce::dontSendNotification);
+        } else {
+            planHintLabel.setText(
+                "Hi-MD mode: drag splits in MD Tracks lane or switch to Device & Record to "
+                "upload Hi-SP / Hi-LP / LP2 / LP4 / PCM",
+                juce::dontSendNotification);
+        }
+        return;
+    }
+
     const auto totalClusters =
         std::max(1, discState.loadedDisc.active ? discState.loadedDisc.physicalTotalClusters()
                                                 : carta::mdTotalClusters(discState.medium));
@@ -2102,6 +2345,7 @@ void MdWorkspace::refreshPlanSummaryLabels() {
 
 void MdWorkspace::rebuildPartRows(int preferredPartRow) {
     partRows.clear();
+    const bool isHiMd = carta::isHiMdMedium(discState.medium);
     const auto selected = selectedTrackIndices0();
     if (selected.size() == 1) {
         const int row = selected.front();
@@ -2131,9 +2375,15 @@ void MdWorkspace::rebuildPartRows(int preferredPartRow) {
         syncingControls = true;
         const auto titleStr = track.halfWidthTitle;
         trackBaselineTitle = juce::String::fromUTF8(titleStr.c_str());
+        trackTitleEditor.setTextToShowWhenEmpty(isHiMd ? "Track title" : "Track title (ASCII)",
+                                                juce::Colours::grey);
         if (!trackTitleEditor.hasKeyboardFocus(true)) {
             trackTitleEditor.setText(trackBaselineTitle, juce::dontSendNotification);
         }
+        trackFormsButton.setButtonText(isHiMd ? "Meta..." : "Forms...");
+        trackFormsButton.setTooltip(
+            isHiMd ? "Edit Hi-MD title, artist, and album metadata (Shift+F2)"
+                   : "Edit ASCII and Full-Width/Japanese track titles (Shift+F2)");
         trackCodecBox.setSelectedId(
             track.codecOverride ? (carta::md_ui::codecToMenuId(*track.codecOverride) + 1) : 1,
             juce::dontSendNotification);
@@ -2149,8 +2399,8 @@ void MdWorkspace::rebuildPartRows(int preferredPartRow) {
                                            ? "Group: None..."
                                            : "Grp: " +
                                                  juce::String::fromUTF8(rowMeta.groupName.c_str()));
-        partsHeaderLabel.setText("UTOC Parts (" + juce::String(static_cast<int>(partRows.size())) +
-                                     ")",
+        partsHeaderLabel.setText((isHiMd ? "Parts (" : "UTOC Parts (") +
+                                     juce::String(static_cast<int>(partRows.size())) + ")",
                                  juce::dontSendNotification);
         syncingControls = false;
     } else if (selected.size() > 1) {
@@ -3456,9 +3706,30 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
     const int titleX = 114;
     const int titleAvail = std::max(30, width - titleX - rightReserve - attrWidth);
     if (!(inlineEditingRow == row && inlineTrackTitleEditor.isVisible())) {
+        const juce::Font titleFont(
+            juce::FontOptions(12.2f, selected ? juce::Font::bold : juce::Font::plain));
         g.setColour(textPrimary);
-        g.setFont(juce::FontOptions(12.2f, selected ? juce::Font::bold : juce::Font::plain));
+        g.setFont(titleFont);
         g.drawText(tr.title, titleX, 0, titleAvail, height, juce::Justification::centredLeft, true);
+        if (tr.artist.isNotEmpty() || tr.album.isNotEmpty()) {
+            juce::GlyphArrangement ga;
+            ga.addLineOfText(titleFont, tr.title, 0.0f, 0.0f);
+            const int titleW = std::min(
+                titleAvail,
+                static_cast<int>(std::ceil(ga.getBoundingBox(0, -1, false).getWidth())) + 2);
+            if (titleAvail - titleW > 28) {
+                juce::String meta = tr.artist;
+                if (tr.album.isNotEmpty()) {
+                    meta += (meta.isNotEmpty() ? juce::String::fromUTF8(" \xc2\xb7 ")
+                                               : juce::String()) +
+                            tr.album;
+                }
+                g.setColour(textMuted);
+                g.setFont(juce::FontOptions(10.8f));
+                g.drawText(juce::String::fromUTF8(" \xe2\x80\x94 ") + meta, titleX + titleW, 0,
+                           titleAvail - titleW, height, juce::Justification::centredLeft, true);
+            }
+        }
     }
 
     if (attrWidth > 0) {
@@ -3553,6 +3824,12 @@ juce::String MdWorkspace::tooltipForTrackRow(int row) const {
     if (tr.fullWidthTitle.isNotEmpty()) {
         tip += " [" + tr.fullWidthTitle + "]";
     }
+    if (tr.artist.isNotEmpty()) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Artist: ") + tr.artist;
+    }
+    if (tr.album.isNotEmpty()) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Album: ") + tr.album;
+    }
     tip += juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::codecLongLabel(tr.effectiveCodec) +
            juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::formatClock(tr.totalSamples) +
            " (" + juce::String(tr.partCount) + (tr.partCount == 1 ? " part)" : " parts)");
@@ -3594,52 +3871,93 @@ juce::String MdWorkspace::formatSecMmSs(int totalSeconds) {
 
 void MdWorkspace::updatePanelHoverTooltip(juce::Point<int> point) {
     if (budgetPillBounds.contains(point)) {
-        lastHoverTooltip =
-            utocValid
-                ? "UTOC Sectors: " + juce::String(budget.usedTracks) + "/" +
-                      juce::String(budget.maxTracks) + " tracks, " +
-                      juce::String(budget.usedFragments) + "/" + juce::String(budget.maxFragments) +
-                      " fragments, " + juce::String(budget.usedClusters) + "/" +
-                      juce::String(budget.totalClusters) + " clusters, " +
-                      juce::String(budget.usedHalfWidthCells) + "/" +
-                      juce::String(budget.maxHalfWidthCells) + " ASCII title cells, " +
-                      juce::String(budget.usedFullWidthCells) + "/" +
-                      juce::String(budget.maxFullWidthCells) + " full-width cells."
-                : juce::String::fromUTF8(utocErrorText.c_str());
-    } else if (activeTab == "record" && targetBarBounds.contains(point)) {
-        const int totalClu =
-            std::max(1, discState.loadedDisc.active ? discState.loadedDisc.physicalTotalClusters()
-                                                    : carta::mdTotalClusters(discState.medium));
-        if (discState.loadedDisc.active) {
+        if (carta::isHiMdMedium(discState.medium)) {
+            const auto capBytes = hiMdTotalBytes > 0
+                                      ? hiMdTotalBytes
+                                      : carta::hiMdMediumCapacityBytes(discState.medium);
             lastHoverTooltip =
-                "Target Disc Capacity: " + juce::String(physicalPlan.usedClusters) + "/" +
-                juce::String(totalClu) + " clusters (" +
-                juce::String(physicalPlan.onDiscClusters) + " on-disc + " +
-                juce::String(physicalPlan.newUploadClusters) + " new upload(s)" +
-                (physicalPlan.reclaimedClusters > 0
-                     ? (", reclaim " + juce::String(physicalPlan.reclaimedClusters) + " clusters")
-                     : juce::String()) +
-                ").";
+                "Hi-MD Disc Layout: " + juce::String(static_cast<int>(discState.tracks.size())) +
+                " track(s), est. " + formatMegabytes(hiMdUsedBytes) + " / " +
+                formatMegabytes(capBytes) +
+                (discState.loadedDisc.active ? " (loaded Hi-MD disc)" : "") + ".";
         } else {
             lastHoverTooltip =
-                "Target Disc Capacity: " + juce::String(physicalPlan.usedClusters) + "/" +
-                juce::String(totalClu) + " clusters across " +
-                juce::String(static_cast<int>(physicalPlan.spans.size())) +
-                " physical audio upload(s)" +
-                (physicalPlan.savedClusters > 0 ? (" (" + juce::String(physicalPlan.savedClusters) +
-                                                   " clusters saved by aliasing)")
-                                                : juce::String()) +
-                ".";
+                utocValid
+                    ? "UTOC Sectors: " + juce::String(budget.usedTracks) + "/" +
+                          juce::String(budget.maxTracks) + " tracks, " +
+                          juce::String(budget.usedFragments) + "/" +
+                          juce::String(budget.maxFragments) + " fragments, " +
+                          juce::String(budget.usedClusters) + "/" +
+                          juce::String(budget.totalClusters) + " clusters, " +
+                          juce::String(budget.usedHalfWidthCells) + "/" +
+                          juce::String(budget.maxHalfWidthCells) + " ASCII title cells, " +
+                          juce::String(budget.usedFullWidthCells) + "/" +
+                          juce::String(budget.maxFullWidthCells) + " full-width cells."
+                    : juce::String::fromUTF8(utocErrorText.c_str());
         }
-    } else if (activeTab == "record" && deviceDiscMeterBounds.contains(point) &&
-               recordUiState.hasDeviceStatus) {
-        const auto& st = recordUiState.deviceStatus;
-        lastHoverTooltip =
-            st.discPresent
-                ? ("Physical Disc: " + juce::String::fromUTF8(st.discTitle.c_str()) + " (" +
-                   juce::String(st.trackCount) + " tracks, used " + formatSecMmSs(st.usedSeconds) +
-                   ", free " + formatSecMmSs(st.leftSeconds) + ")")
-                : "No disc inserted in selected USB recorder.";
+    } else if (activeTab == "record" && targetBarBounds.contains(point)) {
+        if (carta::isHiMdMedium(discState.medium)) {
+            const auto capBytes =
+                std::max<std::int64_t>(1, hiMdTotalBytes > 0
+                                              ? hiMdTotalBytes
+                                              : carta::hiMdMediumCapacityBytes(discState.medium));
+            lastHoverTooltip = "Target Hi-MD Capacity: " + formatMegabytes(hiMdUsedBytes) +
+                               " / " + formatMegabytes(capBytes) + " across " +
+                               juce::String(static_cast<int>(discState.tracks.size())) +
+                               " track(s).";
+        } else {
+            const int totalClu = std::max(1, discState.loadedDisc.active
+                                                 ? discState.loadedDisc.physicalTotalClusters()
+                                                 : carta::mdTotalClusters(discState.medium));
+            if (discState.loadedDisc.active) {
+                lastHoverTooltip =
+                    "Target Disc Capacity: " + juce::String(physicalPlan.usedClusters) + "/" +
+                    juce::String(totalClu) + " clusters (" +
+                    juce::String(physicalPlan.onDiscClusters) + " on-disc + " +
+                    juce::String(physicalPlan.newUploadClusters) + " new upload(s)" +
+                    (physicalPlan.reclaimedClusters > 0
+                         ? (", reclaim " + juce::String(physicalPlan.reclaimedClusters) +
+                            " clusters")
+                         : juce::String()) +
+                    ").";
+            } else {
+                lastHoverTooltip =
+                    "Target Disc Capacity: " + juce::String(physicalPlan.usedClusters) + "/" +
+                    juce::String(totalClu) + " clusters across " +
+                    juce::String(static_cast<int>(physicalPlan.spans.size())) +
+                    " physical audio upload(s)" +
+                    (physicalPlan.savedClusters > 0
+                         ? (" (" + juce::String(physicalPlan.savedClusters) +
+                            " clusters saved by aliasing)")
+                         : juce::String()) +
+                    ".";
+            }
+        }
+    } else if (activeTab == "record" && deviceDiscMeterBounds.contains(point)) {
+        if (recordUiState.activeDeviceIsHiMd && recordUiState.hasHiMdStatus) {
+            const auto& st = recordUiState.hiMdStatus;
+            const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+            lastHoverTooltip =
+                st.fsTotalBytes > 0
+                    ? ("Physical Hi-MD Disc: " +
+                       (!st.discTitle.empty() ? juce::String::fromUTF8(st.discTitle.c_str())
+                                              : juce::String("Untitled Hi-MD Disc")) +
+                       " (" + juce::String(st.trackCount) + " tracks, used " +
+                       formatMegabytes(st.fsUsedBytes) + dot + "free " +
+                       formatMegabytes(st.fsFreeBytes) + ")")
+                    : "No Hi-MD disc mounted on selected USB recorder.";
+        } else if (!recordUiState.activeDeviceIsHiMd && recordUiState.hasDeviceStatus) {
+            const auto& st = recordUiState.deviceStatus;
+            lastHoverTooltip =
+                st.discPresent
+                    ? ("Physical Disc: " + juce::String::fromUTF8(st.discTitle.c_str()) + " (" +
+                       juce::String(st.trackCount) + " tracks, used " +
+                       formatSecMmSs(st.usedSeconds) + ", free " + formatSecMmSs(st.leftSeconds) +
+                       ")")
+                    : "No disc inserted in selected USB recorder.";
+        } else {
+            lastHoverTooltip.clear();
+        }
     } else {
         lastHoverTooltip.clear();
     }
@@ -3661,6 +3979,76 @@ void MdWorkspace::paintPhysicalDiscMeter(juce::Graphics& g, juce::Rectangle<int>
     g.drawRoundedRectangle(bounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
 
     auto area = bounds.reduced(8, 4);
+    if (recordUiState.activeDeviceIsHiMd) {
+        if (!recordUiState.hasHiMdStatus || recordUiState.hiMdStatus.deviceId.empty()) {
+            g.setColour(textMuted);
+            g.setFont(juce::FontOptions(11.0f));
+            g.drawText("Connect a Sony NetMD / Hi-MD recorder via USB and click Refresh.", area,
+                       juce::Justification::centredLeft, true);
+            return;
+        }
+        const auto& st = recordUiState.hiMdStatus;
+        auto headerRow = area.removeFromTop(16);
+        const bool discPresent = st.fsTotalBytes > 0;
+        juce::Colour stateCol = dark ? juce::Colour(0xff8a8a8a) : juce::Colour(0xff666666);
+        juce::String stateLabel;
+        if (!discPresent) {
+            stateLabel = "NO DISC";
+        } else {
+            stateCol = dark ? juce::Colour(0xff8b5cf6) : juce::Colour(0xff6d28d9);
+            stateLabel = st.trackCount == 0 ? juce::String("BLANK")
+                                            : (juce::String(st.trackCount) + " TRK");
+        }
+        const int pillW = std::min(96, static_cast<int>(stateLabel.length()) * 7 + 16);
+        const auto pillRect = headerRow.removeFromRight(pillW);
+        g.setColour(stateCol.withAlpha(dark ? 0.28f : 0.16f));
+        g.fillRoundedRectangle(pillRect.toFloat(), 3.0f);
+        g.setColour(dark ? stateCol.brighter(0.35f) : stateCol);
+        g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        g.drawText(stateLabel, pillRect, juce::Justification::centred, false);
+
+        headerRow.removeFromRight(6);
+        const juce::String titleText =
+            !discPresent ? juce::String("No Hi-MD disc inserted")
+                         : (!st.discTitle.empty() ? juce::String::fromUTF8(st.discTitle.c_str())
+                                                  : juce::String("Untitled Hi-MD Disc"));
+        g.setColour(textPrimary);
+        g.setFont(juce::FontOptions(11.4f, juce::Font::bold));
+        g.drawText(titleText, headerRow, juce::Justification::centredLeft, true);
+
+        if (area.getHeight() >= 11) {
+            area.removeFromTop(3);
+            const auto barRect = area.removeFromTop(8);
+            g.setColour(wellBg);
+            g.fillRoundedRectangle(barRect.toFloat(), 3.0f);
+            g.setColour(border);
+            g.drawRoundedRectangle(barRect.toFloat().reduced(0.5f), 3.0f, 1.0f);
+
+            if (discPresent && st.fsUsedBytes > 0) {
+                const double frac =
+                    juce::jlimit(0.0, 1.0,
+                                 static_cast<double>(st.fsUsedBytes) /
+                                     static_cast<double>(st.fsTotalBytes));
+                const int fillW =
+                    std::max(4, static_cast<int>(std::llround(barRect.getWidth() * frac)));
+                g.setColour(stateCol.withAlpha(0.82f));
+                g.fillRoundedRectangle(barRect.withWidth(fillW).reduced(1).toFloat(), 2.5f);
+            }
+            if (area.getHeight() >= 12) {
+                area.removeFromTop(3);
+                const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+                const juce::String sub =
+                    !discPresent
+                        ? juce::String("Insert a Hi-MD disc and click Refresh.")
+                        : ("Used " + formatMegabytes(st.fsUsedBytes) + dot + "Free " +
+                           formatMegabytes(st.fsFreeBytes) + dot + "Hi-MD FAT16");
+                g.setColour(textMuted);
+                g.setFont(juce::FontOptions(10.3f));
+                g.drawText(sub, area, juce::Justification::centredLeft, true);
+            }
+        }
+        return;
+    }
     if (!recordUiState.hasDeviceStatus || recordUiState.deviceStatus.deviceId.empty()) {
         g.setColour(textMuted);
         g.setFont(juce::FontOptions(11.0f));
@@ -3761,10 +4149,79 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
     const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
     const auto wellBg = dark ? juce::Colour(0xff1b1b1b) : juce::Colour(0xffe5e5e5);
     const auto border = dark ? juce::Colour(0xff3c3c3c) : juce::Colour(0xffc6c6c6);
-    const bool over = !utocValid || !planValid || !budget.fits();
+    const bool isHiMd = carta::isHiMdMedium(discState.medium);
+    const std::int64_t hiMdCap = std::max<std::int64_t>(
+        1, hiMdTotalBytes > 0 ? hiMdTotalBytes : carta::hiMdMediumCapacityBytes(discState.medium));
+    const bool over =
+        isHiMd ? (hiMdUsedBytes > hiMdCap) : (!utocValid || !planValid || !budget.fits());
 
     g.setColour(wellBg);
     g.fillRoundedRectangle(bounds.toFloat(), 4.0f);
+
+    if (isHiMd) {
+        const auto inner = bounds.reduced(1);
+        std::int64_t cursorBytes = 0;
+        for (std::size_t i = 0; i < discState.tracks.size(); ++i) {
+            const auto& t = discState.tracks[i];
+            const auto codec = t.codecOverride.value_or(discState.defaultCodec);
+            const auto trackBytes = carta::estimateHiMdTrackBytes(codec, t.totalSamples());
+            if (trackBytes <= 0) {
+                continue;
+            }
+            const int x1 = inner.getX() +
+                           static_cast<int>(std::llround((static_cast<double>(cursorBytes) /
+                                                          static_cast<double>(hiMdCap)) *
+                                                         inner.getWidth()));
+            cursorBytes += trackBytes;
+            const int x2Raw = inner.getX() +
+                              static_cast<int>(std::llround((static_cast<double>(cursorBytes) /
+                                                             static_cast<double>(hiMdCap)) *
+                                                            inner.getWidth()));
+            const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
+            if (x1 >= inner.getRight()) {
+                break;
+            }
+            const auto segRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
+            const auto col =
+                over ? juce::Colour(0xffdc2626) : carta::md_ui::codecColour(codec, dark);
+            g.setColour(col.withAlpha(dark ? 0.72f : 0.65f));
+            g.fillRect(segRect);
+            if (x2 < inner.getRight()) {
+                g.setColour(wellBg.withAlpha(0.85f));
+                g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+            }
+            if (segRect.getWidth() >= 48) {
+                g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
+                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                g.drawText("T" + juce::String(static_cast<int>(i + 1)) + " " +
+                               carta::md_ui::codecShortLabel(codec),
+                           segRect.reduced(3, 0), juce::Justification::centred, true);
+            }
+        }
+        g.setColour(over ? juce::Colour(0xffdc2626) : border);
+        g.drawRoundedRectangle(bounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
+
+        const int pct = static_cast<int>(std::llround(
+            (static_cast<double>(hiMdUsedBytes) * 100.0) / static_cast<double>(hiMdCap)));
+        const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+        const auto capText =
+            formatMegabytes(hiMdUsedBytes) + " / " + formatMegabytes(hiMdCap) + " (" +
+            juce::String(pct) + "%)" +
+            (discState.tracks.empty()
+                 ? juce::String()
+                 : (dot + juce::String(static_cast<int>(discState.tracks.size())) + " track(s)"));
+        g.setFont(juce::FontOptions(10.2f, juce::Font::bold));
+        const int labelW =
+            std::min(bounds.getWidth() - 12, static_cast<int>(capText.length()) * 6 + 16);
+        const auto pill = juce::Rectangle<int>(bounds.getRight() - labelW - 4, bounds.getY() + 3,
+                                               labelW, bounds.getHeight() - 6);
+        g.setColour((dark ? juce::Colour(0xff1e1e1e) : juce::Colour(0xfff7f7f7)).withAlpha(0.84f));
+        g.fillRoundedRectangle(pill.toFloat(), 3.0f);
+        g.setColour(over ? (dark ? juce::Colour(0xfffca5a5) : juce::Colour(0xffb91c1c))
+                         : textMuted.interpolatedWith(textPrimary, 0.7f));
+        g.drawText(capText, pill.reduced(4, 0), juce::Justification::centredRight, true);
+        return;
+    }
 
     const int totalClu =
         std::max(1, discState.loadedDisc.active ? discState.loadedDisc.physicalTotalClusters()
@@ -3956,7 +4413,11 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
     juce::String physText;
     const juce::String sharedTag =
         pr.spanRefCount > 1 ? (" (x" + juce::String(pr.spanRefCount) + ")") : juce::String();
-    if (pr.partHopsText.isNotEmpty()) {
+    if (carta::isHiMdMedium(discState.medium)) {
+        const auto estBytes = carta::estimateHiMdTrackBytes(pr.codec, pr.totalSamples);
+        physText = (pr.onDisc ? "DISC " : (discState.loadedDisc.active ? "NEW " : "")) +
+                   formatMegabytes(estBytes);
+    } else if (pr.partHopsText.isNotEmpty()) {
         const juce::String tagPrefix =
             (pr.onDisc && pr.primarySpanIndex >= 0)
                 ? "MIX "
@@ -4001,7 +4462,10 @@ juce::String MdWorkspace::tooltipForPlanRow(int row) const {
         juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::codecLongLabel(pr.codec) +
         juce::String::fromUTF8(" \xc2\xb7 ") + carta::md_ui::formatClock(pr.totalSamples) + " (" +
         juce::String(pr.partCount) + (pr.partCount == 1 ? " part)" : " parts)");
-    if (pr.onDisc && pr.primarySpanIndex < 0) {
+    if (carta::isHiMdMedium(discState.medium)) {
+        const auto estBytes = carta::estimateHiMdTrackBytes(pr.codec, pr.totalSamples);
+        tip += juce::String::fromUTF8(" \xc2\xb7 Est. Hi-MD size: ") + formatMegabytes(estBytes);
+    } else if (pr.onDisc && pr.primarySpanIndex < 0) {
         tip += juce::String::fromUTF8(" \xc2\xb7 Preserved On-Disc Audio (Clusters ") +
                juce::String(pr.spanClusterStart) + ".." + juce::String(pr.spanClusterEnd) + ")";
     } else if (pr.primarySpanIndex >= 0) {
@@ -4146,14 +4610,94 @@ juce::String MdWorkspace::tooltipForAudioBankRow(int row) const {
 
 void MdWorkspace::paintDeviceTrackRow(int row, juce::Graphics& g, int width, int height,
                                       bool selected) const {
+    const bool dark = juce::Desktop::getInstance().isDarkModeActive();
+    const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
+    const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
+
+    if (recordUiState.activeDeviceIsHiMd) {
+        if (!recordUiState.hasHiMdStatus) {
+            return;
+        }
+        const auto& tracks = recordUiState.hiMdStatus.tracks;
+        if (row < 0 || row >= static_cast<int>(tracks.size())) {
+            return;
+        }
+        const auto& tr = tracks[static_cast<std::size_t>(row)];
+        paintAlternatingRowBackground(g, row, width, height, selected, dark);
+
+        g.setColour(textMuted);
+        g.setFont(juce::FontOptions(10.5f, juce::Font::bold));
+        g.drawText(juce::String::formatted("%02d", tr.index + 1), 6, 0, 22, height,
+                   juce::Justification::centredLeft, false);
+
+        const int durW = 42;
+        const int codecW = 44;
+        const int rightX = width - 6;
+        g.setColour(textPrimary);
+        g.setFont(juce::FontOptions(10.5f));
+        g.drawText(formatSecMmSs(static_cast<int>(std::llround(tr.durationSeconds))), rightX - durW,
+                   0, durW, height, juce::Justification::centredRight, false);
+
+        const juce::String codecLabel =
+            tr.encoding.empty() ? juce::String("Hi-SP")
+                                : juce::String::fromUTF8(tr.encoding.c_str());
+        carta::MdCodecMode codecMode = carta::MdCodecMode::hiSp;
+        if (codecLabel.equalsIgnoreCase("PCM") || codecLabel.equalsIgnoreCase("LPCM")) {
+            codecMode = carta::MdCodecMode::pcm;
+        } else if (codecLabel.equalsIgnoreCase("Hi-LP") || codecLabel.equalsIgnoreCase("HILP")) {
+            codecMode = carta::MdCodecMode::hiLp;
+        } else if (codecLabel.equalsIgnoreCase("LP2")) {
+            codecMode = carta::MdCodecMode::lp2;
+        } else if (codecLabel.equalsIgnoreCase("LP4")) {
+            codecMode = carta::MdCodecMode::lp4;
+        }
+        const auto codecCol = carta::md_ui::codecColour(codecMode, dark);
+        const auto codecRect =
+            juce::Rectangle<int>(rightX - durW - 4 - codecW, 3, codecW, height - 6);
+        g.setColour(codecCol.withAlpha(dark ? 0.28f : 0.14f));
+        g.fillRoundedRectangle(codecRect.toFloat(), 3.0f);
+        g.setColour(dark ? codecCol.brighter(0.35f) : codecCol);
+        g.setFont(juce::FontOptions(9.5f, juce::Font::bold));
+        g.drawText(codecLabel, codecRect, juce::Justification::centred, false);
+
+        const juce::String titleText =
+            !tr.title.empty() ? juce::String::fromUTF8(tr.title.c_str())
+                              : ("Track " + juce::String(tr.index + 1));
+        const int titleX = 30;
+        const int titleW = std::max(24, codecRect.getX() - titleX - 4);
+        const juce::Font titleFont(juce::FontOptions(11.0f));
+        g.setFont(titleFont);
+        if (!tr.artist.empty()) {
+            const juce::String artistSuffix =
+                juce::String::fromUTF8(" \xe2\x80\x94 ") +
+                juce::String::fromUTF8(tr.artist.c_str());
+            juce::GlyphArrangement ga;
+            ga.addLineOfText(titleFont, titleText, 0.0f, 0.0f);
+            const int titlePx =
+                static_cast<int>(std::ceil(ga.getBoundingBox(0, -1, false).getWidth())) + 2;
+            const int drawTitleW = std::min(titleW, titlePx);
+            g.setColour(textPrimary);
+            g.drawText(titleText, titleX, 0, drawTitleW, height, juce::Justification::centredLeft,
+                       true);
+            const int remW = titleW - drawTitleW;
+            if (remW >= 28) {
+                g.setColour(textMuted);
+                g.setFont(juce::FontOptions(10.3f));
+                g.drawText(artistSuffix, titleX + drawTitleW, 0, remW, height,
+                           juce::Justification::centredLeft, true);
+            }
+        } else {
+            g.setColour(textPrimary);
+            g.drawText(titleText, titleX, 0, titleW, height, juce::Justification::centredLeft, true);
+        }
+        return;
+    }
+
     const auto& tracks = recordUiState.deviceStatus.tracks;
     if (row < 0 || row >= static_cast<int>(tracks.size())) {
         return;
     }
     const auto& tr = tracks[static_cast<std::size_t>(row)];
-    const bool dark = juce::Desktop::getInstance().isDarkModeActive();
-    const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
-    const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
     paintAlternatingRowBackground(g, row, width, height, selected, dark);
 
     g.setColour(textMuted);
@@ -4203,6 +4747,34 @@ void MdWorkspace::paintDeviceTrackRow(int row, juce::Graphics& g, int width, int
 }
 
 juce::String MdWorkspace::tooltipForDeviceTrackRow(int row) const {
+    const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+    if (recordUiState.activeDeviceIsHiMd) {
+        if (!recordUiState.hasHiMdStatus) {
+            return {};
+        }
+        const auto& tracks = recordUiState.hiMdStatus.tracks;
+        if (row < 0 || row >= static_cast<int>(tracks.size())) {
+            return {};
+        }
+        const auto& tr = tracks[static_cast<std::size_t>(row)];
+        juce::String tip = "Hi-MD Track " + juce::String::formatted("%02d", tr.index + 1) + ": " +
+                           (!tr.title.empty() ? juce::String::fromUTF8(tr.title.c_str())
+                                              : juce::String("(untitled)"));
+        if (!tr.artist.empty()) {
+            tip += dot + "Artist: " + juce::String::fromUTF8(tr.artist.c_str());
+        }
+        if (!tr.album.empty()) {
+            tip += dot + "Album: " + juce::String::fromUTF8(tr.album.c_str());
+        }
+        const juce::String enc =
+            tr.encoding.empty() ? juce::String("Hi-SP")
+                                : juce::String::fromUTF8(tr.encoding.c_str());
+        tip += dot + enc +
+               (tr.bitrate > 0 ? (" (" + juce::String(tr.bitrate) + " kbps)") : juce::String()) +
+               dot + formatSecMmSs(static_cast<int>(std::llround(tr.durationSeconds)));
+        return tip;
+    }
+
     const auto& tracks = recordUiState.deviceStatus.tracks;
     if (row < 0 || row >= static_cast<int>(tracks.size())) {
         return {};
@@ -4219,7 +4791,6 @@ juce::String MdWorkspace::tooltipForDeviceTrackRow(int row) const {
     if (!tr.fullWidthTitle.empty() && !tr.title.empty()) {
         tip += " [" + juce::String::fromUTF8(tr.fullWidthTitle.c_str()) + "]";
     }
-    const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
     tip += dot +
            (tr.codec.empty() ? juce::String("SP") : juce::String::fromUTF8(tr.codec.c_str())) +
            dot + formatSecMmSs(tr.durationSeconds);

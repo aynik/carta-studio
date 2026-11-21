@@ -112,6 +112,19 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     discWorkspace.onEraseDisc = [this] { triggerEraseDiscFromUi(); };
     discWorkspace.onRecordWriteUtoc = [this] { triggerRecordWriteUtocFromUi(); };
     discWorkspace.onRecordStart = [this] { triggerRecordStartFromUi(); };
+    discWorkspace.onDumpHiMdTrack = [this](int trackIndex) {
+        triggerHiMdDumpTrackFromUi(trackIndex);
+    };
+    discWorkspace.onHiMdDiscTools = [this] { triggerHiMdDiscToolsMenuFromUi(); };
+    discWorkspace.onRenameHiMdTrack = [this](int trackIndex) {
+        triggerHiMdRenameTrackFromUi(trackIndex);
+    };
+    discWorkspace.onMoveHiMdTrack = [this](int trackIndex, int delta) {
+        triggerHiMdMoveTrackFromUi(trackIndex, delta);
+    };
+    discWorkspace.onDeleteHiMdTrack = [this](int trackIndex) {
+        triggerHiMdDeleteTrackFromUi(trackIndex);
+    };
     discWorkspace.onImportAudio = [this] { importAudio(); };
     auto seekMdTimelineRange = [this](juce::int64 startSample, juce::int64 endSample,
                                       const juce::String& focusTrackId) {
@@ -169,7 +182,7 @@ Studio::Studio(bool headless) : headlessMode(headless) {
         status.setText(message, juce::dontSendNotification);
     };
     discWorkspace.onTabChanged = [this](const juce::String& view) {
-        if (view == "record" && !netMdScannedOnce) {
+        if (view == "record" && (!netMdScannedOnce || !hiMdScannedOnce)) {
             refreshRecordWorkspace(true);
         } else {
             refreshRecordWorkspace(false);
@@ -459,6 +472,7 @@ Studio::~Studio() {
 
     netMdStopRequested.store(true);
     netMdWorker.reset();
+    hiMdWorker.reset();
 
     if (activeExport) {
         activeExport->cancelled.store(true);
@@ -1325,6 +1339,7 @@ void Studio::timerCallback() {
         finishReadyImports();
     }
     pollNetMdJobProgress();
+    pollHiMdJobProgress();
     refreshDiscWorkspace();
     queuePlaybackIndex();
     maybeAutosave();

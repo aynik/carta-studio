@@ -567,6 +567,162 @@ bool encodeAtracNetMdWire(const std::string& mode, const float* left, const floa
     return true;
 }
 
+bool encodeHiMdTrackPayload(const std::string& mode, const float* left, const float* right,
+                            int channels, int sampleCount, std::vector<std::uint8_t>& outPayload,
+                            const std::function<void(int, int)>& progressCallback,
+                            std::string& error) {
+    outPayload.clear();
+    std::string normalized = normalizeAsciiLower(mode);
+    if (normalized == "hisp") {
+        normalized = "hi-sp";
+    } else if (normalized == "hilp") {
+        normalized = "hi-lp";
+    }
+
+    if (normalized == "pcm" || normalized == "lpcm") {
+        if (channels < 1 || channels > 2 || sampleCount < 0 ||
+            (sampleCount > 0 && left == nullptr)) {
+            error = "Invalid PCM input geometry for Hi-MD LPCM encoding.";
+            return false;
+        }
+        if (sampleCount == 0) {
+            if (progressCallback) {
+                progressCallback(0, 0);
+            }
+            error.clear();
+            return true;
+        }
+        const float* passRight = (channels == 2 && right != nullptr) ? right : left;
+        outPayload.reserve(static_cast<std::size_t>(sampleCount) * 4u);
+        if (progressCallback) {
+            progressCallback(0, sampleCount);
+        }
+        auto quantizeS16 = [](float sample) -> std::int16_t {
+            const float clamped = std::max(-1.0f, std::min(1.0f, sample));
+            const long rounded = std::lround(static_cast<double>(clamped) * 32767.0);
+            const long bounded = std::max(-32768L, std::min(32767L, rounded));
+            return static_cast<std::int16_t>(bounded);
+        };
+        for (int i = 0; i < sampleCount; ++i) {
+            const float sL = left[i];
+            const float sR = passRight[i];
+            if (!std::isfinite(sL) || !std::isfinite(sR)) {
+                outPayload.clear();
+                error = "PCM audio contains a non-finite sample.";
+                return false;
+            }
+            const auto uL = static_cast<std::uint16_t>(quantizeS16(sL));
+            const auto uR = static_cast<std::uint16_t>(quantizeS16(sR));
+            outPayload.push_back(static_cast<std::uint8_t>((uL >> 8) & 0xFFu));
+            outPayload.push_back(static_cast<std::uint8_t>(uL & 0xFFu));
+            outPayload.push_back(static_cast<std::uint8_t>((uR >> 8) & 0xFFu));
+            outPayload.push_back(static_cast<std::uint8_t>(uR & 0xFFu));
+            if (progressCallback && ((i + 1) % 16384) == 0 && (i + 1) < sampleCount) {
+                progressCallback(i + 1, sampleCount);
+            }
+        }
+        if (progressCallback) {
+            progressCallback(sampleCount, sampleCount);
+        }
+        error.clear();
+        return true;
+    }
+
+    if (normalized == "lp2" || normalized == "lp4") {
+        return encodeAtracNetMdWire(normalized, left, right, channels, sampleCount, outPayload,
+                                    progressCallback, error);
+    }
+
+    const auto* spec = findAtracModeSpec(normalized);
+    if (!spec || std::strcmp(spec->codec, "carta5") != 0) {
+        error = "Unsupported Hi-MD codec mode '" + mode +
+                "' (expected hi-sp, hi-lp, lp2, lp4, or pcm).";
+        return false;
+    }
+    if (channels < 1 || channels > 2 || sampleCount < 0 || (sampleCount > 0 && left == nullptr)) {
+        error = "Invalid PCM input geometry for Hi-MD ATRAC3plus encoding.";
+        return false;
+    }
+    if (sampleCount == 0) {
+        if (progressCallback) {
+            progressCallback(0, 0);
+        }
+        error.clear();
+        return true;
+    }
+
+    const float* passRight = (channels == 2 && right != nullptr) ? right : left;
+    NativeAtracStreamEncoder encoder;
+    if (!encoder.open(spec->id, error)) {
+        return false;
+    }
+
+    constexpr int kCarta5DelayFrames = 7;
+    constexpr int kCarta5OverlapSamples = 368;
+    const int frameSamples = spec->samplesPerFrame;
+    const int frameBytes = spec->bytesPerFrame;
+    const int remainder = sampleCount % frameSamples;
+    const int lastFrameSamples = (remainder == 0) ? frameSamples : remainder;
+    const int flushTailFrames =
+        kCarta5DelayFrames +
+        (lastFrameSamples + kCarta5OverlapSamples + frameSamples - 1) / frameSamples;
+    const int pcmFrames = (sampleCount + frameSamples - 1) / frameSamples;
+    const int totalCalls = pcmFrames + flushTailFrames;
+
+    outPayload.reserve(static_cast<std::size_t>(pcmFrames + flushTailFrames - kCarta5DelayFrames) *
+                       static_cast<std::size_t>(frameBytes));
+
+    std::vector<float> frameL(static_cast<std::size_t>(frameSamples), 0.0f);
+    std::vector<float> frameR(static_cast<std::size_t>(frameSamples), 0.0f);
+    std::vector<std::uint8_t> frameOut(static_cast<std::size_t>(frameBytes), 0);
+
+    auto reportStep = [&](int done, int total, bool force) {
+        if (progressCallback && (force || (done % 16) == 0)) {
+            progressCallback(done, total);
+        }
+    };
+    reportStep(0, totalCalls, true);
+
+    int encodedCount = 0;
+    for (int pos = 0; pos < sampleCount; pos += frameSamples) {
+        std::fill(frameL.begin(), frameL.end(), 0.0f);
+        std::fill(frameR.begin(), frameR.end(), 0.0f);
+        const int take = std::min(frameSamples, sampleCount - pos);
+        std::memcpy(frameL.data(), left + pos, static_cast<std::size_t>(take) * sizeof(float));
+        std::memcpy(frameR.data(), passRight + pos, static_cast<std::size_t>(take) * sizeof(float));
+        const int n = encoder.encodeFrame(frameL.data(), frameR.data(), frameOut.data(),
+                                          frameOut.size(), error);
+        if (n < 0) {
+            outPayload.clear();
+            return false;
+        }
+        if (n > 0) {
+            outPayload.insert(outPayload.end(), frameOut.begin(), frameOut.begin() + n);
+        }
+        ++encodedCount;
+        reportStep(encodedCount, totalCalls, false);
+    }
+
+    std::fill(frameL.begin(), frameL.end(), 0.0f);
+    std::fill(frameR.begin(), frameR.end(), 0.0f);
+    for (int f = 0; f < flushTailFrames; ++f) {
+        const int n = encoder.encodeFrame(frameL.data(), frameR.data(), frameOut.data(),
+                                          frameOut.size(), error);
+        if (n < 0) {
+            outPayload.clear();
+            return false;
+        }
+        if (n > 0) {
+            outPayload.insert(outPayload.end(), frameOut.begin(), frameOut.begin() + n);
+        }
+        ++encodedCount;
+        reportStep(encodedCount, totalCalls, f + 1 == flushTailFrames);
+    }
+
+    error.clear();
+    return true;
+}
+
 // ============================================================================
 // Offline Session Rendering & File Export
 // ============================================================================

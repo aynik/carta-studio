@@ -26,6 +26,7 @@
 #include "Editing/Editing.h"
 #include "MiniDisc/MdAuthoring.h"
 #include "MiniDisc/NetMdBridge.h"
+#include "MiniDisc/HiMdBridge.h"
 #include "Core/Session.h"
 #include "MiniDisc/Utoc.h"
 
@@ -69,7 +70,7 @@ inline juce::String formatAddr(const MdPhysAddr& addr) {
                                    static_cast<unsigned>(addr.group));
 }
 
-/** Returns compact badge text ("SP-ST", "SP-MO", "LP2", "LP4") for `mode`. */
+/** Returns compact badge text ("SP-ST", "SP-MO", "LP2", "LP4", "Hi-SP", "Hi-LP", "PCM") for `mode`. */
 inline juce::String codecShortLabel(MdCodecMode mode) {
     switch (mode) {
     case MdCodecMode::spStereo:
@@ -80,11 +81,17 @@ inline juce::String codecShortLabel(MdCodecMode mode) {
         return "LP2";
     case MdCodecMode::lp4:
         return "LP4";
+    case MdCodecMode::hiSp:
+        return "Hi-SP";
+    case MdCodecMode::hiLp:
+        return "Hi-LP";
+    case MdCodecMode::pcm:
+        return "PCM";
     }
     return "SP-ST";
 }
 
-/** Returns display name ("SP Stereo", "SP Mono", "LP2", "LP4") for `mode`. */
+/** Returns display name ("SP Stereo", "SP Mono", "LP2", "LP4", "Hi-SP", "Hi-LP", "Linear PCM") for `mode`. */
 inline juce::String codecLongLabel(MdCodecMode mode) {
     switch (mode) {
     case MdCodecMode::spStereo:
@@ -95,6 +102,12 @@ inline juce::String codecLongLabel(MdCodecMode mode) {
         return "LP2";
     case MdCodecMode::lp4:
         return "LP4";
+    case MdCodecMode::hiSp:
+        return "Hi-SP";
+    case MdCodecMode::hiLp:
+        return "Hi-LP";
+    case MdCodecMode::pcm:
+        return "Linear PCM";
     }
     return "SP Stereo";
 }
@@ -110,6 +123,12 @@ inline juce::Colour codecColour(MdCodecMode mode, bool dark) {
         return dark ? juce::Colour(0xffcf872c) : juce::Colour(0xffb45309);
     case MdCodecMode::lp4:
         return dark ? juce::Colour(0xffcc5959) : juce::Colour(0xffbe123c);
+    case MdCodecMode::hiSp:
+        return dark ? juce::Colour(0xff2c82c9) : juce::Colour(0xff1d4ed8);
+    case MdCodecMode::hiLp:
+        return dark ? juce::Colour(0xff8e5bd6) : juce::Colour(0xff6d28d9);
+    case MdCodecMode::pcm:
+        return dark ? juce::Colour(0xff3ba55d) : juce::Colour(0xff15803d);
     }
     return juce::Colour(0xff0f766e);
 }
@@ -135,6 +154,12 @@ inline int codecToMenuId(MdCodecMode mode) noexcept {
         return 3;
     case MdCodecMode::lp4:
         return 4;
+    case MdCodecMode::hiSp:
+        return 5;
+    case MdCodecMode::hiLp:
+        return 6;
+    case MdCodecMode::pcm:
+        return 7;
     }
     return 1;
 }
@@ -148,6 +173,12 @@ inline MdCodecMode menuIdToCodec(int id) noexcept {
         return MdCodecMode::lp2;
     case 4:
         return MdCodecMode::lp4;
+    case 5:
+        return MdCodecMode::hiSp;
+    case 6:
+        return MdCodecMode::hiLp;
+    case 7:
+        return MdCodecMode::pcm;
     case 1:
     default:
         return MdCodecMode::spStereo;
@@ -163,6 +194,10 @@ inline int mediumToMenuId(MdMedium medium) noexcept {
         return 2;
     case MdMedium::md80:
         return 3;
+    case MdMedium::himd300:
+        return 4;
+    case MdMedium::himd1gb:
+        return 5;
     }
     return 3;
 }
@@ -174,6 +209,10 @@ inline MdMedium menuIdToMedium(int id) noexcept {
         return MdMedium::md60;
     case 2:
         return MdMedium::md74;
+    case 4:
+        return MdMedium::himd300;
+    case 5:
+        return MdMedium::himd1gb;
     case 3:
     default:
         return MdMedium::md80;
@@ -304,6 +343,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         int getNumRows() override;
         void paintListBoxItem(int row, juce::Graphics& g, int width, int height,
                               bool selected) override;
+        void listBoxItemClicked(int row, const juce::MouseEvent& event) override;
+        void listBoxItemDoubleClicked(int row, const juce::MouseEvent& event) override;
         juce::String getTooltipForRow(int row) override;
 
       private:
@@ -331,6 +372,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         int index0 = 0;
         juce::String title;
         juce::String fullWidthTitle;
+        juce::String artist;
+        juce::String album;
         std::string groupName;
         int groupColorIndex = -1;
         carta::MdCodecMode effectiveCodec = carta::MdCodecMode::spStereo;
@@ -414,15 +457,21 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     /** Device, preflight, and live operation status pushed by the parent Studio window. */
     struct RecordUiSnapshot {
         std::vector<carta::NetMdDeviceEntry> devices;
+        std::vector<carta::HiMdDeviceEntry> hiMdDevices;
         std::string activeDeviceId;
+        bool activeDeviceIsHiMd = false;
         bool hasDeviceStatus = false;
         carta::NetMdDeviceStatus deviceStatus;
+        bool hasHiMdStatus = false;
+        carta::HiMdDeviceStatus hiMdStatus;
         juce::String badgeText;
         juce::String statusText;
         bool canLoadDisc = false;
         bool canReadToc = false;
+        bool canDumpTrack = false;
         bool canErase = false;
         bool canWriteUtoc = false;
+        bool canManageHiMd = false;
         bool canRecord = false;
         bool busy = false;
         carta::NetMdProgressSnapshot progress;
@@ -455,6 +504,11 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     std::function<void()> onEraseDisc;
     std::function<void()> onRecordWriteUtoc;
     std::function<void()> onRecordStart;
+    std::function<void(int trackIndex)> onDumpHiMdTrack;
+    std::function<void()> onHiMdDiscTools;
+    std::function<void(int trackIndex)> onRenameHiMdTrack;
+    std::function<void(int trackIndex, int delta)> onMoveHiMdTrack;
+    std::function<void(int trackIndex)> onDeleteHiMdTrack;
     std::function<void(const juce::String& tab)> onTabChanged;
     std::function<void(const juce::String& message)> onFeedback;
     std::function<void(const juce::String& trackId)> onTrackSelectionChanged;
@@ -478,10 +532,13 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
                 double playheadSec, juce::uint64 generation,
                 const juce::String& preferredTrackId = {});
 
-    /** Updates Tab 2 NetMD device selector, preflight status badges, and action enablement. */
+    /** Updates Tab 2 NetMD / Hi-MD device selector, preflight status badges, and action
+     * enablement. */
     void updateRecordSummary(const RecordUiSnapshot& snapshot);
 
     juce::String selectedRecordDeviceId() const;
+    bool selectedRecordDeviceIsHiMd() const noexcept;
+    int selectedDeviceTrackIndex0() const noexcept;
     std::vector<int> selectedTrackIndices0() const;
     int singleSelectedTrackIndex() const;
     juce::String primaryTrackId() const;
@@ -550,6 +607,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     void paintPartRow(int row, juce::Graphics& g, int width, int height, bool selected) const;
     void paintDeviceTrackRow(int row, juce::Graphics& g, int width, int height,
                              bool selected) const;
+    void handleDeviceTrackClick(int row, const juce::MouseEvent& event);
+    void syncCodecDropdownsForMedium(bool isHiMd);
     juce::String tooltipForTrackRow(int row) const;
     juce::String tooltipForPartRow(int row) const;
     juce::String tooltipForDeviceTrackRow(int row) const;
@@ -575,6 +634,9 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     bool utocValid = true;
     std::string planErrorText;
     std::string utocErrorText;
+    std::int64_t hiMdUsedBytes = 0;
+    std::int64_t hiMdTotalBytes = 0;
+    int lastCodecMenuKind = -1; // -1 = uninitialized, 0 = Standard MD, 1 = Hi-MD
 
     juce::String activeTab = "tracks";
     juce::String planViewMode = "playback";
@@ -681,6 +743,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     juce::Label deviceCardTitle;
     juce::ComboBox recordDeviceBox;
     std::vector<std::string> recordDeviceIds;
+    std::vector<bool> recordDeviceIsHiMd;
     juce::TextButton refreshRecordButton{"Refresh"};
     juce::Label recordBadgeLabel;
     DeviceTrackListModel deviceTrackModel;

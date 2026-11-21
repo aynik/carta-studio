@@ -679,6 +679,173 @@ void testNonLinearPartAndBlockEdits() {
     }
 }
 
+void testHiMdAuthoringAndSessionV27() {
+    std::string err;
+
+    // 1. Hi-MD media & codec enum roundtrip + validity helpers
+    carta::MdMedium parsedMed{};
+    check(carta::isHiMdMedium(carta::MdMedium::himd300) &&
+              carta::isHiMdMedium(carta::MdMedium::himd1gb) &&
+              !carta::isHiMdMedium(carta::MdMedium::md80) &&
+              carta::parseMdMedium(carta::mdMediumToString(carta::MdMedium::himd300), parsedMed) &&
+              parsedMed == carta::MdMedium::himd300 &&
+              carta::parseMdMedium(carta::mdMediumToString(carta::MdMedium::himd1gb), parsedMed) &&
+              parsedMed == carta::MdMedium::himd1gb &&
+              carta::hiMdMediumCapacityBytes(carta::MdMedium::himd1gb) >
+                  carta::hiMdMediumCapacityBytes(carta::MdMedium::himd300),
+          "Hi-MD medium helpers and capacities match expectations");
+
+    carta::MdCodecMode parsedCodec{};
+    check(carta::isHiMdOnlyCodec(carta::MdCodecMode::hiSp) &&
+              carta::isHiMdOnlyCodec(carta::MdCodecMode::hiLp) &&
+              carta::isHiMdOnlyCodec(carta::MdCodecMode::pcm) &&
+              !carta::isHiMdOnlyCodec(carta::MdCodecMode::lp2) &&
+              carta::isStandardMdOnlyCodec(carta::MdCodecMode::spStereo) &&
+              carta::isStandardMdOnlyCodec(carta::MdCodecMode::spMono) &&
+              !carta::isStandardMdOnlyCodec(carta::MdCodecMode::hiSp) &&
+              carta::parseMdCodecMode("hi-sp", parsedCodec) && parsedCodec == carta::MdCodecMode::hiSp &&
+              carta::parseMdCodecMode("hi-lp", parsedCodec) && parsedCodec == carta::MdCodecMode::hiLp &&
+              carta::parseMdCodecMode("pcm", parsedCodec) && parsedCodec == carta::MdCodecMode::pcm,
+          "Hi-MD codec parsing and medium exclusivity helpers work");
+
+    check(carta::isCodecValidForMedium(carta::MdMedium::himd300, carta::MdCodecMode::hiSp) &&
+              carta::isCodecValidForMedium(carta::MdMedium::himd300, carta::MdCodecMode::hiLp) &&
+              carta::isCodecValidForMedium(carta::MdMedium::himd300, carta::MdCodecMode::lp2) &&
+              carta::isCodecValidForMedium(carta::MdMedium::himd300, carta::MdCodecMode::lp4) &&
+              carta::isCodecValidForMedium(carta::MdMedium::himd1gb, carta::MdCodecMode::pcm) &&
+              !carta::isCodecValidForMedium(carta::MdMedium::himd300, carta::MdCodecMode::spStereo) &&
+              !carta::isCodecValidForMedium(carta::MdMedium::md80, carta::MdCodecMode::hiSp) &&
+              !carta::isCodecValidForMedium(carta::MdMedium::md74, carta::MdCodecMode::pcm),
+          "Codec-vs-medium matrix enforces Hi-MD / Standard MD boundaries");
+
+    // 2. Authoring validation, estimation, physical planning, and UTOC rejection
+    carta::MdDisc hiDisc;
+    hiDisc.medium = carta::MdMedium::himd1gb;
+    hiDisc.defaultCodec = carta::MdCodecMode::hiSp;
+    hiDisc.halfWidthTitle = "Hi-MD Authoring";
+    hiDisc.tracks = {
+        {carta::makeMdTrackId(), "Track One", {}, std::nullopt, false, false, false, {},
+         {{0, 44100}}, "Artist One", "Album One"},
+        {carta::makeMdTrackId(), "Track Two", {}, carta::MdCodecMode::hiLp, false, false, false, {},
+         {{44100, 88200}}, "Artist Two", "Album One"},
+        {carta::makeMdTrackId(), "Track Three", {}, carta::MdCodecMode::pcm, false, false, false,
+         {}, {{88200, 132300}}, "Artist Three", "Album Two"},
+    };
+    hiDisc.groups = {{1, 2, "Group A", {}}, {3, 3, "Group B", {}}};
+    check(carta::validateMdDisc(hiDisc, err), "Valid Hi-MD disc passes validateMdDisc: " + err);
+
+    const auto bHiLp = carta::estimateHiMdTrackBytes(
+        carta::effectiveTrackCodec(hiDisc, hiDisc.tracks[1]), hiDisc.tracks[1].totalSamples());
+    const auto bHiSp = carta::estimateHiMdTrackBytes(
+        carta::effectiveTrackCodec(hiDisc, hiDisc.tracks[0]), hiDisc.tracks[0].totalSamples());
+    const auto bPcm = carta::estimateHiMdTrackBytes(
+        carta::effectiveTrackCodec(hiDisc, hiDisc.tracks[2]), hiDisc.tracks[2].totalSamples());
+    check(bHiLp > 0 && bHiSp > bHiLp && bPcm > bHiSp,
+          "estimateHiMdTrackBytes scales monotonically Hi-LP < Hi-SP < PCM");
+
+    carta::MdPhysicalPlan hiPlan;
+    check(carta::planMdPhysicalAudio(hiDisc, hiPlan, err) && hiPlan.maxEndSample == 132300 &&
+              hiPlan.logicalPlaySamples == 132300 && hiPlan.uniquePhysicalSamples == 132300 &&
+              hiPlan.spans.size() == 3 && hiPlan.placements.size() == 3,
+          "planMdPhysicalAudio computes spans & placements for Hi-MD");
+
+    carta::UtocDiscState badUtoc{};
+    check(!carta::compileMdDiscToUtoc(hiDisc, badUtoc, err) &&
+              err.find("UTOC") != std::string::npos,
+          "compileMdDiscToUtoc rejects Hi-MD disc");
+
+    auto mixedBad = hiDisc;
+    mixedBad.tracks[0].codecOverride = carta::MdCodecMode::spStereo;
+    check(!carta::validateMdDisc(mixedBad, err),
+          "validateMdDisc rejects sp-stereo track inside Hi-MD disc");
+
+    // 3. SessionIO .carta v27 roundtrip vs preserved v25/v26 behavior
+    const auto tmpDir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                            .getChildFile("carta_mdauthor_v27_" +
+                                          juce::String(juce::Time::getHighResolutionTicks()));
+    check(tmpDir.createDirectory(), "Create temp dir for v27 test");
+    struct DirGuard final {
+        juce::File dir;
+        ~DirGuard() { dir.deleteRecursively(); }
+    } dirGuard{tmpDir};
+
+    carta::Session v27Session;
+    v27Session.minimumEndSample = 132300;
+    v27Session.tracks.push_back({"Audio", {}});
+    v27Session.mdDisc = hiDisc;
+
+    const auto v27File = tmpDir.getChildFile("himd_project.carta");
+    juce::String ioErr;
+    check(carta::saveSession(v27Session, 2, v27File, ioErr),
+          "saveSession v27 failed: " + ioErr.toStdString());
+    const auto v27Json = juce::JSON::parse(v27File.loadFileAsString());
+    check(v27Json.isObject() && static_cast<int>(v27Json["version"]) == 27,
+          "Hi-MD MdDisc serializes at project version 27");
+
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    carta::Session loadedV27;
+    int loadedChannels = 0;
+    check(carta::loadSession(loadedV27, loadedChannels, formats, v27File, ioErr) &&
+              loadedV27.mdDisc == hiDisc && loadedV27.mdDisc.tracks[0].artist == "Artist One" &&
+              loadedV27.mdDisc.tracks[2].album == "Album Two",
+          "loadSession v27 restores complete Hi-MD disc + artist/album identically");
+
+    // Loaded Hi-MD disc with unitCount == 0 regions validates and roundtrips via v27 SessionIO.
+    carta::Session loadedHiSession;
+    auto loadedDisc = hiDisc;
+    loadedDisc.loadedDisc.active = true;
+    loadedDisc.loadedDisc.sourceDeviceId = "mock:mz-rh1";
+    loadedDisc.loadedDisc.baselineSector0Hash = "ABC:1";
+    loadedDisc.loadedDisc.regions = {
+        {"r0", carta::MdCodecMode::hiSp, 0, {0, 0, 0}, {0, 0, 0}, 0, 0, 44100, false},
+        {"r1", carta::MdCodecMode::hiLp, 0, {0, 0, 0}, {0, 0, 0}, 0, 44100, 88200, false},
+        {"r2", carta::MdCodecMode::pcm, 0, {0, 0, 0}, {0, 0, 0}, 0, 88200, 132300, false},
+    };
+    check(carta::validateMdDisc(loadedDisc, err),
+          "Loaded Hi-MD disc with unitCount == 0 validates: " + err);
+    carta::populateLoadedDiscSession(loadedDisc, loadedHiSession);
+    const auto loadedV27File = tmpDir.getChildFile("loaded_himd_v27.carta");
+    check(carta::saveSession(loadedHiSession, 2, loadedV27File, ioErr),
+          "saveSession loaded Hi-MD failed: " + ioErr.toStdString());
+    carta::Session reopenedLoadedV27;
+    int reopenedLoadedCh = 0;
+    check(carta::loadSession(reopenedLoadedV27, reopenedLoadedCh, formats, loadedV27File, ioErr) &&
+              reopenedLoadedV27.mdDisc == loadedDisc &&
+              carta::validateMdDisc(reopenedLoadedV27.mdDisc, err),
+          "loadSession restores loaded Hi-MD unitCount == 0 disc identically");
+
+    // Standard MD without artist/album still writes v25 (or v26 when loadedDisc.active).
+    carta::Session v25Session;
+    v25Session.minimumEndSample = 44100;
+    v25Session.tracks.push_back({"Audio", {}});
+    v25Session.mdDisc.medium = carta::MdMedium::md74;
+    v25Session.mdDisc.defaultCodec = carta::MdCodecMode::lp2;
+    v25Session.mdDisc.tracks = {
+        {carta::makeMdTrackId(), "Std Track", {}, std::nullopt, false, false, false, {},
+         {{0, 44100}}}};
+    const auto v25File = tmpDir.getChildFile("std_v25.carta");
+    check(carta::saveSession(v25Session, 2, v25File, ioErr),
+          "saveSession v25 failed: " + ioErr.toStdString());
+    const auto v25Json = juce::JSON::parse(v25File.loadFileAsString());
+    check(v25Json.isObject() && static_cast<int>(v25Json["version"]) == 25,
+          "Standard MD without artist/album preserves v25");
+
+    // Reject v26 project illegally containing Hi-MD features.
+    auto badDowngrade = juce::JSON::parse(v27File.loadFileAsString());
+    check(badDowngrade.isObject() && badDowngrade.getDynamicObject() != nullptr,
+          "Parse v27 project for downgrade rejection test");
+    if (auto* badObj = badDowngrade.getDynamicObject()) {
+        badObj->setProperty("version", 26);
+        const auto badV26File = tmpDir.getChildFile("bad_v26_himd.carta");
+        badV26File.replaceWithText(juce::JSON::toString(badDowngrade));
+        carta::Session unchangedSession;
+        int unchangedChannels = 2;
+        check(!carta::loadSession(unchangedSession, unchangedChannels, formats, badV26File, ioErr),
+              "v26 project containing Hi-MD features is rejected");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -689,6 +856,7 @@ int main() {
     testInteractiveRibbonAndMultiLayerClipSync();
     testLoadedDiscLocksPlaceholderAndSessionIO();
     testNonLinearPartAndBlockEdits();
+    testHiMdAuthoringAndSessionV27();
     if (gFailures == 0) {
         std::cout << "MdAuthoringTests passed.\n";
         return 0;

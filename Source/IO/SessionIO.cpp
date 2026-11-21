@@ -1512,7 +1512,8 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
     juce::Array<juce::var> tracks;
     for (const auto& track : disc.tracks) {
         if (!validDiscText(track.id) || !validDiscText(track.halfWidthTitle) ||
-            !validDiscText(track.fullWidthTitle) || !validDiscText(track.timestamp)) {
+            !validDiscText(track.fullWidthTitle) || !validDiscText(track.artist) ||
+            !validDiscText(track.album) || !validDiscText(track.timestamp)) {
             error = "MD track text contains invalid UTF-8 text.";
             return false;
         }
@@ -1524,6 +1525,12 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
         }
         if (!track.fullWidthTitle.empty()) {
             p->setProperty("fullWidthTitle", juce::String::fromUTF8(track.fullWidthTitle.c_str()));
+        }
+        if (!track.artist.empty()) {
+            p->setProperty("artist", juce::String::fromUTF8(track.artist.c_str()));
+        }
+        if (!track.album.empty()) {
+            p->setProperty("album", juce::String::fromUTF8(track.album.c_str()));
         }
         if (track.codecOverride.has_value()) {
             p->setProperty("codecOverride",
@@ -1737,6 +1744,20 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
             }
             trk.fullWidthTitle = item["fullWidthTitle"].toString().toStdString();
         }
+        if (tp->hasProperty("artist")) {
+            if (!item["artist"].isString()) {
+                error = "Invalid MD track artist.";
+                return false;
+            }
+            trk.artist = item["artist"].toString().toStdString();
+        }
+        if (tp->hasProperty("album")) {
+            if (!item["album"].isString()) {
+                error = "Invalid MD track album.";
+                return false;
+            }
+            trk.album = item["album"].toString().toStdString();
+        }
         if (tp->hasProperty("codecOverride")) {
             MdCodecMode ov{};
             if (!item["codecOverride"].isString() ||
@@ -1937,7 +1958,8 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
                 if (!integerValue(rv["rawModeByte"], rawMode) || rawMode < 0 || rawMode > 255 ||
                     !parseAddrVar(rv["physStart"], reg.physStart) ||
                     !parseAddrVar(rv["physEnd"], reg.physEnd) ||
-                    !integerValue(rv["unitCount"], units) || units <= 0 ||
+                    !integerValue(rv["unitCount"], units) ||
+                    (isHiMdMedium(next.medium) ? (units < 0) : (units <= 0)) ||
                     !integerValue(rv["timelineStartSample"], ts) || ts < 0 ||
                     !integerValue(rv["timelineEndSample"], te) || te <= ts ||
                     te >= 9007199254740992LL) {
@@ -2383,30 +2405,42 @@ bool determineProjectVersion(const Session& session, WavRange savedLoop, bool& h
             });
         });
 
-    projectVersion =
-        hasLoadedOnDisc
-            ? 26
-            : (hasMdDisc
-                   ? 25
-                   : ((hasHighGain || hasFadeShapes)
-                          ? 24
-                          : (savedLoop.end > savedLoop.start
-                                 ? 14
-                                 : (!session.markers.empty()
-                                        ? 13
-                                        : (hasChannelHeights
-                                               ? 12
-                                               : (hasWaveformZoom
-                                                      ? 11
-                                                      : (hasGroups
-                                                             ? 10
-                                                             : (session.minimumEndSample > 0
-                                                                    ? 9
-                                                                    : (hasChannelView
-                                                                           ? 8
-                                                                           : (hasCombinedView
-                                                                                  ? 7
-                                                                                  : 6))))))))));
+    const bool hasHiMdFeatures =
+        isHiMdMedium(session.mdDisc.medium) || isHiMdOnlyCodec(session.mdDisc.defaultCodec) ||
+        std::any_of(session.mdDisc.tracks.begin(), session.mdDisc.tracks.end(),
+                    [](const MdTrack& track) {
+                        return (track.codecOverride.has_value() &&
+                                isHiMdOnlyCodec(*track.codecOverride)) ||
+                               !track.artist.empty() || !track.album.empty();
+                    });
+
+    if (hasHiMdFeatures) {
+        projectVersion = 27;
+    } else if (hasLoadedOnDisc) {
+        projectVersion = 26;
+    } else if (hasMdDisc) {
+        projectVersion = 25;
+    } else if (hasHighGain || hasFadeShapes) {
+        projectVersion = 24;
+    } else if (savedLoop.end > savedLoop.start) {
+        projectVersion = 14;
+    } else if (!session.markers.empty()) {
+        projectVersion = 13;
+    } else if (hasChannelHeights) {
+        projectVersion = 12;
+    } else if (hasWaveformZoom) {
+        projectVersion = 11;
+    } else if (hasGroups) {
+        projectVersion = 10;
+    } else if (session.minimumEndSample > 0) {
+        projectVersion = 9;
+    } else if (hasChannelView) {
+        projectVersion = 8;
+    } else if (hasCombinedView) {
+        projectVersion = 7;
+    } else {
+        projectVersion = 6;
+    }
     return true;
 }
 
@@ -3508,7 +3542,7 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
     juce::int64 version = 0;
     juce::int64 masterValue = 0;
     if (!root.isObject() || !integerValue(root["version"], version) || version < 1 ||
-        version > 26 || !root["tracks"].isArray() || !root["markers"].isArray()) {
+        version > 27 || !root["tracks"].isArray() || !root["markers"].isArray()) {
         error = "Invalid or unsupported Carta Studio project.";
         return false;
     }
@@ -3552,6 +3586,18 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
             return false;
         }
         if (!decodeMdDisc(root["mdDisc"], next.mdDisc, error)) {
+            return false;
+        }
+        const bool usesHiMd =
+            isHiMdMedium(next.mdDisc.medium) || isHiMdOnlyCodec(next.mdDisc.defaultCodec) ||
+            std::any_of(next.mdDisc.tracks.begin(), next.mdDisc.tracks.end(),
+                        [](const MdTrack& track) {
+                            return (track.codecOverride.has_value() &&
+                                    isHiMdOnlyCodec(*track.codecOverride)) ||
+                                   !track.artist.empty() || !track.album.empty();
+                        });
+        if (usesHiMd && version < 27) {
+            error = "Hi-MD disc features require project version 27 or later.";
             return false;
         }
     }

@@ -96,6 +96,19 @@ bool encodeAtracNetMdWire(const std::string& mode, const float* left, const floa
                           std::string& error);
 
 /**
+ * Encodes 44.1 kHz planar float PCM into raw Hi-MD track upload payload bytes:
+ * - `"hi-sp"` / `"hi-lp"`: raw ATRAC3plus frames matching `encodeAtracContainer` +
+ *   `extractNetMdWirePayload` bit-for-bit (without `.oma` EA3 container headers),
+ * - `"lp2"` / `"lp4"`: raw ATRAC3 frames matching `encodeAtracNetMdWire`,
+ * - `"pcm"` / `"lpcm"`: 16-bit signed big-endian stereo interleaved LPCM bytes.
+ * Invokes `progressCallback(doneUnits, totalUnits)` periodically during encoding.
+ */
+bool encodeHiMdTrackPayload(const std::string& mode, const float* left, const float* right,
+                            int channels, int sampleCount, std::vector<std::uint8_t>& outPayload,
+                            const std::function<void(int, int)>& progressCallback,
+                            std::string& error);
+
+/**
  * Renders a half-open session timeline range `[startSample, endSample)` at 44.1 kHz.
  * Clears output vectors and populates `error` on invalid geometry or unsupported sample rate.
  */

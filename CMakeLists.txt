@@ -198,6 +198,10 @@ set(CARTA_NETMD_SOURCES
     Source/MiniDisc/NetMdBridge.cpp
 )
 
+set(CARTA_HIMD_SOURCES
+    Source/MiniDisc/HiMdBridge.cpp
+)
+
 set(CARTA_STUDIO_UI_SOURCES
     Source/Platform/Ipc.cpp
     Source/MiniDisc/MdWorkspace.cpp
@@ -222,10 +226,11 @@ target_sources(CartaStudio PRIVATE
     ${CARTA_ENGINE_SOURCES}
     ${CARTA_CODEC_SOURCES}
     ${CARTA_NETMD_SOURCES}
+    ${CARTA_HIMD_SOURCES}
     ${CARTA_STUDIO_UI_SOURCES}
 )
 target_include_directories(CartaStudio PRIVATE Source)
-add_dependencies(CartaStudio CartaPorfforCodecs carta-netmd)
+add_dependencies(CartaStudio CartaPorfforCodecs carta-netmd carta-himd)
 carta_link_porffor_codecs(CartaStudio)
 if(APPLE)
     target_sources(CartaStudio PRIVATE Source/Platform/NativeSavePrompt_mac.mm)
@@ -242,6 +247,7 @@ if(APPLE)
             "${CARTA_PORFFOR_CARTA3_LINK}"
             "${CARTA_PORFFOR_CARTA5_LINK}"
             "${CARTA_PORFFOR_NETMD_LINK}"
+            "${CARTA_PORFFOR_HIMD_LINK}"
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Frameworks/"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CARTA_LIBUSB_REALPATH}"
@@ -250,31 +256,46 @@ if(APPLE)
             "$<TARGET_FILE:carta-netmd>"
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-netmd"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:carta-himd>"
+            "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-himd"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Resources/THIRD_PARTY_NOTICES.md"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/carta-netmd/LICENSE"
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Resources/LICENSE-carta-netmd-GPL-2.0.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/carta-himd/LICENSE"
+            "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Resources/LICENSE-carta-himd-GPL-2.0.txt"
         COMMAND chmod u+w "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Frameworks/${CARTA_LIBUSB_SONAME}"
         COMMAND install_name_tool -id "@rpath/${CARTA_LIBUSB_SONAME}"
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Frameworks/${CARTA_LIBUSB_SONAME}"
         COMMAND install_name_tool -change "${CARTA_LIBUSB_LIBDIR}/${CARTA_LIBUSB_SONAME}"
             "@executable_path/../Frameworks/${CARTA_LIBUSB_SONAME}"
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-netmd"
+        COMMAND install_name_tool -change "${CARTA_LIBUSB_LIBDIR}/${CARTA_LIBUSB_SONAME}"
+            "@executable_path/../Frameworks/${CARTA_LIBUSB_SONAME}"
+            "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-himd"
         COMMAND codesign --force --sign -
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Frameworks/${CARTA_LIBUSB_SONAME}"
         COMMAND codesign --force --sign -
             "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-netmd"
+        COMMAND codesign --force --sign -
+            "$<TARGET_BUNDLE_DIR:CartaStudio>/Contents/Helpers/carta-himd"
         VERBATIM)
 elseif(WIN32)
     add_custom_command(TARGET CartaStudio POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:carta-netmd>"
+            "$<TARGET_FILE:carta-himd>"
             "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
             "$<TARGET_FILE_DIR:CartaStudio>/"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/carta-netmd/LICENSE"
             "$<TARGET_FILE_DIR:CartaStudio>/LICENSE-carta-netmd-GPL-2.0.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/carta-himd/LICENSE"
+            "$<TARGET_FILE_DIR:CartaStudio>/LICENSE-carta-himd-GPL-2.0.txt"
         VERBATIM)
     if(CARTA_LIBUSB_DLL AND EXISTS "${CARTA_LIBUSB_DLL}")
         add_custom_command(TARGET CartaStudio POST_BUILD
@@ -298,13 +319,18 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_custom_command(TARGET CartaStudio POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:carta-netmd>"
+            "$<TARGET_FILE:carta-himd>"
             ${CARTA_PORFFOR_CODEC_RUNTIME_LIBS}
             "${CARTA_PORFFOR_NETMD_LINK}"
+            "${CARTA_PORFFOR_HIMD_LINK}"
             "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
             "$<TARGET_FILE_DIR:CartaStudio>/"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/carta-netmd/LICENSE"
             "$<TARGET_FILE_DIR:CartaStudio>/LICENSE-carta-netmd-GPL-2.0.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/carta-himd/LICENSE"
+            "$<TARGET_FILE_DIR:CartaStudio>/LICENSE-carta-himd-GPL-2.0.txt"
         VERBATIM)
 endif()
 target_compile_features(CartaStudio PRIVATE cxx_std_17)
@@ -393,17 +419,18 @@ if(BUILD_TESTING)
             ${CARTA_ENGINE_SOURCES}
             ${CARTA_CODEC_SOURCES}
             ${CARTA_NETMD_SOURCES}
+            ${CARTA_HIMD_SOURCES}
             ${CARTA_STUDIO_UI_SOURCES}
         )
         target_include_directories(CartaComponentTests PRIVATE Source)
-        add_dependencies(CartaComponentTests CartaPorfforCodecs carta-netmd)
+        add_dependencies(CartaComponentTests CartaPorfforCodecs carta-netmd carta-himd)
         target_compile_features(CartaComponentTests PRIVATE cxx_std_17)
         target_compile_definitions(CartaComponentTests PRIVATE CARTA_STUDIO_COMPONENT_TEST=1 JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
         target_link_libraries(CartaComponentTests PRIVATE juce::juce_audio_utils juce::juce_gui_extra juce::juce_dsp juce::juce_cryptography PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
         carta_link_porffor_codecs(CartaComponentTests)
         if(WIN32)
             add_custom_command(TARGET CartaComponentTests POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-netmd>" "$<TARGET_FILE_DIR:CartaComponentTests>/"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-netmd>" "$<TARGET_FILE:carta-himd>" "$<TARGET_FILE_DIR:CartaComponentTests>/"
                 VERBATIM)
         endif()
         add_test(NAME carta-component COMMAND CartaComponentTests)
@@ -470,6 +497,27 @@ if(BUILD_TESTING)
         endif()
     endif()
     add_test(NAME carta-himd COMMAND CartaHiMdTests)
+
+    juce_add_console_app(CartaHiMdBridgeTests PRODUCT_NAME "Carta Hi-MD Bridge Tests")
+    target_sources(CartaHiMdBridgeTests PRIVATE Tests/HiMdBridgeTests.cpp ${CARTA_HIMD_SOURCES} ${CARTA_CODEC_SOURCES} ${CARTA_ENGINE_SOURCES})
+    target_include_directories(CartaHiMdBridgeTests PRIVATE Source)
+    add_dependencies(CartaHiMdBridgeTests CartaPorfforCodecs carta-himd)
+    target_compile_features(CartaHiMdBridgeTests PRIVATE cxx_std_17)
+    target_compile_definitions(CartaHiMdBridgeTests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_link_libraries(CartaHiMdBridgeTests PRIVATE juce::juce_audio_formats juce::juce_dsp juce::juce_graphics juce::juce_cryptography
+        PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+    carta_link_porffor_codecs(CartaHiMdBridgeTests)
+    if(WIN32)
+        add_custom_command(TARGET CartaHiMdBridgeTests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-himd>" "$<TARGET_FILE_DIR:CartaHiMdBridgeTests>/"
+            VERBATIM)
+        if(CARTA_LIBUSB_DLL AND EXISTS "${CARTA_LIBUSB_DLL}")
+            add_custom_command(TARGET CartaHiMdBridgeTests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CARTA_LIBUSB_DLL}" "$<TARGET_FILE_DIR:CartaHiMdBridgeTests>/"
+                VERBATIM)
+        endif()
+    endif()
+    add_test(NAME carta-himd-bridge COMMAND CartaHiMdBridgeTests)
 
     # Pure C++ unit tests for OS SCSI pass-through & USB BOT transport (zero JUCE / zero Porffor).
     add_executable(CartaHiMdTransportTests

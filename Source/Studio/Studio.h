@@ -40,6 +40,7 @@
 #include "MiniDisc/Utoc.h"
 #include "MiniDisc/NativeCodecs.h"
 #include "MiniDisc/NetMdBridge.h"
+#include "MiniDisc/HiMdBridge.h"
 #include "Editing/Editing.h"
 #include "Audio/Transport.h"
 #include "Audio/Spectrogram.h"
@@ -926,7 +927,7 @@ class Studio final : public juce::AudioAppComponent,
     template <typename Fn>
     void launchNetMdWorker(const std::string& op, const std::string& devId,
                            const std::string& initialPhase, Fn&& body) {
-        if (netMdBusy.load()) {
+        if (netMdBusy.load() || hiMdBusy.load()) {
             return;
         }
         netMdWorker.reset();
@@ -999,6 +1000,94 @@ class Studio final : public juce::AudioAppComponent,
     void triggerEraseDiscFromUi();
     void triggerRecordWriteUtocFromUi();
     void triggerRecordStartFromUi();
+
+    // Hi-MD USB BOT hardware bridge & async job orchestration
+    std::string resolveActiveHiMdDeviceId(const juce::String& explicitId, std::string& error);
+    juce::var buildHiMdStatusJson();
+
+    /**
+     * @brief Runs an exclusive background Hi-MD USB BOT job while reporting progress to the UI.
+     */
+    template <typename Fn>
+    void launchHiMdWorker(const std::string& op, const std::string& devId,
+                          const std::string& initialPhase, Fn&& body) {
+        if (hiMdBusy.load() || netMdBusy.load()) {
+            return;
+        }
+        hiMdWorker.reset();
+        {
+            std::lock_guard<std::mutex> lk(hiMdMutex);
+            hiMdActiveOp = op;
+            hiMdActiveDevId = devId;
+            hiMdLastOp = op;
+            hiMdLastDevId = devId;
+            hiMdLastOk = false;
+            hiMdLastError.clear();
+            hiMdLastResult = juce::var();
+            hiMdPendingUiStatus.clear();
+            hiMdPendingAlertTitle.clear();
+            hiMdPendingAlertBody.clear();
+            hiMdPendingStatus.reset();
+            hiMdPendingLoadedDisc.reset();
+        }
+        hiMdDonePending.store(false);
+        carta::setHiMdProgress(op, initialPhase, 0.0);
+        hiMdBusy.store(true, std::memory_order_release);
+        refreshRecordWorkspace(false);
+        hiMdWorker = std::make_unique<NetMdWorkerThread>(
+            [this, fn = std::forward<Fn>(body)]() mutable {
+                std::string err;
+                juce::var result;
+                juce::String uiStatus;
+                juce::String alertTitle;
+                juce::String alertBody;
+                std::optional<carta::HiMdDeviceStatus> afterStatus;
+                const bool ok = fn(err, result, uiStatus, alertTitle, alertBody, afterStatus);
+                carta::clearHiMdProgress();
+                {
+                    std::lock_guard<std::mutex> lk(hiMdMutex);
+                    hiMdLastOk = ok;
+                    hiMdLastError = err;
+                    hiMdLastResult = result;
+                    hiMdPendingUiStatus = uiStatus;
+                    hiMdPendingAlertTitle = alertTitle;
+                    hiMdPendingAlertBody = alertBody;
+                    hiMdPendingStatus = afterStatus;
+                }
+                hiMdDonePending.store(true, std::memory_order_release);
+                hiMdBusy.store(false, std::memory_order_release);
+            });
+    }
+
+    void startHiMdProbeJob(const std::string& devId);
+    void startHiMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
+    void startHiMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
+                            bool confirmHardware, bool showAlerts = true);
+    void startHiMdDumpJob(const std::string& devId, int trackIndex, const juce::File& outFile,
+                          bool rawAudio, bool showAlerts = true);
+    void startHiMdRenameDiscJob(const std::string& devId, const std::string& title,
+                                bool confirmHardware, bool showAlerts = true);
+    void startHiMdRenameTrackJob(const std::string& devId, int trackIndex, bool hasTitle,
+                                 const std::string& title, bool hasArtist,
+                                 const std::string& artist, bool hasAlbum,
+                                 const std::string& album, bool confirmHardware,
+                                 bool showAlerts = true);
+    void startHiMdMoveTrackJob(const std::string& devId, int fromIndex, int toIndex,
+                               bool confirmHardware, bool showAlerts = true);
+    void startHiMdSetGroupsJob(const std::string& devId, std::vector<carta::MdGroup> groups,
+                               int trackCount, bool confirmHardware, bool showAlerts = true);
+    void startHiMdDeleteTracksJob(const std::string& devId, std::vector<int> trackIndices,
+                                  bool confirmHardware, bool showAlerts = true);
+    void startHiMdWipeJob(const std::string& devId, bool reformat, bool confirmHardware,
+                          bool showAlerts = true);
+    void pollHiMdJobProgress();
+    void triggerHiMdDumpTrackFromUi(int trackIndex = -1);
+    void triggerHiMdDiscToolsMenuFromUi();
+    void triggerHiMdRenameDiscFromUi();
+    void triggerHiMdRenameTrackFromUi(int trackIndex);
+    void triggerHiMdMoveTrackFromUi(int trackIndex, int delta);
+    void triggerHiMdDeleteTrackFromUi(int trackIndex);
+    void triggerHiMdSyncGroupsFromUi();
 
     // ------------------------------------------------------------------------
     // Analysis, Track Rendering, List Browsers, Audition, and Modal Prompts
@@ -1452,6 +1541,25 @@ class Studio final : public juce::AudioAppComponent,
     std::string netMdPendingCommittedHash;
     bool netMdPendingNeedsReload = false;
     bool netMdPendingShowLoadAlerts = true;
+    std::vector<carta::HiMdDeviceEntry> cachedHiMdDevices;
+    std::optional<carta::HiMdDeviceStatus> cachedHiMdStatus;
+    bool hiMdScannedOnce = false;
+    std::unique_ptr<NetMdWorkerThread> hiMdWorker;
+    std::atomic<bool> hiMdBusy{false};
+    std::atomic<bool> hiMdDonePending{false};
+    std::mutex hiMdMutex;
+    std::string hiMdActiveOp;
+    std::string hiMdActiveDevId;
+    std::string hiMdLastOp;
+    std::string hiMdLastDevId;
+    std::string hiMdLastError;
+    bool hiMdLastOk = false;
+    juce::var hiMdLastResult;
+    juce::String hiMdPendingUiStatus;
+    juce::String hiMdPendingAlertTitle;
+    juce::String hiMdPendingAlertBody;
+    std::optional<carta::HiMdDeviceStatus> hiMdPendingStatus;
+    std::optional<carta::MdDisc> hiMdPendingLoadedDisc;
     juce::File workspaceSettingsFile;
     carta::WorkspacePreferences lastWorkspacePreferences;
     juce::String discWorkspaceAudioError;

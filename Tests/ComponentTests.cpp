@@ -920,6 +920,139 @@ struct StudioComponentTests {
         check(md.commandSearchEntries().size() >= 180,
               "Command search preserves nested submenu command discovery");
 
+        // 5. Hi-MD medium/codec selection, track metadata, and Device & Record Hi-MD layout
+        {
+            check(static_cast<bool>(md.ipcCommand({"disc", "medium", "himd300"})["ok"]),
+                  "IPC disc medium himd300 switches layout panel to Hi-MD");
+            md.refreshDiscWorkspace(true);
+            check(md.session.mdDisc.medium == carta::MdMedium::himd300 &&
+                      md.session.mdDisc.defaultCodec == carta::MdCodecMode::hiSp &&
+                      dock.utocValid && dock.mediumBox.getSelectedId() == 4 &&
+                      dock.codecBox.getNumItems() == 5 && dock.codecBox.getSelectedId() == 5 &&
+                      dock.codecBox.getItemId(0) == 5 && dock.codecBox.getItemId(1) == 6 &&
+                      dock.codecBox.getItemId(2) == 3 && dock.codecBox.getItemId(3) == 4 &&
+                      dock.codecBox.getItemId(4) == 7,
+                  "Hi-MD 300M sets default codec to Hi-SP, clears UTOC error, and populates 5 Hi-MD "
+                  "codec choices");
+            if (!md.session.mdDisc.tracks.empty()) {
+                dock.selectTrackById(
+                    juce::String::fromUTF8(md.session.mdDisc.tracks[0].id.c_str()), false);
+                check(dock.trackCodecBox.getNumItems() == 6,
+                      "Track codec ComboBox exposes Default plus 5 Hi-MD codecs");
+                check(static_cast<bool>(md.ipcCommand(
+                          {"disc", "track", "metadata", "0", "Studio Artist", "Studio Album"})["ok"]) &&
+                          md.session.mdDisc.tracks[0].artist == "Studio Artist" &&
+                          md.session.mdDisc.tracks[0].album == "Studio Album",
+                      "IPC disc track metadata assigns artist and album with UTOC bypassed");
+                md.restoreHistory(false);
+                check(md.session.mdDisc.tracks[0].artist.empty() &&
+                          md.session.mdDisc.tracks[0].album.empty(),
+                      "Undo reverts disc track metadata edits cleanly");
+                md.restoreHistory(true);
+                check(md.session.mdDisc.tracks[0].artist == "Studio Artist" &&
+                          md.session.mdDisc.tracks[0].album == "Studio Album",
+                      "Redo restores disc track metadata edits cleanly");
+            }
+
+            check(static_cast<bool>(md.ipcCommand({"disc", "view", "record"})["ok"]),
+                  "Switch to Device & Record tab for Hi-MD layout checks");
+            {
+                MdWorkspace::RecordUiSnapshot recSnap;
+                recSnap.hiMdDevices = {
+                    {"mock:mz-rh1", 0x054c, 0x0287, "Sony MZ-RH1", true, "mock", {}}};
+                recSnap.activeDeviceId = "mock:mz-rh1";
+                recSnap.activeDeviceIsHiMd = true;
+                recSnap.hasHiMdStatus = true;
+                recSnap.hiMdStatus.deviceId = "mock:mz-rh1";
+                recSnap.hiMdStatus.deviceName = "Sony MZ-RH1";
+                recSnap.hiMdStatus.inquiryVid = "SONY";
+                recSnap.hiMdStatus.inquiryPid = "MZ-RH1";
+                recSnap.hiMdStatus.discTitle = "Mock Hi-MD";
+                recSnap.hiMdStatus.fsTotalBytes = 305000000;
+                recSnap.hiMdStatus.fsUsedBytes = 12000000;
+                recSnap.hiMdStatus.fsFreeBytes = 293000000;
+                recSnap.hiMdStatus.trackCount = 2;
+                recSnap.hiMdStatus.tracks = {
+                    {0, 1, "Hi-SP Track", "Mock Artist", "Mock Album", "Hi-SP", 256, 125.0},
+                    {1, 2, "PCM Track", "Mock Artist", "Mock Album", "PCM", 1411, 60.0},
+                };
+                recSnap.badgeText =
+                    juce::String::fromUTF8("Hi-MD USB \xc2\xb7 SONY MZ-RH1 \xc2\xb7 2 trk");
+                recSnap.statusText = "Hi-MD disc has 2 track(s)";
+                recSnap.utocSummaryText =
+                    juce::String::fromUTF8("Hi-MD FAT16 \xc2\xb7 2 trk \xc2\xb7 3.1 MB");
+                recSnap.canLoadDisc = true;
+                recSnap.canDumpTrack = true;
+                recSnap.canErase = true;
+                recSnap.canManageHiMd = true;
+                recSnap.canRecord = false;
+                dock.updateRecordSummary(recSnap);
+            }
+            check(dock.selectedRecordDeviceIsHiMd() &&
+                      dock.selectedRecordDeviceId() == "mock:mz-rh1" &&
+                      dock.deviceTrackList.getListBoxModel()->getNumRows() == 2,
+                  "Hi-MD RecordUiSnapshot selects mock:mz-rh1 and lists 2 Hi-MD tracks");
+            check(dock.readDiscTocButton.getButtonText() == "Dump Track..." &&
+                      dock.eraseDiscButton.getButtonText() == "Wipe Disc..." &&
+                      dock.writeUtocButton.getButtonText() == "Disc Tools..." &&
+                      dock.recordDiscButton.getButtonText() == "Record Hi-MD...",
+                  "Record action buttons adapt labels cleanly for Hi-MD mode");
+
+            for (int w : {780, 1180}) {
+                const int h = (w == 780) ? 260 : 280;
+                dock.setSize(w, h);
+                dock.resized();
+                const auto img = dock.createComponentSnapshot(dock.getLocalBounds());
+                check(!img.isNull(), "Hi-MD workspace snapshot renders without errors");
+                const juce::Rectangle<int> local(0, 0, w, h);
+                check(!rectsOverlap({dock.mdLabel.getBounds(), dock.discTitleEditor.getBounds(),
+                                     dock.discFormsButton.getBounds(), dock.mediumBox.getBounds(),
+                                     dock.codecBox.getBounds(), dock.autoTrackToggle.getBounds(),
+                                     dock.budgetPillBounds, dock.closeButton.getBounds()}),
+                      "Hi-MD header controls and status pill do not overlap");
+                check(!rectsOverlap({dock.deviceCardBounds, dock.planCardBounds}) &&
+                          !rectsOverlap({dock.deviceCardTitle.getBounds(),
+                                         dock.recordDeviceBox.getBounds(),
+                                         dock.refreshRecordButton.getBounds()}) &&
+                          !rectsOverlap({dock.loadDiscButton.getBounds(),
+                                         dock.readDiscTocButton.getBounds(),
+                                         dock.eraseDiscButton.getBounds()}) &&
+                          !rectsOverlap({dock.writeUtocButton.getBounds(),
+                                         dock.recordDiscButton.getBounds()}),
+                      "Hi-MD Record tab cards and buttons do not overlap");
+                if (w == 1180) {
+                    check(rectsInsideBounds({dock.deviceCardTitle.getBounds(),
+                                             dock.recordDeviceBox.getBounds(),
+                                             dock.refreshRecordButton.getBounds(),
+                                             dock.recordBadgeLabel.getBounds(),
+                                             dock.deviceDiscMeterBounds,
+                                             dock.deviceTrackList.getBounds(),
+                                             dock.loadDiscButton.getBounds(),
+                                             dock.readDiscTocButton.getBounds(),
+                                             dock.eraseDiscButton.getBounds()},
+                                            dock.deviceCardBounds) &&
+                              rectsInsideBounds({dock.planCardTitle.getBounds(),
+                                                 dock.utocSummaryLabel.getBounds(),
+                                                 dock.targetBarBounds, dock.planList.getBounds(),
+                                                 dock.planProgressBounds,
+                                                 dock.writeUtocButton.getBounds(),
+                                                 dock.recordDiscButton.getBounds()},
+                                                dock.planCardBounds) &&
+                              rectsInsideBounds({dock.deviceCardBounds, dock.planCardBounds},
+                                                local),
+                          "Hi-MD Device and Plan widgets fit cleanly inside 1180px panel bounds");
+                }
+            }
+
+            check(static_cast<bool>(md.ipcCommand({"disc", "medium", "md80"})["ok"]),
+                  "Switch layout test medium back to Standard MD 80");
+            md.refreshDiscWorkspace(true);
+            check(md.session.mdDisc.medium == carta::MdMedium::md80 &&
+                      md.session.mdDisc.defaultCodec == carta::MdCodecMode::spStereo &&
+                      dock.codecBox.getNumItems() == 4,
+                  "Switching back from Hi-MD restores Standard MD SP default and 4 codec options");
+        }
+
         md.setDiscWorkspaceVisible(false);
         check(md.visibleMdRibbonHeight() == 0 &&
                   md.trackArea(0).getY() == md.timeline().getY() + 32,
@@ -1196,6 +1329,189 @@ struct StudioComponentTests {
                   "Unconfirmed netmd write-utoc rejects touching hardware");
             check(!static_cast<bool>(studio.ipcCommand({"netmd", "record", "usb:054c:0188"})["ok"]),
                   "Unconfirmed netmd record rejects touching hardware");
+
+            // 5b. Hi-MD IPC surface, hardware confirmation guards & async mock MZ-RH1 workflow
+            check(static_cast<bool>(studio.ipcCommand({"schema", "himd"})["ok"]),
+                  "IPC schema himd returns command documentation");
+            const auto fullSt = studio.ipcCommand({"status"});
+            const auto hiSt = studio.ipcCommand({"himd", "status"});
+            check(static_cast<bool>(fullSt["ok"]) &&
+                      fullSt["result"]["himd"].isObject() &&
+                      !static_cast<bool>(fullSt["result"]["himd"]["active"]) &&
+                      static_cast<bool>(hiSt["ok"]) &&
+                      !static_cast<bool>(hiSt["result"]["active"]),
+                  "IPC status['himd'] and himd status succeed when idle");
+
+            for (const juce::StringArray& unconfirmed :
+                 {juce::StringArray{"himd", "record", "usb:054c:0287"},
+                  juce::StringArray{"himd", "wipe", "usb:054c:0287"},
+                  juce::StringArray{"himd", "rename-disc", "X", "usb:054c:0287"},
+                  juce::StringArray{"himd", "rename-track", "0", "--title", "X", "usb:054c:0287"},
+                  juce::StringArray{"himd", "move-track", "0", "1", "usb:054c:0287"},
+                  juce::StringArray{"himd", "set-groups", "usb:054c:0287"},
+                  juce::StringArray{"himd", "delete-tracks", "0", "usb:054c:0287"}}) {
+                const auto guardRes = studio.ipcCommand(unconfirmed);
+                const auto msg =
+                    "Unconfirmed " + unconfirmed.joinIntoString(" ") + " rejects touching hardware";
+                check(!static_cast<bool>(guardRes["ok"]), msg.toRawUTF8());
+            }
+
+            {
+                struct ScopedHiMdMock {
+                    ~ScopedHiMdMock() {
+                        std::string ignoreErr;
+                        carta::setHiMdTestMockSessionEnabled(false, ignoreErr);
+                    }
+                } mockCleanup;
+
+                std::string mockErr;
+                check(carta::setHiMdTestMockSessionEnabled(true, mockErr) &&
+                          carta::resetHiMdTestMockSession(mockErr),
+                      "Start and reset isolated mock Hi-MD session");
+
+                auto waitHiMdIdle = [&](const char* label) {
+                    const auto deadline = juce::Time::getMillisecondCounterHiRes() + 30000.0;
+                    while (juce::Time::getMillisecondCounterHiRes() < deadline) {
+                        studio.pollHiMdJobProgress();
+                        if (!studio.hiMdBusy.load() && !studio.hiMdDonePending.load()) {
+                            return;
+                        }
+                        juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+                    }
+                    check(false, label);
+                };
+
+                const auto devsRes = studio.ipcCommand({"himd", "devices"});
+                bool foundMockHiMd = false;
+                if (const auto* arr = devsRes["result"]["devices"].getArray()) {
+                    for (const auto& item : *arr) {
+                        if (item["id"].toString() == "mock:mz-rh1") {
+                            foundMockHiMd = true;
+                            break;
+                        }
+                    }
+                }
+                check(static_cast<bool>(devsRes["ok"]) && foundMockHiMd,
+                      "IPC himd devices includes mock:mz-rh1");
+
+                check(static_cast<bool>(studio.ipcCommand({"disc", "medium", "himd300"})["ok"]) &&
+                          static_cast<bool>(
+                              studio.ipcCommand({"disc", "title", "Studio Hi-MD Test"})["ok"]) &&
+                          static_cast<bool>(studio.ipcCommand(
+                              {"disc", "track", "metadata", "0", "Artist Zero", "Album Zero"})["ok"]) &&
+                          static_cast<bool>(
+                              studio.ipcCommand({"disc", "group", "set", "1", "2", "Set One"})["ok"]),
+                      "Prepare Hi-MD 300M project metadata and groups via IPC");
+
+                const auto expectedTracks = static_cast<int>(studio.session.mdDisc.tracks.size());
+                check(expectedTracks >= 2, "Prepared Hi-MD project has at least 2 tracks");
+
+                const auto discSt = studio.ipcCommand({"disc", "status"})["result"];
+                check(static_cast<bool>(discSt["is_himd"]) &&
+                          static_cast<juce::int64>(discSt["capacity_bytes"]) > 0 &&
+                          static_cast<juce::int64>(discSt["estimated_bytes"]) > 0 &&
+                          discSt["tracks"][0]["artist"].toString() == "Artist Zero" &&
+                          discSt["tracks"][0]["album"].toString() == "Album Zero",
+                      "IPC disc status exposes Hi-MD capacity, estimate, and track metadata");
+
+                const auto probeBefore = studio.ipcCommand({"himd", "probe", "mock:mz-rh1"});
+                check(static_cast<bool>(probeBefore["ok"]) &&
+                          static_cast<int>(probeBefore["result"]["track_count"]) == 0 &&
+                          static_cast<bool>(probeBefore["result"]["preflight"]["valid"]),
+                      "IPC himd probe reports blank mock:mz-rh1 passing preflight");
+
+                const auto recStart = studio.ipcCommand({"himd", "record", "mock:mz-rh1"});
+                check(static_cast<bool>(recStart["ok"]) &&
+                          static_cast<bool>(recStart["result"]["started"]),
+                      "IPC himd record launches async worker on mock:mz-rh1");
+                waitHiMdIdle("Async himd record timed out");
+                const auto recDone = studio.ipcCommand({"himd", "status"});
+                check(static_cast<bool>(recDone["ok"]) &&
+                          static_cast<bool>(recDone["result"]["ok"]) &&
+                          recDone["result"]["operation"].toString() == "record",
+                      "Async himd record completes successfully");
+
+                const auto probeAfterRec = studio.ipcCommand({"himd", "probe", "mock:mz-rh1"});
+                check(static_cast<bool>(probeAfterRec["ok"]) &&
+                          static_cast<int>(probeAfterRec["result"]["track_count"]) ==
+                              expectedTracks &&
+                          probeAfterRec["result"]["disc_title"].toString() ==
+                              "Studio Hi-MD Test" &&
+                          probeAfterRec["result"]["tracks"][0]["artist"].toString() ==
+                              "Artist Zero" &&
+                          probeAfterRec["result"]["tracks"][0]["album"].toString() == "Album Zero",
+                      "Probing mock:mz-rh1 after record shows recorded tracks, title, and "
+                      "metadata");
+
+                const auto dumpedOma = dir.getChildFile("himd_track0.oma");
+                const auto dumpStart = studio.ipcCommand(
+                    {"himd", "dump", "0", dumpedOma.getFullPathName(), "mock:mz-rh1"});
+                check(static_cast<bool>(dumpStart["ok"]),
+                      "IPC himd dump launches async worker on mock:mz-rh1");
+                waitHiMdIdle("Async himd dump timed out");
+                juce::MemoryBlock omaBytes;
+                check(static_cast<bool>(studio.ipcCommand({"himd", "status"})["result"]["ok"]) &&
+                          dumpedOma.existsAsFile() && dumpedOma.loadFileAsData(omaBytes) &&
+                          omaBytes.getSize() > 96 && omaBytes[0] == 'E' && omaBytes[1] == 'A' &&
+                          omaBytes[2] == '3',
+                      "Async himd dump extracts non-empty EA3 .oma container");
+
+                check(static_cast<bool>(studio.ipcCommand(
+                          {"himd", "rename-disc", "Renamed Hi-MD", "mock:mz-rh1"})["ok"]),
+                      "IPC himd rename-disc starts async worker");
+                waitHiMdIdle("Async himd rename-disc timed out");
+                check(static_cast<bool>(studio.ipcCommand({"himd", "status"})["result"]["ok"]),
+                      "Async himd rename-disc completes cleanly");
+
+                check(static_cast<bool>(
+                          studio.ipcCommand({"himd", "rename-track", "0", "--title", "New Tr0",
+                                             "--artist", "New Artist", "--album", "New Album",
+                                             "mock:mz-rh1"})["ok"]),
+                      "IPC himd rename-track starts async worker");
+                waitHiMdIdle("Async himd rename-track timed out");
+                check(static_cast<bool>(studio.ipcCommand({"himd", "status"})["result"]["ok"]),
+                      "Async himd rename-track completes cleanly");
+
+                check(static_cast<bool>(
+                          studio.ipcCommand({"himd", "move-track", "0", "1", "mock:mz-rh1"})["ok"]),
+                      "IPC himd move-track starts async worker");
+                waitHiMdIdle("Async himd move-track timed out");
+                check(static_cast<bool>(studio.ipcCommand({"himd", "status"})["result"]["ok"]),
+                      "Async himd move-track completes cleanly");
+
+                check(static_cast<bool>(
+                          studio.ipcCommand({"himd", "load-disc", "mock:mz-rh1"})["ok"]),
+                      "IPC himd load-disc starts async worker");
+                waitHiMdIdle("Async himd load-disc timed out");
+                check(static_cast<bool>(studio.ipcCommand({"himd", "status"})["result"]["ok"]) &&
+                          studio.session.mdDisc.loadedDisc.active &&
+                          studio.session.mdDisc.medium == carta::MdMedium::himd300 &&
+                          studio.session.mdDisc.halfWidthTitle == "Renamed Hi-MD" &&
+                          static_cast<int>(studio.session.mdDisc.tracks.size()) == expectedTracks &&
+                          studio.session.mdDisc.tracks[1].halfWidthTitle == "New Tr0" &&
+                          studio.session.mdDisc.tracks[1].artist == "New Artist" &&
+                          studio.session.mdDisc.tracks[1].album == "New Album",
+                      "Async himd load-disc populates session loadedDisc, renamed disc, moved "
+                      "track metadata, and groups");
+
+                check(static_cast<bool>(
+                          studio.ipcCommand({"himd", "delete-tracks", "0", "mock:mz-rh1"})["ok"]),
+                      "IPC himd delete-tracks starts async worker");
+                waitHiMdIdle("Async himd delete-tracks timed out");
+                const auto probeAfterDel = studio.ipcCommand({"himd", "probe", "mock:mz-rh1"});
+                check(static_cast<bool>(probeAfterDel["ok"]) &&
+                          static_cast<int>(probeAfterDel["result"]["track_count"]) ==
+                              expectedTracks - 1,
+                      "Async himd delete-tracks decrements on-disc track count");
+
+                check(static_cast<bool>(studio.ipcCommand({"himd", "wipe", "mock:mz-rh1"})["ok"]),
+                      "IPC himd wipe starts async worker");
+                waitHiMdIdle("Async himd wipe timed out");
+                const auto probeAfterWipe = studio.ipcCommand({"himd", "probe", "mock:mz-rh1"});
+                check(static_cast<bool>(probeAfterWipe["ok"]) &&
+                          static_cast<int>(probeAfterWipe["result"]["track_count"]) == 0,
+                      "Async himd wipe leaves mock:mz-rh1 blank");
+            }
         }
 
         // 6. Interactive MD Tracks mouse manipulation, magnetic snapping, Shift bypass, Escape

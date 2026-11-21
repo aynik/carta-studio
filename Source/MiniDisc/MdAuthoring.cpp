@@ -231,6 +231,10 @@ std::string mdMediumToString(MdMedium medium) {
         return "md74";
     case MdMedium::md80:
         return "md80";
+    case MdMedium::himd300:
+        return "himd300";
+    case MdMedium::himd1gb:
+        return "himd1gb";
     }
     return "md80";
 }
@@ -249,7 +253,92 @@ bool parseMdMedium(const std::string& text, MdMedium& out) noexcept {
         out = MdMedium::md80;
         return true;
     }
+    if (lower == "himd300" || lower == "himd-300" || lower == "himd") {
+        out = MdMedium::himd300;
+        return true;
+    }
+    if (lower == "himd1gb" || lower == "himd-1gb" || lower == "1gb") {
+        out = MdMedium::himd1gb;
+        return true;
+    }
     return false;
+}
+
+bool isHiMdMedium(MdMedium medium) noexcept {
+    return medium == MdMedium::himd300 || medium == MdMedium::himd1gb;
+}
+
+bool isHiMdOnlyCodec(MdCodecMode mode) noexcept {
+    return mode == MdCodecMode::hiSp || mode == MdCodecMode::hiLp || mode == MdCodecMode::pcm;
+}
+
+bool isStandardMdOnlyCodec(MdCodecMode mode) noexcept {
+    return mode == MdCodecMode::spStereo || mode == MdCodecMode::spMono;
+}
+
+bool isCodecValidForMedium(MdMedium medium, MdCodecMode mode) noexcept {
+    if (isHiMdMedium(medium)) {
+        return !isStandardMdOnlyCodec(mode);
+    }
+    return !isHiMdOnlyCodec(mode);
+}
+
+std::int64_t hiMdMediumCapacityBytes(MdMedium medium) noexcept {
+    switch (medium) {
+    case MdMedium::himd300:
+        return 283213824LL;
+    case MdMedium::himd1gb:
+        return 985000000LL;
+    case MdMedium::md60:
+    case MdMedium::md74:
+    case MdMedium::md80:
+        return 0;
+    }
+    return 0;
+}
+
+std::int64_t estimateHiMdTrackBytes(MdCodecMode mode, std::int64_t samples) noexcept {
+    if (samples <= 0) {
+        return 0;
+    }
+    std::int64_t rawBytes = 0;
+    switch (mode) {
+    case MdCodecMode::hiSp: {
+        const std::int64_t frames = ((samples + 2047) / 2048) + 2;
+        rawBytes = frames * 1488LL;
+        break;
+    }
+    case MdCodecMode::hiLp: {
+        const std::int64_t frames = ((samples + 2047) / 2048) + 2;
+        rawBytes = frames * 376LL;
+        break;
+    }
+    case MdCodecMode::lp2: {
+        const std::int64_t frames = ((samples + 1023) / 1024) + 3;
+        rawBytes = frames * 384LL;
+        break;
+    }
+    case MdCodecMode::lp4: {
+        const std::int64_t frames = ((samples + 1023) / 1024) + 3;
+        rawBytes = frames * 192LL;
+        break;
+    }
+    case MdCodecMode::pcm:
+        rawBytes = samples * 4LL;
+        break;
+    case MdCodecMode::spStereo:
+    case MdCodecMode::spMono:
+        return 0;
+    }
+    if (rawBytes <= 0) {
+        return 0;
+    }
+    constexpr std::int64_t kHiMdPayloadPerBlock = 16320LL;
+    constexpr std::int64_t kHiMdBlockBytes = 16384LL;
+    constexpr std::int64_t kFatClusterBytes = 32768LL;
+    const std::int64_t blocks = (rawBytes + kHiMdPayloadPerBlock - 1) / kHiMdPayloadPerBlock;
+    const std::int64_t atdataBytes = blocks * kHiMdBlockBytes;
+    return ((atdataBytes + kFatClusterBytes - 1) / kFatClusterBytes) * kFatClusterBytes;
 }
 
 int mdTotalClusters(MdMedium medium) noexcept {
@@ -260,6 +349,9 @@ int mdTotalClusters(MdMedium medium) noexcept {
         return 2173;
     case MdMedium::md80:
         return 2350;
+    case MdMedium::himd300:
+    case MdMedium::himd1gb:
+        return 0;
     }
     return 2350;
 }
@@ -274,6 +366,12 @@ std::string mdCodecModeToString(MdCodecMode mode) {
         return "lp2";
     case MdCodecMode::lp4:
         return "lp4";
+    case MdCodecMode::hiSp:
+        return "hi-sp";
+    case MdCodecMode::hiLp:
+        return "hi-lp";
+    case MdCodecMode::pcm:
+        return "pcm";
     }
     return "sp-stereo";
 }
@@ -296,6 +394,18 @@ bool parseMdCodecMode(const std::string& text, MdCodecMode& out) noexcept {
         out = MdCodecMode::lp4;
         return true;
     }
+    if (lower == "hi-sp" || lower == "hisp" || lower == "at3p-256") {
+        out = MdCodecMode::hiSp;
+        return true;
+    }
+    if (lower == "hi-lp" || lower == "hilp" || lower == "at3p-64") {
+        out = MdCodecMode::hiLp;
+        return true;
+    }
+    if (lower == "pcm" || lower == "lpcm") {
+        out = MdCodecMode::pcm;
+        return true;
+    }
     return false;
 }
 
@@ -307,6 +417,11 @@ std::int64_t mdFrameQuantumSamples(MdCodecMode mode) noexcept {
     case MdCodecMode::lp2:
     case MdCodecMode::lp4:
         return 1024;
+    case MdCodecMode::hiSp:
+    case MdCodecMode::hiLp:
+        return 2048;
+    case MdCodecMode::pcm:
+        return 1;
     }
     return 512;
 }
@@ -318,6 +433,9 @@ int mdUnitsPerQuantum(MdCodecMode mode) noexcept {
         return 2;
     case MdCodecMode::spMono:
     case MdCodecMode::lp4:
+    case MdCodecMode::hiSp:
+    case MdCodecMode::hiLp:
+    case MdCodecMode::pcm:
         return 1;
     }
     return 2;
@@ -332,6 +450,11 @@ std::int64_t mdSamplesPerUnit(MdCodecMode mode) noexcept {
         return 512;
     case MdCodecMode::lp4:
         return 1024;
+    case MdCodecMode::hiSp:
+    case MdCodecMode::hiLp:
+        return 2048;
+    case MdCodecMode::pcm:
+        return 1;
     }
     return 256;
 }
@@ -429,6 +552,11 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
         error = "Disc timestamp must be empty or formatted YYYY-MM-DD HH:MM:SS.";
         return false;
     }
+    if (!isCodecValidForMedium(disc.medium, disc.defaultCodec)) {
+        error = "Codec '" + mdCodecModeToString(disc.defaultCodec) +
+                "' is not supported on medium '" + mdMediumToString(disc.medium) + "'.";
+        return false;
+    }
     if (static_cast<int>(disc.tracks.size()) > kMdMaxTracks) {
         error = "MiniDisc UTOC supports at most 255 tracks.";
         return false;
@@ -439,6 +567,16 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
         tlIntervals.reserve(disc.loadedDisc.regions.size());
         for (std::size_t i = 0; i < disc.loadedDisc.regions.size(); ++i) {
             const auto& r = disc.loadedDisc.regions[i];
+            if (isHiMdMedium(disc.medium)) {
+                if (r.id.empty() || r.timelineStartSample < 0 ||
+                    r.timelineEndSample <= r.timelineStartSample) {
+                    error = "Loaded Hi-MD region " + std::to_string(i + 1) +
+                            " is empty or has invalid timeline bounds.";
+                    return false;
+                }
+                tlIntervals.emplace_back(r.timelineStartSample, r.timelineEndSample);
+                continue;
+            }
             if (r.id.empty() || r.unitCount <= 0) {
                 error = "Loaded disc region " + std::to_string(i + 1) + " is empty or missing ID.";
                 return false;
@@ -482,6 +620,12 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
         if (!validTimestampOrEmpty(tr.timestamp)) {
             error = "Track " + std::to_string(t + 1) +
                     " timestamp must be empty or formatted YYYY-MM-DD HH:MM:SS.";
+            return false;
+        }
+        if (!isCodecValidForMedium(disc.medium, effectiveTrackCodec(disc, tr))) {
+            error = "Track " + std::to_string(t + 1) + " codec '" +
+                    mdCodecModeToString(effectiveTrackCodec(disc, tr)) +
+                    "' is not supported on medium '" + mdMediumToString(disc.medium) + "'.";
             return false;
         }
         if (tr.parts.empty()) {
@@ -548,6 +692,52 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
     out.totalClusters = physicalTotal > 0 ? physicalTotal : mdTotalClusters(disc.medium);
     if (!validateMdDisc(disc, error)) {
         return false;
+    }
+
+    if (isHiMdMedium(disc.medium)) {
+        std::vector<std::pair<std::int64_t, std::int64_t>> intervals;
+        for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
+            const auto& tr = disc.tracks[t];
+            const auto codec = effectiveTrackCodec(disc, tr);
+            for (std::size_t p = 0; p < tr.parts.size(); ++p) {
+                const auto& part = tr.parts[p];
+                out.maxEndSample = std::max(out.maxEndSample, part.endSample);
+                out.logicalPlaySamples += part.durationSamples();
+                intervals.emplace_back(part.startSample, part.endSample);
+
+                MdPhysicalSpan span;
+                span.codec = codec;
+                span.startSample = part.startSample;
+                span.endSample = part.endSample;
+                span.unitCount = 0;
+                span.startCluster = 0;
+                span.clusterCount = 0;
+                const int spanIdx = static_cast<int>(out.spans.size());
+                out.spans.push_back(span);
+
+                MdPartPlacement place;
+                place.trackIndex = static_cast<int>(t);
+                place.partIndex = static_cast<int>(p);
+                place.spanIndex = spanIdx;
+                out.placements.push_back(place);
+            }
+        }
+        if (!intervals.empty()) {
+            std::sort(intervals.begin(), intervals.end());
+            std::int64_t curS = intervals.front().first;
+            std::int64_t curE = intervals.front().second;
+            for (std::size_t i = 1; i < intervals.size(); ++i) {
+                if (intervals[i].first <= curE) {
+                    curE = std::max(curE, intervals[i].second);
+                } else {
+                    out.uniquePhysicalSamples += (curE - curS);
+                    curS = intervals[i].first;
+                    curE = intervals[i].second;
+                }
+            }
+            out.uniquePhysicalSamples += (curE - curS);
+        }
+        return true;
     }
 
     std::vector<RawPartRef> localRefs;

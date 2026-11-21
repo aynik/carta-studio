@@ -44,11 +44,11 @@ inline constexpr int kMdUnitsPerSector = 11;
 inline constexpr int kMdUnitsPerCluster = kMdSectorsPerCluster * kMdUnitsPerSector; // 352
 inline constexpr std::uint16_t kMdFirstAudioCluster = 1;
 
-/** Standard MiniDisc physical medium capacities (MD60/MD74/MD80). */
-enum class MdMedium { md60, md74, md80 };
+/** Standard MiniDisc and Hi-MD physical medium capacities. */
+enum class MdMedium { md60, md74, md80, himd300, himd1gb };
 
-/** Standard MiniDisc and MDLP recording modes supported by UTOC Sector 0. */
-enum class MdCodecMode { spStereo, spMono, lp2, lp4 };
+/** MiniDisc and Hi-MD recording codec modes supported by Carta Studio. */
+enum class MdCodecMode { spStereo, spMono, lp2, lp4, hiSp, hiLp, pcm };
 
 // ============================================================================
 // Authoring Data Structures
@@ -177,6 +177,8 @@ struct MdTrack {
     bool emphasis = false;
     std::string timestamp; // "YYYY-MM-DD HH:MM:SS" or empty
     std::vector<MdPart> parts;
+    std::string artist{};
+    std::string album{};
 
     std::int64_t totalSamples() const noexcept {
         std::int64_t total = 0;
@@ -198,7 +200,8 @@ struct MdTrack {
 
     bool operator==(const MdTrack& o) const noexcept {
         return id == o.id && halfWidthTitle == o.halfWidthTitle &&
-               fullWidthTitle == o.fullWidthTitle && codecOverride == o.codecOverride &&
+               fullWidthTitle == o.fullWidthTitle && artist == o.artist && album == o.album &&
+               codecOverride == o.codecOverride &&
                writeProtected == o.writeProtected && scmsCopyProtected == o.scmsCopyProtected &&
                emphasis == o.emphasis && timestamp == o.timestamp && parts == o.parts;
     }
@@ -291,16 +294,34 @@ struct MdPhysicalPlan {
 // Medium & Codec Metadata Helpers
 // ============================================================================
 
-/** Returns canonical string tag ("md60", "md74", or "md80"). */
+/** Returns canonical string tag ("md60", "md74", "md80", "himd300", or "himd1gb"). */
 std::string mdMediumToString(MdMedium medium);
 
 /** Parses medium text or minute count; leaves `out` unchanged on failure. */
 bool parseMdMedium(const std::string& text, MdMedium& out) noexcept;
 
-/** Returns standard writable user cluster capacity for `medium`. */
+/** Returns true when `medium` uses Hi-MD FAT16/TRKIDX format rather than Standard MD UTOC. */
+bool isHiMdMedium(MdMedium medium) noexcept;
+
+/** Returns true when `mode` is a Hi-MD-only codec (`hiSp`, `hiLp`, `pcm`). */
+bool isHiMdOnlyCodec(MdCodecMode mode) noexcept;
+
+/** Returns true when `mode` is only valid on Standard MD / NetMD (`spStereo`, `spMono`). */
+bool isStandardMdOnlyCodec(MdCodecMode mode) noexcept;
+
+/** Returns true when `mode` is supported on `medium`. */
+bool isCodecValidForMedium(MdMedium medium, MdCodecMode mode) noexcept;
+
+/** Returns nominal Hi-MD filesystem usable capacity in bytes (0 for Standard MD). */
+std::int64_t hiMdMediumCapacityBytes(MdMedium medium) noexcept;
+
+/** Estimates Hi-MD cluster-aligned byte storage required for `samples` in `mode`. */
+std::int64_t estimateHiMdTrackBytes(MdCodecMode mode, std::int64_t samples) noexcept;
+
+/** Returns standard writable user cluster capacity for `medium` (0 for Hi-MD). */
 int mdTotalClusters(MdMedium medium) noexcept;
 
-/** Returns canonical codec mode tag ("sp-stereo", "sp-mono", "lp2", "lp4"). */
+/** Returns canonical codec mode tag ("sp-stereo", "sp-mono", "lp2", "lp4", "hi-sp", "hi-lp", "pcm"). */
 std::string mdCodecModeToString(MdCodecMode mode);
 
 /** Parses codec mode alias; leaves `out` unchanged on failure. */

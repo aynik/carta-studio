@@ -995,6 +995,10 @@ int uploadModeCodeForCodec(MdCodecMode codec) noexcept {
         return 2;
     case MdCodecMode::lp4:
         return 3;
+    case MdCodecMode::hiSp:
+    case MdCodecMode::hiLp:
+    case MdCodecMode::pcm:
+        return -1;
     }
     return -1;
 }
@@ -2945,6 +2949,15 @@ bool loadNetMdDisc(const std::string& deviceId, MdDisc& outDisc, NetMdDeviceStat
                 break;
             case MdCodecMode::lp4:
                 row.codec = "LP4";
+                break;
+            case MdCodecMode::hiSp:
+                row.codec = "Hi-SP";
+                break;
+            case MdCodecMode::hiLp:
+                row.codec = "Hi-LP";
+                break;
+            case MdCodecMode::pcm:
+                row.codec = "PCM";
                 break;
             }
             row.durationSeconds =

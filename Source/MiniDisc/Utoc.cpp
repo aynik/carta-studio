@@ -1181,6 +1181,16 @@ std::string computeUtocSectorSha256Hex(const std::uint8_t* sector2352) {
 
 bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& error) {
     error.clear();
+    if (isHiMdMedium(disc.medium) || isHiMdOnlyCodec(disc.defaultCodec)) {
+        error = "Hi-MD discs use FAT16/TRKIDX instead of Standard MD UTOC sectors.";
+        return false;
+    }
+    for (const auto& track : disc.tracks) {
+        if (isHiMdOnlyCodec(effectiveTrackCodec(disc, track))) {
+            error = "Hi-MD discs use FAT16/TRKIDX instead of Standard MD UTOC sectors.";
+            return false;
+        }
+    }
     MdPhysicalPlan plan;
     if (!planMdPhysicalAudio(disc, plan, error)) {
         return false;
