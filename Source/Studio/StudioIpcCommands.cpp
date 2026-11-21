@@ -4588,6 +4588,23 @@ struct Studio::IpcRouter {
             if (!carta::mdDiscFromUtoc(utoc, imported, reason)) {
                 return ipcReply(false, juce::String::fromUTF8(reason.c_str()));
             }
+            if (!imported.loadedDisc.active) {
+                const auto masterSamples =
+                    static_cast<std::int64_t>(carta::projectEndSample(studio.session));
+                if (masterSamples > 0) {
+                    for (auto& trk : imported.tracks) {
+                        const std::int64_t q =
+                            carta::mdFrameQuantumSamples(carta::effectiveTrackCodec(imported, trk));
+                        for (auto& part : trk.parts) {
+                            if (part.endSample > masterSamples &&
+                                (part.endSample - masterSamples) < q &&
+                                masterSamples > part.startSample) {
+                                part.endSample = masterSamples;
+                            }
+                        }
+                    }
+                }
+            }
             if (s0) {
                 imported.importedUtocSectors[0].assign(s0, s0 + sectorBytes);
             }
@@ -4834,7 +4851,7 @@ struct Studio::IpcRouter {
                                            juce::String::fromUTF8(devId.c_str()) + "'.");
             }
             if (sub == "erase") {
-                studio.startNetMdEraseJob(devId, confirmHw);
+                studio.startNetMdEraseJob(devId, confirmHw, false);
             } else {
                 if (sub == "record" && !studio.pendingImports.empty()) {
                     return ipcReply(false,
@@ -4851,7 +4868,7 @@ struct Studio::IpcRouter {
                     return ipcReply(false, juce::String::fromUTF8(checkErr.c_str()));
                 }
                 if (sub == "write-utoc") {
-                    studio.startNetMdWriteUtocJob(snapshot, devId, confirmHw);
+                    studio.startNetMdWriteUtocJob(snapshot, devId, confirmHw, false);
                 } else {
                     carta::MdPhysicalPlan plan;
                     if (!carta::planMdPhysicalAudio(snapshot.mdDisc, plan, checkErr)) {
@@ -4873,7 +4890,7 @@ struct Studio::IpcRouter {
                             }
                         }
                     }
-                    studio.startNetMdRecordJob(std::move(snapshot), devId, confirmHw);
+                    studio.startNetMdRecordJob(std::move(snapshot), devId, confirmHw, false);
                 }
             }
             auto* root = new juce::DynamicObject();

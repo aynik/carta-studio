@@ -268,10 +268,17 @@ void Studio::exportCurrentUtocDialog() {
                 return;
             }
             const auto result = safe->ipcCommand({"utoc", "export", file.getFullPathName()});
-            safe->status.setText(static_cast<bool>(result["ok"])
-                                     ? "Exported 9408-byte UTOC bundle to " + file.getFileName()
-                                     : result["error"].toString(),
-                                 juce::dontSendNotification);
+            if (static_cast<bool>(result["ok"])) {
+                const bool loadedActive = safe->session.mdDisc.loadedDisc.active;
+                safe->status.setText(
+                    loadedActive
+                        ? ("Exported 9408-byte UTOC bundle to " + file.getFileName())
+                        : ("Exported 9408-byte virtual UTOC bundle to " + file.getFileName() +
+                           " (use Save Project for exact timeline edits)."),
+                    juce::dontSendNotification);
+            } else {
+                safe->status.setText(result["error"].toString(), juce::dontSendNotification);
+            }
         });
 }
 
@@ -427,6 +434,10 @@ void Studio::startNetMdReadUtocJob(const std::string& devId, const juce::File& o
             carta::UtocDiscState parsed{};
             if (!carta::readNetMdDiscUtoc(devId, rawSectors, parsed, err)) {
                 uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showPopup) {
+                    alertTitle = "Read Disc TOC Failed";
+                    alertBody = uiStatus;
+                }
                 return false;
             }
 
@@ -490,12 +501,17 @@ void Studio::startNetMdLoadDiscJob(const std::string& devId, bool showAlerts) {
     launchNetMdWorker(
         "load-disc", devId, "Reading MiniDisc UTOC...",
         [this, devId, showAlerts](
-            std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
-            juce::String&, std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody,
+            std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
             carta::MdDisc loadedDisc{};
             carta::NetMdDeviceStatus devStatus{};
             if (!carta::loadNetMdDisc(devId, loadedDisc, &devStatus, err)) {
                 uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Load MiniDisc Failed";
+                    alertBody = uiStatus;
+                }
                 return false;
             }
 
@@ -572,7 +588,7 @@ bool Studio::applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& erro
     return true;
 }
 
-void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware) {
+void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware, bool showAlerts) {
     carta::Session snapshot;
     {
         const juce::ScopedLock guard(lock);
@@ -581,12 +597,17 @@ void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware) 
 
     launchNetMdWorker(
         "erase", devId, "Erasing MiniDisc...",
-        [snapshot, devId, confirmHardware](
-            std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
-            juce::String&, std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
+        [snapshot, devId, confirmHardware, showAlerts](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody,
+            std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
             carta::NetMdDeviceStatus afterStatus{};
             if (!carta::eraseNetMdDisc(devId, confirmHardware, afterStatus, err)) {
                 uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Erase MiniDisc Failed";
+                    alertBody = uiStatus;
+                }
                 return false;
             }
 
@@ -611,18 +632,24 @@ void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware) 
 }
 
 void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::string& devId,
-                                    bool confirmHardware) {
+                                    bool confirmHardware, bool showAlerts) {
     launchNetMdWorker(
         "write-utoc", devId, "Writing UTOC Sectors 0/1/2/4...",
-        [this, snapCopy = snapshot, devId, confirmHardware](
-            std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
-            juce::String&, std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
+        [this, snapCopy = snapshot, devId, confirmHardware, showAlerts](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody,
+            std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
             carta::UtocBudget budget{};
             std::string committedHash;
             std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committedRaw{};
             if (!carta::writeNetMdUtoc(snapCopy.mdDisc, devId, confirmHardware, budget, err,
                                        &committedHash, &committedRaw)) {
                 uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Write MiniDisc UTOC Failed";
+                    alertBody = uiStatus +
+                                "\n\nUse Help -> Export Diagnostic Log to save details.";
+                }
                 return false;
             }
 
@@ -666,10 +693,10 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
 }
 
 void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
-                                 bool confirmHardware) {
+                                 bool confirmHardware, bool showAlerts) {
     launchNetMdWorker(
         "record", devId, "Preparing ATRAC spans...",
-        [this, snapshot = std::move(snapshotIn), devId, confirmHardware](
+        [this, snapshot = std::move(snapshotIn), devId, confirmHardware, showAlerts](
             std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
             juce::String& alertBody,
             std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
@@ -677,6 +704,11 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
             if (!carta::recordNetMdDisc(snapshot, snapshot.mdDisc, devId, confirmHardware, rec,
                                         err)) {
                 uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "MiniDisc Recording Failed";
+                    alertBody = uiStatus +
+                                "\n\nUse Help -> Export Diagnostic Log to save details.";
+                }
                 return false;
             }
 
@@ -754,6 +786,7 @@ void Studio::pollNetMdJobProgress() {
         juce::String uiStatus;
         juce::String alertTitle;
         juce::String alertBody;
+        bool alertIsWarning = false;
         std::optional<carta::NetMdPreflightReport> afterPreflight;
         std::optional<carta::MdDisc> pendingLoadedDisc;
         std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committedRaw{};
@@ -764,6 +797,7 @@ void Studio::pollNetMdJobProgress() {
             uiStatus = netMdPendingUiStatus;
             alertTitle = netMdPendingAlertTitle;
             alertBody = netMdPendingAlertBody;
+            alertIsWarning = !netMdLastOk;
             afterPreflight = netMdPendingPreflight;
             pendingLoadedDisc = std::move(netMdPendingLoadedDisc);
             netMdPendingLoadedDisc.reset();
@@ -829,12 +863,14 @@ void Studio::pollNetMdJobProgress() {
         }
         refreshRecordWorkspace(false);
         if (alertBody.isNotEmpty() && !headlessMode) {
-            showGuardedStudioAlert(juce::MessageBoxOptions()
-                                       .withIconType(juce::MessageBoxIconType::InfoIcon)
-                                       .withTitle(alertTitle)
-                                       .withMessage(alertBody)
-                                       .withButton("OK")
-                                       .withAssociatedComponent(this));
+            showGuardedStudioAlert(
+                juce::MessageBoxOptions()
+                    .withIconType(alertIsWarning ? juce::MessageBoxIconType::WarningIcon
+                                                 : juce::MessageBoxIconType::InfoIcon)
+                    .withTitle(alertTitle)
+                    .withMessage(alertBody)
+                    .withButton("OK")
+                    .withAssociatedComponent(this));
         }
         return;
     }

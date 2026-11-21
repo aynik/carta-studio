@@ -1135,6 +1135,48 @@ struct StudioComponentTests {
             check(studio.session.mdDisc.halfWidthTitle == "BEFORE IMPORT",
                   "Undo reverts UTOC import cleanly");
 
+            {
+                const auto wavOdd = dir.getChildFile("unaligned_44100.wav");
+                writeTestWavFile(wavOdd, 2, 44100, 0.25f);
+                Studio oddStudio;
+                oddStudio.setSize(1180, 760);
+                check(static_cast<bool>(
+                          oddStudio.ipcCommand({"import", wavOdd.getFullPathName()})["ok"]),
+                      "Import non-512-aligned 44100-sample WAV for UTOC roundtrip check");
+                for (int i = 0; i < 400 && !oddStudio.pendingImports.empty(); ++i)
+                    juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+                const auto oddUtocFile = dir.getChildFile("odd_44100.utoc");
+                check(static_cast<bool>(oddStudio.ipcCommand(
+                          {"utoc", "export", oddUtocFile.getFullPathName()})["ok"]) &&
+                          static_cast<bool>(oddStudio.ipcCommand(
+                              {"utoc", "import", oddUtocFile.getFullPathName()})["ok"]),
+                      "Export and re-import UTOC on non-512-aligned project");
+                const auto masterSamples =
+                    static_cast<std::int64_t>(carta::projectEndSample(oddStudio.session));
+                bool allWithinMaster = !oddStudio.session.mdDisc.tracks.empty();
+                for (const auto& trk : oddStudio.session.mdDisc.tracks) {
+                    for (const auto& part : trk.parts) {
+                        if (part.endSample > masterSamples) {
+                            allWithinMaster = false;
+                        }
+                    }
+                }
+                carta::NetMdDeviceStatus mockBlankSt{};
+                mockBlankSt.deviceId = "mock:mz-n920";
+                mockBlankSt.deviceName = "Mock";
+                mockBlankSt.versionCode = "S1.600";
+                mockBlankSt.supportsSpUpload = true;
+                mockBlankSt.supportsForceTocEdit = true;
+                mockBlankSt.discPresent = true;
+                mockBlankSt.writable = true;
+                mockBlankSt.trackCount = 0;
+                const auto preOdd = carta::preflightNetMdRecordingWithStatus(
+                    oddStudio.session, oddStudio.session.mdDisc, mockBlankSt);
+                check(allWithinMaster && preOdd.canRecord,
+                      "Imported UTOC on non-512-aligned timeline stays within master samples and "
+                      "passes recording preflight");
+            }
+
             // 5. NetMD IPC surface + hardware safety guards (never touch hardware without
             // confirm-hardware)
             check(static_cast<bool>(studio.ipcCommand({"disc", "sync", "layer1"})["ok"]) &&

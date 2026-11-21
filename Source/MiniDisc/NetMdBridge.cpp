@@ -146,6 +146,135 @@ void clearCachedPhysicalSpanMap(const std::string& deviceId) {
     }
 }
 
+int physicalTotalClustersFromUtoc(const UtocDiscState& utoc) {
+    if (!utoc.hasSector0) {
+        return 0;
+    }
+    std::uint16_t minCluster = 0;
+    std::uint16_t maxCluster = 0;
+    auto noteAddr = [&](const UtocAddress& a, const UtocAddress& b) {
+        if (a.cluster > 0) {
+            minCluster = (minCluster == 0) ? a.cluster : std::min(minCluster, a.cluster);
+        }
+        maxCluster = std::max(maxCluster, b.cluster);
+    };
+    auto scanChain = [&](std::uint8_t head) {
+        std::uint8_t slot = head;
+        std::set<std::uint8_t> visited;
+        while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+            const auto& f = utoc.fragments[slot];
+            if (f.isValid() && f.end.toLinearGroup() >= f.start.toLinearGroup()) {
+                noteAddr(f.start, f.end);
+            }
+            slot = f.link;
+        }
+    };
+    scanChain(utoc.trackMap[0]);       // P-FRA
+    scanChain(utoc.sec0aPadding[14]);  // P-DFA
+    const int nTracks = std::min<int>(utoc.trackCount, kUtocMaxTracks);
+    for (int t = 1; t <= nTracks; ++t) {
+        scanChain(utoc.trackMap[static_cast<std::size_t>(t)]);
+    }
+    if (minCluster == 0 || maxCluster < minCluster) {
+        return 0;
+    }
+    return static_cast<int>(maxCluster - minCluster + 1);
+}
+
+std::int64_t expectedUploadedUnitsForSpan(const MdPhysicalSpan& span) noexcept {
+    const auto unpadded = std::max<std::int64_t>(0, span.endSample - span.startSample);
+    if (unpadded == 0) {
+        return 0;
+    }
+    if (span.codec == MdCodecMode::spStereo || span.codec == MdCodecMode::spMono) {
+        const std::int64_t pcmFrames = (unpadded + 511) / 512;
+        const std::int64_t totalOutFrames = pcmFrames + 1; // +1 carta1 flush frame
+        const std::int64_t rem = totalOutFrames % 11;
+        const std::int64_t uploadedFrames = totalOutFrames + (rem == 0 ? 0 : (11 - rem));
+        const int upq = (span.codec == MdCodecMode::spStereo) ? 2 : 1;
+        return uploadedFrames * upq;
+    }
+    const std::int64_t alignQuantum = (span.codec == MdCodecMode::lp2) ? 2048 : 4096;
+    const std::int64_t rem = unpadded % alignQuantum;
+    const std::int64_t target = rem != 0 ? (unpadded + (alignQuantum - rem)) : unpadded;
+    const std::int64_t lead = std::min<std::int64_t>(target, 69);
+    const std::int64_t mainCalls = (target > lead) ? ((target - lead + 1023) / 1024) : 0;
+    const std::int64_t emittedAtracFrames = 1 + std::max<std::int64_t>(0, mainCalls - 1) + 3;
+    const int upq = (span.codec == MdCodecMode::lp2) ? 2 : 1;
+    return emittedAtracFrames * upq;
+}
+
+std::string formatUtocAddressShort(const UtocAddress& a) {
+    return std::to_string(a.cluster) + ":" + std::to_string(a.sector) + "." +
+           std::to_string(a.group);
+}
+
+std::string formatUtocRangeSummary(const std::vector<std::pair<UtocAddress, UtocAddress>>& ranges) {
+    if (ranges.empty()) {
+        return "empty";
+    }
+    std::int64_t units = 0;
+    for (const auto& r : ranges) {
+        const auto sLin = r.first.toLinearGroup();
+        const auto eLin = r.second.toLinearGroup();
+        if (eLin >= sLin) {
+            units += (eLin - sLin + 1);
+        }
+    }
+    std::string out = formatUtocAddressShort(ranges.front().first);
+    out += (ranges.size() == 1 ? "-" : "..");
+    out += formatUtocAddressShort(ranges.back().second);
+    out += " (units=" + std::to_string(units) + ", frags=" + std::to_string(ranges.size()) + ")";
+    return out;
+}
+
+std::string describeDeviceUtocSector0(const UtocDiscState& utoc) {
+    if (!utoc.hasSector0) {
+        return "missing-sector0";
+    }
+    std::ostringstream oss;
+    oss << "tracks=" << static_cast<int>(utoc.trackCount)
+        << " physClusters=" << physicalTotalClustersFromUtoc(utoc)
+        << " pfraSlot=" << static_cast<int>(utoc.trackMap[0])
+        << " pdfaSlot=" << static_cast<int>(utoc.sec0aPadding[14]);
+    const int limit = std::min<int>(utoc.trackCount, 4);
+    for (int t = 1; t <= limit; ++t) {
+        std::vector<std::pair<UtocAddress, UtocAddress>> ranges;
+        std::uint8_t modeByte = 0;
+        bool hasMode = false;
+        std::uint8_t slot = utoc.trackMap[static_cast<std::size_t>(t)];
+        std::set<std::uint8_t> visited;
+        while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+            const auto& f = utoc.fragments[slot];
+            if (f.isValid()) {
+                if (!hasMode) {
+                    modeByte = f.mode;
+                    hasMode = true;
+                }
+                ranges.emplace_back(f.start, f.end);
+            }
+            slot = f.link;
+        }
+        char modeHex[8];
+        std::snprintf(modeHex, sizeof(modeHex), "0x%02x", static_cast<unsigned>(modeByte));
+        oss << " t" << t << "[" << (hasMode ? audioModeFromUtocMode(modeByte) : "none") << "("
+            << modeHex << ") " << formatUtocRangeSummary(ranges) << "]";
+    }
+    if (utoc.trackCount > 4) {
+        oss << " ...";
+    }
+    return oss.str();
+}
+
+std::string formatBudgetOverflow(const char* prefix, const UtocBudget& b) {
+    return std::string(prefix) + " (clusters=" + std::to_string(b.usedClusters) + "/" +
+           std::to_string(b.totalClusters) + ", tracks=" + std::to_string(b.usedTracks) + "/" +
+           std::to_string(b.maxTracks) + ", fragments=" + std::to_string(b.usedFragments) + "/" +
+           std::to_string(b.maxFragments) + ", hwCells=" + std::to_string(b.usedHalfWidthCells) +
+           "/" + std::to_string(b.maxHalfWidthCells) + ", fwCells=" +
+           std::to_string(b.usedFullWidthCells) + "/" + std::to_string(b.maxFullWidthCells) + ").";
+}
+
 std::mutex& netMdBridgeMutex() {
     static std::mutex m;
     return m;
@@ -1470,6 +1599,10 @@ bool sliceUnitSubrange(const std::vector<std::pair<UtocAddress, UtocAddress>>& s
     if (outRanges.empty() || cursor < wantEnd) {
         error = "Uploaded physical span on NetMD device has fewer sound groups (" +
                 std::to_string(cursor) + ") than required (" + std::to_string(wantEnd) + ").";
+        logDiagnostic("utoc", "sliceUnitSubrange FAIL: " + error +
+                                  " (unitOffset=" + std::to_string(unitOffset) +
+                                  ", unitCount=" + std::to_string(unitCount) +
+                                  ", span=" + formatUtocRangeSummary(spanPhysRanges) + ")");
         return false;
     }
     return true;
@@ -1480,6 +1613,7 @@ bool remapSector0WithPhysicalUploads(const MdDisc& disc, const MdPhysicalPlan& p
                                      const std::vector<SpanUploadPlan>& plans,
                                      UtocDiscState& finalUtoc, std::string& error) {
     copyDeviceHeadersToUtoc(deviceUtoc, finalUtoc);
+    finalUtoc.sec0aPadding[14] = 0; // Reset P-DFA pointer; re-allocate valid chain below.
     finalUtoc.discNonEmpty = disc.tracks.empty() ? 0 : 1;
     finalUtoc.trackCount = static_cast<std::uint8_t>(disc.tracks.size());
 
@@ -1557,6 +1691,28 @@ bool remapSector0WithPhysicalUploads(const MdDisc& disc, const MdPhysicalPlan& p
         finalUtoc.trackMap[0] = nextLink;
     }
 
+    // Preserve device defective-area chain (P-DFA at sec0aPadding[14]) in physical coordinates.
+    if (deviceUtoc.sec0aPadding[14] != 0) {
+        std::vector<UtocFragment> pdfaChain;
+        std::uint8_t slot = deviceUtoc.sec0aPadding[14];
+        std::set<std::uint8_t> visited;
+        while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+            pdfaChain.push_back(deviceUtoc.fragments[slot]);
+            slot = deviceUtoc.fragments[slot].link;
+        }
+        std::uint8_t nextLink = 0;
+        for (auto it = pdfaChain.rbegin(); it != pdfaChain.rend(); ++it) {
+            UtocFragment f = *it;
+            f.link = nextLink;
+            std::uint8_t assigned = 0;
+            if (!allocSlot(f, false, assigned)) {
+                return false;
+            }
+            nextLink = assigned;
+        }
+        finalUtoc.sec0aPadding[14] = nextLink;
+    }
+
     std::map<std::pair<int, int>, const MdPartPlacement*> placeByTrackPart;
     for (const auto& pl : physPlan.placements) {
         placeByTrackPart.emplace(std::make_pair(pl.trackIndex, pl.partIndex), &pl);
@@ -1613,6 +1769,24 @@ bool remapSector0WithPhysicalUploads(const MdDisc& disc, const MdPhysicalPlan& p
     }
 
     return true;
+}
+
+void storeCachedPhysicalSpanMap(const std::string& resolvedId, const MdPhysicalPlan& physPlan,
+                                const std::vector<SpanUploadPlan>& plans) {
+    std::lock_guard<std::mutex> lk(cachedSpanMutex());
+    auto& cache = cachedSpanMap();
+    cache.deviceId = resolvedId;
+    cache.spans.clear();
+    cache.spans.reserve(plans.size());
+    for (std::size_t i = 0; i < physPlan.spans.size() && i < plans.size(); ++i) {
+        CachedSpanEntry entry;
+        entry.codec = physPlan.spans[i].codec;
+        entry.startSample = physPlan.spans[i].startSample;
+        entry.endSample = physPlan.spans[i].endSample;
+        entry.unitCount = physPlan.spans[i].unitCount;
+        entry.physRanges = plans[i].physRanges;
+        cache.spans.push_back(std::move(entry));
+    }
 }
 
 bool tryRemapUtocFromCachedSpans(const MdDisc& disc, const std::string& resolvedId,
@@ -1759,6 +1933,223 @@ bool tryPreserveDeviceSector0Topology(const MdDisc& disc, const UtocDiscState& d
             logicalUtoc.fragments[slot].mode = updatedMode;
         }
     }
+    return true;
+}
+
+bool tryRemapUtocFromRawDeviceSpans(const MdDisc& disc, const UtocDiscState& deviceUtoc,
+                                    UtocDiscState& logicalUtoc, bool& outRemapped,
+                                    std::vector<SpanUploadPlan>& outRecoveredPlans,
+                                    std::string& outMismatchDetail, std::string& error) {
+    outRemapped = false;
+    outRecoveredPlans.clear();
+    outMismatchDetail.clear();
+    if (!deviceUtoc.hasSector0 || disc.tracks.empty()) {
+        return true;
+    }
+
+    MdPhysicalPlan physPlan{};
+    std::string planErr;
+    if (!planMdPhysicalAudio(disc, physPlan, planErr) || physPlan.spans.empty()) {
+        return true;
+    }
+
+    if (static_cast<std::size_t>(deviceUtoc.trackCount) != physPlan.spans.size()) {
+        outMismatchDetail = "disc has " + std::to_string(deviceUtoc.trackCount) +
+                            " track(s), project has " + std::to_string(physPlan.spans.size()) +
+                            " physical span(s) / " + std::to_string(disc.tracks.size()) +
+                            " logical track(s)";
+        return true;
+    }
+
+    constexpr std::int64_t kMaxExtraPaddingUnits = 352;
+    std::vector<SpanUploadPlan> rawPlans;
+    rawPlans.reserve(physPlan.spans.size());
+
+    for (std::size_t i = 0; i < physPlan.spans.size(); ++i) {
+        const auto& span = physPlan.spans[i];
+        const auto expectedModeStr = mdCodecModeToString(span.codec);
+        std::vector<std::pair<UtocAddress, UtocAddress>> physRanges;
+        std::uint8_t slot = deviceUtoc.trackMap[i + 1];
+        std::set<std::uint8_t> visited;
+        std::int64_t deviceUnits = 0;
+
+        while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+            const auto& frag = deviceUtoc.fragments[slot];
+            if (!frag.isValid()) {
+                outMismatchDetail = "span " + std::to_string(i + 1) +
+                                    ": device fragment slot " + std::to_string(slot) +
+                                    " is empty";
+                return true;
+            }
+            if (frag.start.cluster < 50) {
+                outMismatchDetail = "span " + std::to_string(i + 1) +
+                                    ": device cluster " + std::to_string(frag.start.cluster) +
+                                    " < 50";
+                return true;
+            }
+            const std::int64_t sLin = frag.start.toLinearGroup();
+            const std::int64_t eLin = frag.end.toLinearGroup();
+            if (eLin < sLin) {
+                outMismatchDetail = "span " + std::to_string(i + 1) +
+                                    ": inverted device fragment range";
+                return true;
+            }
+            const auto fragMode = audioModeFromUtocMode(frag.mode);
+            if (fragMode != expectedModeStr) {
+                outMismatchDetail = "span " + std::to_string(i + 1) + ": disc has " + fragMode +
+                                    ", project expects " + expectedModeStr;
+                return true;
+            }
+            deviceUnits += (eLin - sLin + 1);
+            physRanges.emplace_back(frag.start, frag.end);
+            slot = frag.link;
+        }
+        if (slot != 0) {
+            outMismatchDetail = "span " + std::to_string(i + 1) +
+                                ": cycle detected in device UTOC fragment chain";
+            return true;
+        }
+        if (physRanges.empty()) {
+            outMismatchDetail = "span " + std::to_string(i + 1) +
+                                ": device track has no audio fragments";
+            return true;
+        }
+
+        const std::int64_t expectedUnits = static_cast<std::int64_t>(span.unitCount);
+        const std::int64_t expectedUploaded = expectedUploadedUnitsForSpan(span);
+        const std::int64_t maxAllowedUnits =
+            std::max(expectedUnits, expectedUploaded) + kMaxExtraPaddingUnits;
+        if (deviceUnits < expectedUnits || deviceUnits > maxAllowedUnits) {
+            outMismatchDetail = "span " + std::to_string(i + 1) + " (" + expectedModeStr +
+                                "): disc has " + std::to_string(deviceUnits) +
+                                " sound groups, expected " + std::to_string(expectedUnits) + ".." +
+                                std::to_string(maxAllowedUnits);
+            return true;
+        }
+
+        SpanUploadPlan up;
+        up.spanIndex = static_cast<int>(i);
+        up.codec = span.codec;
+        up.modeName = expectedModeStr;
+        up.modeCode = uploadModeCodeForCodec(span.codec);
+        up.startSample = span.startSample;
+        up.endSample = span.endSample;
+        up.expectedUnits = span.unitCount;
+        up.uploadedTrackIndex = static_cast<int>(i);
+        up.physRanges = std::move(physRanges);
+        rawPlans.push_back(std::move(up));
+    }
+
+    UtocDiscState remapped = logicalUtoc;
+    if (!remapSector0WithPhysicalUploads(disc, physPlan, deviceUtoc, rawPlans, remapped, error)) {
+        return false;
+    }
+
+    const int devicePhysTotal = physicalTotalClustersFromUtoc(deviceUtoc);
+    const auto remappedBudget =
+        computeUtocBudget(remapped, mdMediumToString(disc.medium), devicePhysTotal);
+    if (!remappedBudget.fits()) {
+        error = formatBudgetOverflow("Remapped physical UTOC exceeds disc limits", remappedBudget);
+        return false;
+    }
+
+    logicalUtoc = std::move(remapped);
+    outRecoveredPlans = std::move(rawPlans);
+    outRemapped = true;
+    return true;
+}
+
+bool tryApplyImportedPhysicalUtoc(const MdDisc& disc, const UtocDiscState& deviceUtoc,
+                                  UtocDiscState& logicalUtoc) {
+    const bool hasImportedHeaders =
+        std::all_of(disc.importedUtocSectors.begin(), disc.importedUtocSectors.end(),
+                    [](const auto& s) { return s.size() == kUtocSectorBytes; });
+    if (!hasImportedHeaders || !deviceUtoc.hasSector0) {
+        return false;
+    }
+
+    UtocDiscState importedUtoc{};
+    std::string ignoredErr;
+    if (!parseUtocSectors(disc.importedUtocSectors[0].data(), disc.importedUtocSectors[1].data(),
+                          disc.importedUtocSectors[2].data(), disc.importedUtocSectors[3].data(),
+                          importedUtoc, ignoredErr) ||
+        !importedUtoc.hasSector0 || !validatePhysicalUtocClusters(importedUtoc, ignoredErr)) {
+        return false;
+    }
+
+    UtocDiscState candidate = logicalUtoc;
+    if (!tryPreserveDeviceSector0Topology(disc, importedUtoc, candidate)) {
+        return false;
+    }
+
+    struct PhysInterval {
+        std::int64_t startLin = 0;
+        std::int64_t endLin = 0;
+        std::string mode;
+    };
+    std::vector<PhysInterval> deviceIntervals;
+    const int devTracks = std::min<int>(deviceUtoc.trackCount, kUtocMaxTracks);
+    for (int t = 1; t <= devTracks; ++t) {
+        std::uint8_t slot = deviceUtoc.trackMap[static_cast<std::size_t>(t)];
+        std::set<std::uint8_t> visited;
+        while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+            const auto& f = deviceUtoc.fragments[slot];
+            if (f.isValid() && f.end.toLinearGroup() >= f.start.toLinearGroup()) {
+                deviceIntervals.push_back(
+                    {f.start.toLinearGroup(), f.end.toLinearGroup(), audioModeFromUtocMode(f.mode)});
+            }
+            slot = f.link;
+        }
+    }
+    if (deviceIntervals.empty()) {
+        return false;
+    }
+    std::sort(deviceIntervals.begin(), deviceIntervals.end(),
+              [](const PhysInterval& a, const PhysInterval& b) {
+                  return std::tie(a.mode, a.startLin, a.endLin) <
+                         std::tie(b.mode, b.startLin, b.endLin);
+              });
+    std::vector<PhysInterval> merged;
+    for (const auto& iv : deviceIntervals) {
+        if (!merged.empty() && merged.back().mode == iv.mode &&
+            iv.startLin <= merged.back().endLin + 1) {
+            merged.back().endLin = std::max(merged.back().endLin, iv.endLin);
+        } else {
+            merged.push_back(iv);
+        }
+    }
+
+    const int candTracks = std::min<int>(candidate.trackCount, kUtocMaxTracks);
+    if (candTracks <= 0) {
+        return false;
+    }
+    for (int t = 1; t <= candTracks; ++t) {
+        std::uint8_t slot = candidate.trackMap[static_cast<std::size_t>(t)];
+        std::set<std::uint8_t> visited;
+        int fragCount = 0;
+        while (slot != 0 && visited.insert(slot).second && visited.size() <= 255) {
+            const auto& f = candidate.fragments[slot];
+            if (!f.isValid() || f.end.toLinearGroup() < f.start.toLinearGroup()) {
+                return false;
+            }
+            const std::int64_t sLin = f.start.toLinearGroup();
+            const std::int64_t eLin = f.end.toLinearGroup();
+            const std::string mode = audioModeFromUtocMode(f.mode);
+            const bool covered = std::any_of(merged.begin(), merged.end(), [&](const PhysInterval& m) {
+                return m.mode == mode && sLin >= m.startLin && eLin <= m.endLin;
+            });
+            if (!covered) {
+                return false;
+            }
+            ++fragCount;
+            slot = f.link;
+        }
+        if (slot != 0 || fragCount == 0) {
+            return false;
+        }
+    }
+
+    logicalUtoc = std::move(candidate);
     return true;
 }
 
@@ -2134,7 +2525,7 @@ bool buildCombinedLoadedAndUploadedUtoc(const MdDisc& disc, const MdPhysicalPlan
     const auto budget =
         computeUtocBudget(finalUtoc, mdMediumToString(disc.medium), physTotalClusters);
     if (!budget.fits()) {
-        error = "Combined physical UTOC exceeds disc cluster or 255-slot limits.";
+        error = formatBudgetOverflow("Combined physical UTOC exceeds disc limits", budget);
         return false;
     }
     return true;
@@ -2655,18 +3046,21 @@ bool writeNetMdUtoc(
     if (!readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, deviceUtoc, readWin, error)) {
         return false;
     }
+    logDiagnostic("utoc", "writeNetMdUtoc device Sector 0: " + describeDeviceUtocSector0(deviceUtoc));
 
     if (disc.loadedDisc.active && !disc.loadedDisc.baselineSector0Hash.empty()) {
         const auto liveHash = computeUtocSectorSha256Hex(rawSectors[0].data());
         if (liveHash != disc.loadedDisc.baselineSector0Hash) {
             error = "Inserted MiniDisc UTOC changed on hardware since Load Disc; click Load Disc "
                     "again before writing UTOC.";
+            logDiagnostic("utoc", "writeNetMdUtoc FAIL: " + error);
             return false;
         }
     }
 
     bool remappedFromHardware = false;
     bool importedHasPhysicalLayout = false;
+    std::string resolutionMethod = "none";
     if (disc.loadedDisc.active) {
         std::string physCheckErr;
         importedHasPhysicalLayout = validatePhysicalUtocClusters(logicalUtoc, physCheckErr);
@@ -2674,8 +3068,10 @@ bool writeNetMdUtoc(
             error = physCheckErr.empty()
                         ? "Compiled UTOC physical cluster layout failed verification."
                         : physCheckErr;
+            logDiagnostic("utoc", "writeNetMdUtoc FAIL: " + error);
             return false;
         }
+        resolutionMethod = "loadedDisc";
     } else {
         const bool hasImportedHeaders =
             std::all_of(disc.importedUtocSectors.begin(), disc.importedUtocSectors.end(),
@@ -2686,22 +3082,60 @@ bool writeNetMdUtoc(
 
         if (!tryRemapUtocFromCachedSpans(disc, resolvedId, deviceUtoc, logicalUtoc,
                                          remappedFromHardware, error)) {
+            logDiagnostic("utoc", "writeNetMdUtoc cached-span remap FAIL: " + error);
             return false;
+        }
+        if (remappedFromHardware) {
+            resolutionMethod = "cachedSpans";
         }
         if (!remappedFromHardware) {
             remappedFromHardware = tryPreserveDeviceSector0Topology(disc, deviceUtoc, logicalUtoc);
+            if (remappedFromHardware) {
+                resolutionMethod = "preserveTopology";
+            }
         }
-
-        std::string physCheckErr;
-        importedHasPhysicalLayout =
-            hasImportedHeaders && validatePhysicalUtocClusters(logicalUtoc, physCheckErr);
-        if (!remappedFromHardware && !isNetMdMockDeviceId(resolvedId) &&
+        std::string rawMismatchDetail;
+        if (!remappedFromHardware) {
+            std::vector<SpanUploadPlan> recoveredPlans;
+            if (!tryRemapUtocFromRawDeviceSpans(disc, deviceUtoc, logicalUtoc,
+                                                remappedFromHardware, recoveredPlans,
+                                                rawMismatchDetail, error)) {
+                logDiagnostic("utoc", "writeNetMdUtoc raw-span remap FAIL: " + error);
+                return false;
+            }
+            if (remappedFromHardware) {
+                resolutionMethod = "rawDeviceSpans";
+                MdPhysicalPlan cachePlan{};
+                std::string cachePlanErr;
+                if (planMdPhysicalAudio(disc, cachePlan, cachePlanErr)) {
+                    storeCachedPhysicalSpanMap(resolvedId, cachePlan, recoveredPlans);
+                }
+            }
+        }
+        if (!remappedFromHardware && hasImportedHeaders) {
+            importedHasPhysicalLayout =
+                tryApplyImportedPhysicalUtoc(disc, deviceUtoc, logicalUtoc);
+            if (importedHasPhysicalLayout) {
+                resolutionMethod = "importedPhysicalUtoc";
+            }
+        }
+        if (!remappedFromHardware &&
+            (!isNetMdMockDeviceId(resolvedId) || isNetMdTestMockGuardEnabled()) &&
             !importedHasPhysicalLayout) {
             error = "Physical audio layout on MiniDisc does not match the current track spans; "
                     "use Record MiniDisc to upload audio first.";
+            if (!rawMismatchDetail.empty()) {
+                error += " (" + rawMismatchDetail + ")";
+            }
+            logDiagnostic("utoc", "writeNetMdUtoc FAIL: " + error);
             return false;
         }
+        if (resolutionMethod == "none") {
+            resolutionMethod = "mockBypass";
+        }
     }
+    logDiagnostic("utoc", "writeNetMdUtoc resolution=" + resolutionMethod +
+                              " tracks=" + std::to_string(logicalUtoc.trackCount));
 
     setNetMdProgress("write-utoc", "Writing UTOC Sectors 0/1/2/4 & running TOCWRT...", 0.28);
     HelperProgressWindow writeWin;
@@ -2714,6 +3148,7 @@ bool writeNetMdUtoc(
     std::string committedHash;
     if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors[3], confirmHardware,
                                         writeWin, error, &committedRaw, &committedHash)) {
+        logDiagnostic("utoc", "writeNetMdUtoc commit FAIL: " + error);
         return false;
     }
     if (outCommittedSector0Hash != nullptr) {
@@ -2722,7 +3157,9 @@ bool writeNetMdUtoc(
     if (outCommittedRawSectors != nullptr) {
         *outCommittedRawSectors = committedRaw;
     }
-    outBudget = computeUtocBudget(logicalUtoc, medium, physTotal);
+    const int effectivePhysTotal =
+        physTotal > 0 ? physTotal : physicalTotalClustersFromUtoc(deviceUtoc);
+    outBudget = computeUtocBudget(logicalUtoc, medium, effectivePhysTotal);
     return true;
 }
 
@@ -2840,6 +3277,20 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         }
         clearCachedPhysicalSpanMap(resolvedId);
 
+        logDiagnostic("utoc", "record Path1 start: device=" + resolvedId + " medium=" + medium +
+                                  " spans=" + std::to_string(plans.size()) +
+                                  " logicalTracks=" + std::to_string(disc.tracks.size()) +
+                                  " totalWireBytes=" + std::to_string(totalEncodedBytes));
+        for (std::size_t idx = 0; idx < plans.size(); ++idx) {
+            const auto& p = plans[idx];
+            logDiagnostic("utoc", "record Path1 plan span=" + std::to_string(idx) +
+                                      " mode=" + p.modeName +
+                                      " samples=[" + std::to_string(p.startSample) + "," +
+                                      std::to_string(p.endSample) + ")" +
+                                      " expectedUnits=" + std::to_string(p.expectedUnits) +
+                                      " wireBytes=" + std::to_string(p.wireBytes.size()));
+        }
+
         const std::int64_t totalBytesDenom = std::max<std::int64_t>(1, totalEncodedBytes);
         std::int64_t sentSoFar = 0;
         for (std::size_t idx = 0; idx < plans.size(); ++idx) {
@@ -2870,10 +3321,14 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
             int trkIdx = -1;
             if (!uploadSpanUnlocked(resolvedId, p.modeCode, p.wireBytes, p.hwTitle, p.fwTitle,
                                     confirmHardware, uploadWin, trkIdx, error)) {
+                logDiagnostic("utoc", "record Path1 upload FAIL span=" + std::to_string(idx) +
+                                          ": " + error);
                 return false;
             }
             p.uploadedTrackIndex = trkIdx;
             sentSoFar += spanWireBytes;
+            logDiagnostic("utoc", "record Path1 uploaded span=" + std::to_string(idx) +
+                                      " -> hwTrack=" + std::to_string(trkIdx));
         }
 
         setNetMdProgress("record", "Reading physical UTOC allocation from disc...", 0.82);
@@ -2886,23 +3341,41 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawSectors{};
         UtocDiscState deviceUtoc{};
         if (!readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, deviceUtoc, readWin, error)) {
+            logDiagnostic("utoc", "record Path1 post-upload read-utoc FAIL: " + error);
             return false;
         }
+        logDiagnostic("utoc", "record Path1 post-upload device Sector 0: " +
+                                  describeDeviceUtocSector0(deviceUtoc));
 
-        for (auto& p : plans) {
+        for (std::size_t idx = 0; idx < plans.size(); ++idx) {
+            auto& p = plans[idx];
             if (!extractTrackFragmentRanges(deviceUtoc, p.uploadedTrackIndex, p.physRanges,
                                             error)) {
+                logDiagnostic("utoc", "record Path1 extractTrackFragmentRanges FAIL span=" +
+                                          std::to_string(idx) + " hwTrack=" +
+                                          std::to_string(p.uploadedTrackIndex) + ": " + error);
                 return false;
             }
+            logDiagnostic("utoc", "record Path1 span=" + std::to_string(idx) +
+                                      " hwTrack=" + std::to_string(p.uploadedTrackIndex) +
+                                      " phys=" + formatUtocRangeSummary(p.physRanges) +
+                                      " expectedUnits=" + std::to_string(p.expectedUnits));
         }
+
+        // Cache extracted hardware span coordinates immediately so Write UTOC Only can recover in
+        // session even if remapping or TOCWRT fails transiently.
+        storeCachedPhysicalSpanMap(resolvedId, physPlan, plans);
 
         UtocDiscState finalUtoc = logicalUtoc;
         if (!remapSector0WithPhysicalUploads(disc, physPlan, deviceUtoc, plans, finalUtoc, error)) {
+            logDiagnostic("utoc", "record Path1 remapSector0 FAIL: " + error);
             return false;
         }
-        const auto finalBudget = computeUtocBudget(finalUtoc, medium);
+        const int devicePhysTotal = physicalTotalClustersFromUtoc(deviceUtoc);
+        const auto finalBudget = computeUtocBudget(finalUtoc, medium, devicePhysTotal);
         if (!finalBudget.fits()) {
-            error = "Remapped physical UTOC exceeds disc cluster or 255-slot limits.";
+            error = formatBudgetOverflow("Remapped physical UTOC exceeds disc limits", finalBudget);
+            logDiagnostic("utoc", "record Path1 finalBudget FAIL: " + error);
             return false;
         }
 
@@ -2917,24 +3390,8 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         std::string committedHash;
         if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &rawSectors[3], confirmHardware,
                                             writeWin, error, &committedRaw, &committedHash)) {
+            logDiagnostic("utoc", "record Path1 writeDeviceUtoc FAIL: " + error);
             return false;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(cachedSpanMutex());
-            auto& cache = cachedSpanMap();
-            cache.deviceId = resolvedId;
-            cache.spans.clear();
-            cache.spans.reserve(plans.size());
-            for (std::size_t i = 0; i < physPlan.spans.size() && i < plans.size(); ++i) {
-                CachedSpanEntry entry;
-                entry.codec = physPlan.spans[i].codec;
-                entry.startSample = physPlan.spans[i].startSample;
-                entry.endSample = physPlan.spans[i].endSample;
-                entry.unitCount = physPlan.spans[i].unitCount;
-                entry.physRanges = plans[i].physRanges;
-                cache.spans.push_back(std::move(entry));
-            }
         }
 
         outResult.deviceId = resolvedId;
@@ -3144,24 +3601,40 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     UtocDiscState postDeviceUtoc{};
     if (!readDeviceUtocSectorsUnlocked(resolvedId, postSectors, postDeviceUtoc, readPostWin,
                                        error)) {
+        logDiagnostic("utoc", "record Path2 post-upload read-utoc FAIL: " + error);
         return false;
     }
+    logDiagnostic("utoc", "record Path2 post-upload device Sector 0: " +
+                              describeDeviceUtocSector0(postDeviceUtoc));
 
-    for (auto& p : plans) {
+    for (std::size_t idx = 0; idx < plans.size(); ++idx) {
+        auto& p = plans[idx];
         if (!extractTrackFragmentRanges(postDeviceUtoc, p.uploadedTrackIndex, p.physRanges,
                                         error)) {
+            logDiagnostic("utoc", "record Path2 extractTrackFragmentRanges FAIL span=" +
+                                      std::to_string(idx) + " hwTrack=" +
+                                      std::to_string(p.uploadedTrackIndex) + ": " + error);
             return false;
         }
+        logDiagnostic("utoc", "record Path2 span=" + std::to_string(idx) +
+                                  " hwTrack=" + std::to_string(p.uploadedTrackIndex) +
+                                  " phys=" + formatUtocRangeSummary(p.physRanges) +
+                                  " expectedUnits=" + std::to_string(p.expectedUnits));
     }
 
+    const int postPhysTotal =
+        physTotal > 0 ? physTotal : physicalTotalClustersFromUtoc(postDeviceUtoc);
     UtocDiscState finalUtoc = logicalUtoc;
     if (!buildCombinedLoadedAndUploadedUtoc(disc, physPlan, logicalUtoc, postDeviceUtoc, plans,
-                                            physTotal, finalUtoc, error)) {
+                                            postPhysTotal, finalUtoc, error)) {
+        logDiagnostic("utoc", "record Path2 buildCombinedUtoc FAIL: " + error);
         return false;
     }
-    const auto finalBudget = computeUtocBudget(finalUtoc, medium, physTotal);
+    const auto finalBudget = computeUtocBudget(finalUtoc, medium, postPhysTotal);
     if (!finalBudget.fits()) {
-        error = "Combined loaded/uploaded UTOC exceeds disc cluster or 255-slot limits.";
+        error = formatBudgetOverflow("Combined loaded/uploaded UTOC exceeds disc limits",
+                                     finalBudget);
+        logDiagnostic("utoc", "record Path2 finalBudget FAIL: " + error);
         return false;
     }
 
@@ -3176,6 +3649,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     std::string committedHash;
     if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &postSectors[3], confirmHardware,
                                         writeWin, error, &committedRaw, &committedHash)) {
+        logDiagnostic("utoc", "record Path2 writeDeviceUtoc FAIL: " + error);
         return false;
     }
 

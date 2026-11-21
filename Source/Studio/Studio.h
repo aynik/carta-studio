@@ -985,11 +985,11 @@ class Studio final : public juce::AudioAppComponent,
     void startNetMdReadUtocJob(const std::string& devId, const juce::File& outFile,
                                const juce::String& outPath, bool showPopup);
     void startNetMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
-    void startNetMdEraseJob(const std::string& devId, bool confirmHardware);
+    void startNetMdEraseJob(const std::string& devId, bool confirmHardware, bool showAlerts = true);
     void startNetMdWriteUtocJob(const carta::Session& snapshot, const std::string& devId,
-                                bool confirmHardware);
+                                bool confirmHardware, bool showAlerts = true);
     void startNetMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
-                             bool confirmHardware);
+                             bool confirmHardware, bool showAlerts = true);
     bool applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& error);
     void pollNetMdJobProgress();
     void refreshRecordWorkspace(bool scanDevices);

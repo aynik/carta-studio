@@ -940,6 +940,326 @@ int main() {
         }
     }
 
+    // 3C. Raw-span recovery for Write UTOC Only, P-DFA preservation, physical budget, and imported UTOC
+    {
+        auto buildSingleSpanSeedUtoc =
+            [&](carta::UtocAddress startAddr, std::int64_t unitCount, std::uint8_t modeByte,
+                carta::UtocAddress freeStart, carta::UtocAddress freeEnd, bool withPdfa,
+                std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5>& outRaw) -> bool {
+            for (auto& s : outRaw) {
+                s.fill(0);
+            }
+            carta::UtocDiscState st{};
+            st.hasSector0 = true;
+            st.hasSector1 = true;
+            st.hasSector2 = true;
+            st.hasSector4 = false;
+            st.deviceSignature = 0x534F;
+            st.discNonEmpty = 1;
+            st.trackCount = 1;
+            for (std::uint8_t i = 1; i < 255; ++i) {
+                st.fragments[i].link = static_cast<std::uint8_t>(i + 1);
+            }
+            st.fragments[255].link = 0;
+            st.nextFreeTrackSlot = 1;
+
+            auto allocF = [&](carta::UtocAddress a, carta::UtocAddress b, std::uint8_t mode) {
+                const std::uint8_t slot = st.nextFreeTrackSlot;
+                st.nextFreeTrackSlot = st.fragments[slot].link;
+                st.fragments[slot].start = a;
+                st.fragments[slot].end = b;
+                st.fragments[slot].mode = mode;
+                st.fragments[slot].link = 0;
+                return slot;
+            };
+            st.trackMap[1] = allocF(
+                startAddr,
+                carta::UtocAddress::fromLinearGroup(startAddr.toLinearGroup() + unitCount - 1),
+                modeByte);
+            st.trackMap[0] = allocF(freeStart, freeEnd, 0);
+            if (withPdfa) {
+                st.sec0aPadding[14] = allocF({610, 0, 0}, {610, 31, 10}, 0);
+            }
+            st.halfTitleCells[1].bytes = {'R', 'A', 'W', 0, 0, 0, 0};
+            st.halfTitleCells[1].link = 0;
+            st.halfTitleMap[0] = 1;
+            st.nextFreeHalfTitleSlot = 2;
+
+            std::string compErr;
+            return carta::compileUtocSectors(st, outRaw[0], outRaw[1], outRaw[2], outRaw[4],
+                                             compErr);
+        };
+
+        const std::uint8_t spStereoMode =
+            carta::utocModeFromTrack("sp-stereo", false, false, false);
+        const std::uint8_t spMonoMode = carta::utocModeFromTrack("sp-mono", false, false, false);
+
+        // 3C.1: Multi-track SP-Stereo coalesced 1-track upload recovery with empty cache + P-DFA
+        carta::MdDisc sp3Disc;
+        sp3Disc.medium = carta::MdMedium::md80;
+        sp3Disc.defaultCodec = carta::MdCodecMode::spStereo;
+        sp3Disc.halfWidthTitle = "SP3 TEST";
+        for (int i = 0; i < 3; ++i) {
+            carta::MdTrack t;
+            t.id = "sp3-" + std::to_string(i + 1);
+            t.halfWidthTitle = "Track " + std::to_string(i + 1);
+            t.parts = {{i * kSegLen, (i + 1) * kSegLen}};
+            sp3Disc.tracks.push_back(std::move(t));
+        }
+        carta::MdPhysicalPlan sp3Plan{};
+        REQUIRE(carta::planMdPhysicalAudio(sp3Disc, sp3Plan, planErr) && sp3Plan.spans.size() == 1,
+                "3-track SP-Stereo disc must coalesce into 1 span");
+
+        // 3 * 44032 = 132096 samples -> 258 frames -> (258+1) padded mod 11 = 264 frames = 528 SG
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw3c1{};
+        REQUIRE(buildSingleSpanSeedUtoc({50, 0, 0}, 528, spStereoMode, {611, 0, 0}, {2251, 31, 10},
+                                        true, raw3c1),
+                "Failed building 3C.1 seed UTOC");
+        REQUIRE(carta::resetNetMdTestMockSession(mockErr) &&
+                    carta::seedNetMdTestMockUtoc(raw3c1, mockErr) &&
+                    carta::setNetMdTestMockGuard(true, mockErr),
+                "Failed seeding 3C.1 mock state: " + mockErr);
+        {
+            carta::UtocBudget b{};
+            std::string err3c1, hash3c1;
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committed{};
+            REQUIRE(carta::writeNetMdUtoc(sp3Disc, "mock:mz-n920", true, b, err3c1, &hash3c1,
+                                          &committed),
+                    "3C.1 writeNetMdUtoc recovery failed: " + err3c1);
+            carta::UtocDiscState parsed{};
+            REQUIRE(carta::parseUtocSectors(committed[0].data(), committed[1].data(),
+                                            committed[2].data(), committed[4].data(), parsed,
+                                            err3c1),
+                    "3C.1 parse committed UTOC failed: " + err3c1);
+            REQUIRE(parsed.trackCount == 3, "3C.1 must commit 3 tracks");
+            const auto startLin = carta::UtocAddress{50, 0, 0}.toLinearGroup();
+            const std::int64_t perTrackUnits = 172; // 44032 / 256
+            for (int t = 0; t < 3; ++t) {
+                const std::uint8_t slot = parsed.trackMap[static_cast<std::size_t>(t + 1)];
+                REQUIRE(slot != 0 && parsed.fragments[slot].link == 0,
+                        "3C.1 each remapped track must have 1 contiguous fragment");
+                REQUIRE(parsed.fragments[slot].start.toLinearGroup() ==
+                                startLin + t * perTrackUnits &&
+                            parsed.fragments[slot].end.toLinearGroup() ==
+                                startLin + (t + 1) * perTrackUnits - 1,
+                        "3C.1 remapped physical addresses must match exact sequential subranges");
+            }
+            const bool hasPfra =
+                parsed.trackMap[0] != 0 &&
+                parsed.fragments[parsed.trackMap[0]].start == carta::UtocAddress{611, 0, 0};
+            REQUIRE(hasPfra, "3C.1 must preserve P-FRA");
+            const bool hasPdfa =
+                parsed.sec0aPadding[14] != 0 &&
+                parsed.fragments[parsed.sec0aPadding[14]].start ==
+                    carta::UtocAddress{610, 0, 0} &&
+                parsed.fragments[parsed.sec0aPadding[14]].end ==
+                    carta::UtocAddress{610, 31, 10};
+            REQUIRE(hasPdfa, "3C.1 must preserve P-DFA chain across Sector 0 remap");
+        }
+
+        // 3C.2: Single-track SP-Stereo padded raw upload recovery (dUnits > lUnits)
+        carta::MdDisc sp1Disc;
+        sp1Disc.medium = carta::MdMedium::md80;
+        sp1Disc.defaultCodec = carta::MdCodecMode::spStereo;
+        sp1Disc.halfWidthTitle = "SP1 TEST";
+        sp1Disc.tracks.push_back({"sp1-1", "Solo", {}, {}, false, false, false, "", {{0, kSegLen}}});
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw3c2{};
+        REQUIRE(buildSingleSpanSeedUtoc({50, 0, 0}, 172 + 14, spStereoMode, {52, 0, 0},
+                                        {2251, 31, 10}, false, raw3c2),
+                "Failed building 3C.2 seed UTOC");
+        REQUIRE(carta::seedNetMdTestMockUtoc(raw3c2, mockErr),
+                "Failed seeding 3C.2 mock UTOC: " + mockErr);
+        {
+            carta::UtocBudget b{};
+            std::string err3c2, hash3c2;
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committed{};
+            REQUIRE(carta::writeNetMdUtoc(sp1Disc, "mock:mz-n920", true, b, err3c2, &hash3c2,
+                                          &committed),
+                    "3C.2 single-track padded writeNetMdUtoc failed: " + err3c2);
+            carta::UtocDiscState parsed{};
+            REQUIRE(carta::parseUtocSectors(committed[0].data(), committed[1].data(),
+                                            committed[2].data(), committed[4].data(), parsed,
+                                            err3c2),
+                    "3C.2 parse failed: " + err3c2);
+            const std::uint8_t s = parsed.trackMap[1];
+            REQUIRE(parsed.trackCount == 1 && s != 0 &&
+                        (parsed.fragments[s].end.toLinearGroup() -
+                         parsed.fragments[s].start.toLinearGroup() + 1) == 172,
+                    "3C.2 must trim padded 186 SG raw upload to exact 172 SG track");
+        }
+
+        // 3C.3: Mid-cluster start crossing nominal MD60 cluster cap when real disc is MD80 (2352 cl)
+        {
+            constexpr std::int64_t kHalfUnits = 881LL * 352LL; // total 1762 * 352 = 620224 units
+            carta::MdDisc bigMd60;
+            bigMd60.medium = carta::MdMedium::md60;
+            bigMd60.defaultCodec = carta::MdCodecMode::spStereo;
+            bigMd60.halfWidthTitle = "MID CLUSTER";
+            bigMd60.tracks.push_back({"b1",
+                                      "Part 1",
+                                      {},
+                                      {},
+                                      false,
+                                      false,
+                                      false,
+                                      "",
+                                      {{0, kHalfUnits * 256}}});
+            bigMd60.tracks.push_back({"b2",
+                                      "Part 2",
+                                      {},
+                                      {},
+                                      false,
+                                      false,
+                                      false,
+                                      "",
+                                      {{kHalfUnits * 256, 2 * kHalfUnits * 256}}});
+
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw3c3{};
+            REQUIRE(buildSingleSpanSeedUtoc({50, 16, 0}, 2 * kHalfUnits + 8, spStereoMode,
+                                            {1813, 0, 0}, {2401, 31, 10}, false, raw3c3),
+                    "Failed building 3C.3 seed UTOC");
+            REQUIRE(carta::seedNetMdTestMockUtoc(raw3c3, mockErr),
+                    "Failed seeding 3C.3 mock UTOC: " + mockErr);
+            carta::UtocBudget b{};
+            std::string err3c3;
+            REQUIRE(carta::writeNetMdUtoc(bigMd60, "mock:mz-n920", true, b, err3c3),
+                    "3C.3 writeNetMdUtoc must use physical disc capacity: " + err3c3);
+            REQUIRE(b.totalClusters == 2352 && b.usedClusters == 1763 && b.fits(),
+                    "3C.3 expected real physical disc capacity 2352 with 1763 occupied clusters");
+        }
+
+        // 3C.4: Imported physical UTOC backup recovery
+        {
+            constexpr std::int64_t kElevenClustersUnits = 11LL * 352LL; // 3872 SG per track
+            carta::MdDisc impDisc;
+            impDisc.medium = carta::MdMedium::md80;
+            impDisc.defaultCodec = carta::MdCodecMode::spStereo;
+            impDisc.halfWidthTitle = "IMPORTED PHYS";
+            impDisc.tracks.push_back({"i1",
+                                      "Imp One",
+                                      {},
+                                      {},
+                                      false,
+                                      false,
+                                      false,
+                                      "",
+                                      {{0, kElevenClustersUnits * 256}}});
+            impDisc.tracks.push_back({"i2",
+                                      "Imp Two",
+                                      {},
+                                      {},
+                                      false,
+                                      false,
+                                      false,
+                                      "",
+                                      {{kElevenClustersUnits * 256, 2 * kElevenClustersUnits * 256}}});
+
+            // Build physical backup UTOC pointing at clusters 50..60 and 70..80.
+            carta::UtocDiscState impState{};
+            impState.hasSector0 = true;
+            impState.hasSector1 = true;
+            impState.hasSector2 = true;
+            impState.deviceSignature = 0x534F;
+            impState.discNonEmpty = 1;
+            impState.trackCount = 2;
+            for (std::uint8_t i = 1; i < 255; ++i) {
+                impState.fragments[i].link = static_cast<std::uint8_t>(i + 1);
+            }
+            impState.fragments[255].link = 0;
+            impState.nextFreeTrackSlot = 1;
+            auto allocImp = [&](carta::UtocAddress a, carta::UtocAddress b, std::uint8_t mode) {
+                const std::uint8_t slot = impState.nextFreeTrackSlot;
+                impState.nextFreeTrackSlot = impState.fragments[slot].link;
+                impState.fragments[slot].start = a;
+                impState.fragments[slot].end = b;
+                impState.fragments[slot].mode = mode;
+                impState.fragments[slot].link = 0;
+                return slot;
+            };
+            impState.trackMap[1] = allocImp({50, 0, 0}, {60, 31, 10}, spStereoMode);
+            impState.trackMap[2] = allocImp({70, 0, 0}, {80, 31, 10}, spStereoMode);
+            impState.trackMap[0] = allocImp({121, 0, 0}, {2401, 31, 10}, 0);
+            impState.halfTitleCells[1].bytes = {'I', 'M', 'P', 0, 0, 0, 0};
+            impState.halfTitleMap[0] = 1;
+            impState.nextFreeHalfTitleSlot = 2;
+            std::array<std::uint8_t, carta::kUtocSectorBytes> is0{}, is1{}, is2{}, is4{};
+            std::string impCompErr;
+            REQUIRE(carta::compileUtocSectors(impState, is0, is1, is2, is4, impCompErr),
+                    "Failed compiling 3C.4 imported UTOC: " + impCompErr);
+            impDisc.importedUtocSectors[0].assign(is0.begin(), is0.end());
+            impDisc.importedUtocSectors[1].assign(is1.begin(), is1.end());
+            impDisc.importedUtocSectors[2].assign(is2.begin(), is2.end());
+            impDisc.importedUtocSectors[3].assign(is4.begin(), is4.end());
+
+            // Seed hardware with 1 big SP-Stereo span (50..120 = 71 clusters) covering both tracks.
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw3c4{};
+            REQUIRE(buildSingleSpanSeedUtoc({50, 0, 0}, 71LL * 352LL, spStereoMode, {121, 0, 0},
+                                            {2401, 31, 10}, false, raw3c4),
+                    "Failed building 3C.4 seed UTOC");
+            REQUIRE(carta::seedNetMdTestMockUtoc(raw3c4, mockErr),
+                    "Failed seeding 3C.4 mock UTOC: " + mockErr);
+
+            carta::UtocBudget b{};
+            std::string err3c4, hash3c4;
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> committed{};
+            REQUIRE(carta::writeNetMdUtoc(impDisc, "mock:mz-n920", true, b, err3c4, &hash3c4,
+                                          &committed),
+                    "3C.4 writeNetMdUtoc with imported physical UTOC failed: " + err3c4);
+            carta::UtocDiscState parsed{};
+            REQUIRE(carta::parseUtocSectors(committed[0].data(), committed[1].data(),
+                                            committed[2].data(), committed[4].data(), parsed,
+                                            err3c4),
+                    "3C.4 parse failed: " + err3c4);
+            const bool preservedImportedPhys =
+                parsed.trackCount == 2 &&
+                parsed.fragments[parsed.trackMap[1]].start == carta::UtocAddress{50, 0, 0} &&
+                parsed.fragments[parsed.trackMap[1]].end == carta::UtocAddress{60, 31, 10} &&
+                parsed.fragments[parsed.trackMap[2]].start == carta::UtocAddress{70, 0, 0} &&
+                parsed.fragments[parsed.trackMap[2]].end == carta::UtocAddress{80, 31, 10};
+            REQUIRE(preservedImportedPhys,
+                    "3C.4 must preserve physical cluster addresses from imported UTOC");
+        }
+
+        // 3C.5: Mismatch rejection under hardware guard
+        {
+            carta::UtocBudget b{};
+            std::string misErr;
+            std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> badRaw{};
+
+            // Wrong codec (sp-mono on disc vs sp-stereo in project)
+            REQUIRE(buildSingleSpanSeedUtoc({50, 0, 0}, 516, spMonoMode, {55, 0, 0}, {2251, 31, 10},
+                                            false, badRaw) &&
+                        carta::seedNetMdTestMockUtoc(badRaw, mockErr),
+                    "Failed seeding 3C.5 codec mismatch UTOC: " + mockErr);
+            REQUIRE(!carta::writeNetMdUtoc(sp3Disc, "mock:mz-n920", true, b, misErr) &&
+                        misErr.find("does not match") != std::string::npos,
+                    "3C.5 must reject sp-mono disc for sp-stereo project");
+
+            // Too short (506 < 516)
+            misErr.clear();
+            REQUIRE(buildSingleSpanSeedUtoc({50, 0, 0}, 506, spStereoMode, {55, 0, 0},
+                                            {2251, 31, 10}, false, badRaw) &&
+                        carta::seedNetMdTestMockUtoc(badRaw, mockErr),
+                    "Failed seeding 3C.5 too-short UTOC: " + mockErr);
+            REQUIRE(!carta::writeNetMdUtoc(sp3Disc, "mock:mz-n920", true, b, misErr) &&
+                        misErr.find("does not match") != std::string::npos,
+                    "3C.5 must reject too-short span on disc");
+
+            // Far too long (5528 > 528 + 352)
+            misErr.clear();
+            REQUIRE(buildSingleSpanSeedUtoc({50, 0, 0}, 528 + 5000, spStereoMode, {70, 0, 0},
+                                            {2251, 31, 10}, false, badRaw) &&
+                        carta::seedNetMdTestMockUtoc(badRaw, mockErr),
+                    "Failed seeding 3C.5 too-long UTOC: " + mockErr);
+            REQUIRE(!carta::writeNetMdUtoc(sp3Disc, "mock:mz-n920", true, b, misErr) &&
+                        misErr.find("does not match") != std::string::npos,
+                    "3C.5 must reject unrelated long span on disc");
+        }
+
+        REQUIRE(carta::setNetMdTestMockGuard(false, mockErr),
+                "Failed restoring mock guard after 3C: " + mockErr);
+    }
+
     REQUIRE(carta::setNetMdTestMockSessionEnabled(false, mockErr),
             "Failed stopping mock session: " + mockErr);
 
