@@ -1811,6 +1811,16 @@ function findDeviceById(deviceId) {
   for (let i = 0; i < list.length; i++) {
     if (list[i].id === deviceId) return list[i];
   }
+  if (typeof deviceId === 'string' && deviceId.indexOf('usb:') === 0) {
+    return {
+      id: deviceId,
+      vendorId: 0,
+      productId: 0,
+      name: 'Hi-MD USB Device',
+      isMock: false,
+      transport: 'libusb-bot',
+    };
+  }
   throw new Error('Hi-MD device not found: ' + deviceId);
 }
 
@@ -2274,9 +2284,26 @@ export async function himdDeleteTracks(deviceId, indicesJson) {
 }
 
 export async function himdWipeDisc(deviceId, reformat) {
+  if (reformat) {
+    const info = findDeviceById(deviceId);
+    const dev = new HostScsiDevice(info);
+    const fs = new UMSCHiMDFilesystem(dev);
+    await fs.driver.init();
+    try {
+      await fs.driver.runBOMSR();
+      await fs.driver.inquiry();
+      await fs.driver.testUnitReady();
+      await fs.driver.reformatHiMD();
+      await fs.initFS(false);
+      await HiMD.init(fs);
+    } finally {
+      await fs.driver.close();
+    }
+    return;
+  }
   const { fs, himd } = await openHiMdSession(deviceId);
   try {
-    await himd.wipe(Boolean(reformat));
+    await himd.wipe(false);
   } finally {
     await fs.driver.close();
   }
@@ -2540,7 +2567,7 @@ function setLastError(msg) {
   const off = arr.byteOffset;
   Porffor.c\`
     size_t len = (size_t)PF_F64(n);
-    if (len > 255) len = 255;
+    if (len > 1023) len = 1023;
     if (len > 0) memcpy(g_pf_err, MEM + (u32)PF_F64(ptr) + 8 + (u32)PF_F64(off), len);
     g_pf_err[len] = 0;
   \`;
@@ -2553,7 +2580,7 @@ function copyLastHostError(fallback) {
     const char* herr = carta_himd_host_last_error();
     if (herr && herr[0]) {
       size_t n = strlen(herr);
-      if (n > 255) n = 255;
+      if (n > 1023) n = 1023;
       memcpy(g_pf_err, herr, n);
       g_pf_err[n] = 0;
       len = (f64)n;
@@ -3120,7 +3147,7 @@ static inline double pf_num_u64(u64 x) { return (double)x; }
 static unsigned char* g_pf_out_buf = NULL;
 static size_t g_pf_out_cap = 0;
 static size_t g_pf_out_len = 0;
-static char g_pf_err[256] = {0};
+static char g_pf_err[1024] = {0};
 `
 
   const exportsBlock = `

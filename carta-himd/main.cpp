@@ -496,14 +496,14 @@ int cmdSelftestStack() {
 #if defined(_WIN32)
     struct WinRunner {
         StackCtx* c;
-        decltype(runWorker) fn;
+        void (*fn)(StackCtx*);
+        static DWORD WINAPI entry(LPVOID raw) {
+            auto* r = static_cast<WinRunner*>(raw);
+            r->fn(r->c);
+            return 0;
+        }
     } wr{&ctx, runWorker};
-    auto threadFn = [](LPVOID raw) -> DWORD WINAPI {
-        auto* r = static_cast<WinRunner*>(raw);
-        r->fn(r->c);
-        return 0;
-    };
-    HANDLE hThread = CreateThread(nullptr, 544u * 1024u, threadFn, &wr,
+    HANDLE hThread = CreateThread(nullptr, 544u * 1024u, &WinRunner::entry, &wr,
                                   STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!hThread) {
         emitErrorResult("CreateThread failed");

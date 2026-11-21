@@ -6,6 +6,7 @@
  */
 
 #include "HiMdHostBridge.h"
+#include "HiMdScsiTransport.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -332,6 +334,7 @@ struct ScsiHandle {
     bool isMock = false;
     std::uint16_t vendorId = 0;
     std::uint16_t productId = 0;
+    std::shared_ptr<PhysicalHiMdHandle> physical;
 };
 
 struct MockHiMdState {
@@ -558,17 +561,6 @@ void ensureMockInitLocked() {
     }
 }
 
-bool isMutatingScsiOpcode(std::uint8_t opcode) noexcept {
-    switch (opcode) {
-    case 0x2A: // WRITE(10)
-    case 0xA3: // SEND KEY (Sony Hi-MD auth/ICV write)
-    case 0xC2: // Sony Hi-MD vendor control (wipe / reformat / setTime)
-        return true;
-    default:
-        return false;
-    }
-}
-
 int handleMockScsiCommandLocked(const std::uint8_t* cdb, int cdbLen, int direction,
                                 const std::uint8_t* dataIn, int dataInLen, std::uint8_t* dataOut,
                                 int dataOutMaxLen) {
@@ -582,7 +574,7 @@ int handleMockScsiCommandLocked(const std::uint8_t* cdb, int cdbLen, int directi
 
     // Hardware write confirmation guard check
     if (g_simulateRealGuardOnMock.load() && !g_hardwareWriteConfirmed.load() &&
-        isMutatingScsiOpcode(op)) {
+        isMutatingHiMdScsiCommand(cdb, cdbLen)) {
         setErrorLocked(
             "Hardware write blocked: explicit confirmation is required before modifying a Hi-MD disc.");
         return -1;
@@ -1426,10 +1418,23 @@ CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_list(std::uint8_t* json_out, int
     }
     std::ostringstream oss;
     oss << "[";
+    bool first = true;
     if (carta::g_mockEnabled.load()) {
         oss << "{\"id\":\"" << carta::kMockDeviceId << "\",\"vendorId\":" << carta::kMockVendorId
             << ",\"productId\":" << carta::kMockProductId << ",\"name\":\""
-            << carta::jsonEscape(carta::kMockProductName) << "\",\"isMock\":true}";
+            << carta::jsonEscape(carta::kMockProductName)
+            << "\",\"isMock\":true,\"transport\":\"mock\"}";
+        first = false;
+    }
+    for (const auto& dev : carta::listPhysicalHiMdDevices()) {
+        if (!first) {
+            oss << ",";
+        }
+        first = false;
+        oss << "{\"id\":\"" << carta::jsonEscape(dev.id) << "\",\"vendorId\":" << dev.vendorId
+            << ",\"productId\":" << dev.productId << ",\"name\":\"" << carta::jsonEscape(dev.name)
+            << "\",\"isMock\":false,\"transport\":\"" << carta::jsonEscape(dev.transport)
+            << "\",\"systemPath\":\"" << carta::jsonEscape(dev.systemPath) << "\"}";
     }
     oss << "]";
     const std::string json = oss.str();
@@ -1443,14 +1448,15 @@ CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_list(std::uint8_t* json_out, int
 }
 
 CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_open(const char* device_id) {
-    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
-    carta::ensureMockInitLocked();
     if (!device_id || !*device_id) {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
         carta::setErrorLocked("Empty Hi-MD device id.");
         return -1;
     }
     const std::string targetId(device_id);
     if (targetId == carta::kMockDeviceId) {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        carta::ensureMockInitLocked();
         if (!carta::g_mockEnabled.load()) {
             carta::setErrorLocked("Mock Hi-MD device is disabled.");
             return -1;
@@ -1464,52 +1470,108 @@ CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_open(const char* device_id) {
         carta::g_handles[h] = entry;
         return h;
     }
-    carta::setErrorLocked("Native OS SCSI pass-through is not enabled yet for device: " +
-                          targetId);
-    return -1;
+
+    std::string physErr;
+    std::unique_ptr<carta::PhysicalHiMdHandle> phys =
+        carta::PhysicalHiMdHandle::open(targetId, physErr);
+    if (!phys) {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        carta::setErrorLocked(physErr.empty()
+                                  ? ("Failed opening physical Hi-MD device: " + targetId)
+                                  : physErr);
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+    const int h = carta::g_nextHandle++;
+    carta::ScsiHandle entry;
+    entry.isMock = false;
+    entry.physical = std::shared_ptr<carta::PhysicalHiMdHandle>(std::move(phys));
+    carta::g_handles[h] = std::move(entry);
+    return h;
 }
 
 CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_close(int handle) {
-    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
-    auto it = carta::g_handles.find(handle);
-    if (it == carta::g_handles.end()) {
-        return -1;
+    std::shared_ptr<carta::PhysicalHiMdHandle> physToClose;
+    {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        auto it = carta::g_handles.find(handle);
+        if (it == carta::g_handles.end()) {
+            return -1;
+        }
+        if (it->second.isMock) {
+            carta::g_mock.open = false;
+        } else {
+            physToClose = std::move(it->second.physical);
+        }
+        carta::g_handles.erase(it);
     }
-    if (it->second.isMock) {
-        carta::g_mock.open = false;
-    }
-    carta::g_handles.erase(it);
+    physToClose.reset();
     return 0;
 }
 
 CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_reset(int handle) {
-    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
-    auto it = carta::g_handles.find(handle);
-    if (it == carta::g_handles.end()) {
+    std::shared_ptr<carta::PhysicalHiMdHandle> phys;
+    {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        auto it = carta::g_handles.find(handle);
+        if (it == carta::g_handles.end()) {
+            return -1;
+        }
+        if (it->second.isMock) {
+            return 0;
+        }
+        phys = it->second.physical;
+    }
+    if (!phys) {
         return -1;
     }
-    if (it->second.isMock) {
-        return 0;
+    std::string err;
+    const int rc = phys->reset(err);
+    if (rc < 0 && !err.empty()) {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        carta::setErrorLocked(err);
     }
-    return -1;
+    return rc;
 }
 
 CARTA_HIMD_HOST_EXPORT int carta_himd_host_scsi_command(
     int handle, const std::uint8_t* cdb_ptr, int cdb_len, int direction,
     const std::uint8_t* data_in_ptr, int data_in_len, std::uint8_t* data_out_ptr,
     int data_out_max_len) {
-    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
-    auto it = carta::g_handles.find(handle);
-    if (it == carta::g_handles.end()) {
-        carta::setErrorLocked("Invalid Hi-MD SCSI handle.");
+    std::shared_ptr<carta::PhysicalHiMdHandle> phys;
+    {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        auto it = carta::g_handles.find(handle);
+        if (it == carta::g_handles.end()) {
+            carta::setErrorLocked("Invalid Hi-MD SCSI handle.");
+            return -1;
+        }
+        if (it->second.isMock) {
+            return carta::handleMockScsiCommandLocked(cdb_ptr, cdb_len, direction, data_in_ptr,
+                                                      data_in_len, data_out_ptr, data_out_max_len);
+        }
+        if (!carta::g_hardwareWriteConfirmed.load() &&
+            carta::isMutatingHiMdScsiCommand(cdb_ptr, cdb_len)) {
+            carta::setErrorLocked(
+                "Hardware write blocked: explicit confirmation is required before modifying a Hi-MD disc.");
+            return -1;
+        }
+        phys = it->second.physical;
+    }
+    if (!phys) {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        carta::setErrorLocked("Physical Hi-MD SCSI handle is closed.");
         return -1;
     }
-    if (it->second.isMock) {
-        return carta::handleMockScsiCommandLocked(cdb_ptr, cdb_len, direction, data_in_ptr,
-                                                  data_in_len, data_out_ptr, data_out_max_len);
+    std::string err;
+    const int rc = phys->executeCommand(cdb_ptr, cdb_len, direction, data_in_ptr, data_in_len,
+                                        data_out_ptr, data_out_max_len, err);
+    if (rc < 0) {
+        std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+        carta::setErrorLocked(err.empty() ? "Physical Hi-MD SCSI command failed." : err);
     }
-    carta::setErrorLocked("Native OS SCSI pass-through is not enabled yet.");
-    return -1;
+    return rc;
 }
 
 CARTA_HIMD_HOST_EXPORT const char* carta_himd_host_last_error(void) {

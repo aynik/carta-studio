@@ -133,7 +133,7 @@ elseif(WIN32)
 elseif(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(carta-netmd PRIVATE
-        "${CARTA_PORFFOR_NETMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" Threads::Threads "-Wl,-export-dynamic")
+        "${CARTA_PORFFOR_NETMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" Threads::Threads "-Wl,--export-dynamic")
     set_target_properties(carta-netmd PROPERTIES
         BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};${CARTA_LIBUSB_LIBDIR};$ORIGIN;$ORIGIN/../lib"
         INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
@@ -143,8 +143,10 @@ endif()
 add_executable(carta-himd
     carta-himd/main.cpp
     carta-himd/HiMdHostBridge.cpp
+    carta-himd/HiMdScsiTransport.cpp
 )
 target_include_directories(carta-himd PRIVATE carta-himd)
+target_include_directories(carta-himd SYSTEM PRIVATE "${CARTA_LIBUSB_INCLUDE_DIR}")
 target_compile_features(carta-himd PRIVATE cxx_std_17)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
     target_compile_options(carta-himd PRIVATE -Wall -Wextra -Wpedantic)
@@ -152,19 +154,27 @@ endif()
 add_dependencies(carta-himd CartaPorfforHimd)
 if(APPLE)
     target_link_libraries(carta-himd PRIVATE iconv
-        "${CARTA_PORFFOR_HIMD_LINK}" "-Wl,-export_dynamic")
+        "${CARTA_PORFFOR_HIMD_LINK}" "${CARTA_LIBUSB_LIBRARY}"
+        "-framework IOKit" "-framework CoreFoundation" "-framework DiskArbitration"
+        "-Wl,-export_dynamic")
     set_target_properties(carta-himd PROPERTIES
-        BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};@executable_path/../Frameworks"
+        BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};${CARTA_LIBUSB_LIBDIR};@executable_path/../Frameworks"
         INSTALL_RPATH "@executable_path/../Frameworks")
 elseif(WIN32)
     target_link_libraries(carta-himd PRIVATE
-        "${CARTA_PORFFOR_HIMD_LINK}" bcrypt)
+        "${CARTA_PORFFOR_HIMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" bcrypt setupapi cfgmgr32 uuid)
+    if(CARTA_LIBUSB_DLL AND EXISTS "${CARTA_LIBUSB_DLL}")
+        add_custom_command(TARGET carta-himd POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CARTA_LIBUSB_DLL}" "$<TARGET_FILE_DIR:carta-himd>/"
+            VERBATIM)
+    endif()
 elseif(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(carta-himd PRIVATE
-        "${CARTA_PORFFOR_HIMD_LINK}" Threads::Threads "-Wl,-export_dynamic")
+        "${CARTA_PORFFOR_HIMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" Threads::Threads "-Wl,--export-dynamic")
     set_target_properties(carta-himd PROPERTIES
-        BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};$ORIGIN;$ORIGIN/../lib"
+        BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};${CARTA_LIBUSB_LIBDIR};$ORIGIN;$ORIGIN/../lib"
         INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
 endif()
 
@@ -453,8 +463,45 @@ if(BUILD_TESTING)
         add_custom_command(TARGET CartaHiMdTests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-himd>" "$<TARGET_FILE_DIR:CartaHiMdTests>/"
             VERBATIM)
+        if(CARTA_LIBUSB_DLL AND EXISTS "${CARTA_LIBUSB_DLL}")
+            add_custom_command(TARGET CartaHiMdTests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CARTA_LIBUSB_DLL}" "$<TARGET_FILE_DIR:CartaHiMdTests>/"
+                VERBATIM)
+        endif()
     endif()
     add_test(NAME carta-himd COMMAND CartaHiMdTests)
+
+    # Pure C++ unit tests for OS SCSI pass-through & USB BOT transport (zero JUCE / zero Porffor).
+    add_executable(CartaHiMdTransportTests
+        Tests/HiMdTransportTests.cpp
+        carta-himd/HiMdScsiTransport.cpp
+    )
+    target_include_directories(CartaHiMdTransportTests PRIVATE carta-himd)
+    target_include_directories(CartaHiMdTransportTests SYSTEM PRIVATE "${CARTA_LIBUSB_INCLUDE_DIR}")
+    target_compile_features(CartaHiMdTransportTests PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+        target_compile_options(CartaHiMdTransportTests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    if(APPLE)
+        target_link_libraries(CartaHiMdTransportTests PRIVATE
+            "${CARTA_LIBUSB_LIBRARY}"
+            "-framework IOKit" "-framework CoreFoundation" "-framework DiskArbitration")
+        set_target_properties(CartaHiMdTransportTests PROPERTIES BUILD_RPATH "${CARTA_LIBUSB_LIBDIR}")
+    elseif(WIN32)
+        target_link_libraries(CartaHiMdTransportTests PRIVATE
+            "${CARTA_LIBUSB_LIBRARY}" setupapi cfgmgr32 uuid)
+        if(CARTA_LIBUSB_DLL AND EXISTS "${CARTA_LIBUSB_DLL}")
+            add_custom_command(TARGET CartaHiMdTransportTests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CARTA_LIBUSB_DLL}" "$<TARGET_FILE_DIR:CartaHiMdTransportTests>/"
+                VERBATIM)
+        endif()
+    elseif(UNIX)
+        find_package(Threads REQUIRED)
+        target_link_libraries(CartaHiMdTransportTests PRIVATE "${CARTA_LIBUSB_LIBRARY}" Threads::Threads)
+        set_target_properties(CartaHiMdTransportTests PROPERTIES BUILD_RPATH "${CARTA_LIBUSB_LIBDIR}")
+    endif()
+    add_test(NAME carta-himd-transport COMMAND CartaHiMdTransportTests)
 endif()
 
 # The streaming reader adds gapless MPEG-1 MP3 import on Linux. The native

@@ -29,3 +29,11 @@ carta-himd selftest-stack
 ```
 
 All commands emit optional newline-delimited JSON progress lines (`{"event":"progress",...}`) followed by a single final result line (`{"event":"result","ok":true|false,...}`) on `stdout`.
+
+## Native OS SCSI & USB BOT Transport
+
+`carta-himd` enumerates connected physical Sony / Buffalo Hi-MD devices across OS SCSI pass-through and USB Mass Storage Bulk-Only Transport (`libusb-1.0`), ignoring NetMD-only hardware:
+
+- **macOS**: Inspects `IOUSBHostDevice` / `IOUSBDevice` entries (`macos:<vid>:<pid>:<locationID>`), unmounts any mounted whole BSD disk via `DiskArbitration`, uses IOKit `SCSITaskDeviceInterface` (`SCSITaskUserClient`) when present, and falls back to `libusb-1.0` BOT (reporting clear `IOUSBMassStorageDriver` ownership diagnostics if exclusive USB claim is blocked).
+- **Linux**: Enumerates `/sys/class/scsi_generic/sg*` (`sg:/dev/sgN`) via `SG_IO` (blocking writes while the sibling `/dev/sdX*` is mounted in `/proc/mounts`) and falls back to `libusb-1.0` BOT (`usb:bus:addr`).
+- **Windows**: Enumerates `\\.\PhysicalDriveN` (`spti:PhysicalDriveN`) via `IOCTL_SCSI_PASS_THROUGH_DIRECT` (locking & dismounting logical volumes before mutating commands) with `libusb-1.0` WinUSB BOT fallback.
