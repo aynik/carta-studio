@@ -16,10 +16,11 @@ jobs:
           node-version: 22
       - name: Fetch pinned Porffor alpha-19
         run: node Tools/fetch_porffor.mjs
-      - name: Emit Porffor C sources (codecs + NetMD)
+      - name: Emit Porffor C sources (codecs + NetMD + Hi-MD)
         run: |
           node Tools/build_porffor_codecs.mjs --emit-c-only
           node Tools/build_porffor_netmd.mjs --emit-c-only
+          node Tools/build_porffor_himd.mjs --emit-c-only
       - name: Upload generated C sources
         uses: actions/upload-artifact@v4
         with:
@@ -71,6 +72,10 @@ jobs:
         run: |
           node Tools/build_porffor_codecs.mjs --compile-only
           node Tools/build_porffor_netmd.mjs --compile-only
+          node Tools/build_porffor_himd.mjs --compile-only
+
+      - name: Install Hi-MD upstream verification deps
+        run: node -e "const fs=require('fs'),cp=require('child_process'),p=require('path');const d=p.join('build','porffor','himd-deps');fs.mkdirSync(d,{recursive:true});fs.copyFileSync(p.join('Tools','himd-deps','package.json'),p.join(d,'package.json'));fs.copyFileSync(p.join('Tools','himd-deps','package-lock.json'),p.join(d,'package-lock.json'));cp.execSync('npm ci --ignore-scripts --prefix '+d,{stdio:'inherit'})"
 
       - name: Configure (macOS / Linux)
         if: runner.os != 'Windows'

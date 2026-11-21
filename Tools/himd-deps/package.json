@@ -1,0 +1,9 @@
+{
+  "name": "carta-studio-himd-deps",
+  "private": true,
+  "dependencies": {
+    "himd-js": "0.2.15",
+    "node-mass-storage": "0.2.4",
+    "nufatfs": "0.1.11"
+  }
+}

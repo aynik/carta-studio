@@ -12,6 +12,11 @@ exact license terms of every upstream dependency:
    ForceTOCEdit protocol communication over standard CLI arguments, temporary
    binary files, and NDJSON `stdout` events. See [carta-netmd/LICENSE](carta-netmd/LICENSE)
    for the full GPL-2.0 license text.
+3. **`carta-himd` (`carta-himd/carta-himd`)** — A standalone **GNU GPL-2.0**
+   CLI executable that handles Hi-MD SCSI / USB Mass Storage / FAT16 protocol
+   communication over CLI arguments, temporary binary files, and NDJSON
+   `stdout` events. See [carta-himd/LICENSE](carta-himd/LICENSE) for the full
+   GPL-2.0 license text.
 
 ---
 
@@ -30,7 +35,7 @@ exact license terms of every upstream dependency:
 - **Upstream**: https://github.com/CanadaHonk/porffor
 - **License**: MIT License
 - **Usage**: Ahead-of-time JavaScript-to-C compiler used to build native dynamic libraries
-  for `carta1`, `carta3`, `carta5`, and `carta-netmd`.
+  for `carta1`, `carta3`, `carta5`, `carta-netmd`, and `carta-himd`.
 
 ### minimp3 (optional, Linux default)
 - **Upstream**: https://github.com/lieff/minimp3
@@ -61,5 +66,24 @@ exact license terms of every upstream dependency:
 - **Upstream**: https://libusb.info / https://github.com/libusb/libusb
 - **License**: GNU Lesser General Public License v2.1 or later (LGPL-2.1-or-later)
 - **Usage**: Dynamically linked by `carta-netmd` (`Contents/Frameworks/libusb-1.0.0.dylib`
-  on macOS) for USB transport. Users may replace the bundled `libusb-1.0` shared
-  library with a compatible build per LGPL-2.1 Section 6.
+  on macOS) and `carta-himd` for USB transport. Users may replace the bundled
+  `libusb-1.0` shared library with a compatible build per LGPL-2.1 Section 6.
+
+---
+
+## Third-Party Components in `carta-himd` (Standalone GPL-2.0 Helper)
+
+### himd-js
+- **Upstream**: https://github.com/asivery/himd-js
+- **Copyright**: Copyright (c) asivery & contributors
+- **License**: GNU General Public License v2.0 (GPL-2.0)
+
+### nufatfs
+- **Upstream**: https://github.com/asivery/nufatfs
+- **Copyright**: Copyright (c) asivery & contributors
+- **License**: GNU General Public License v2.0 (GPL-2.0)
+
+### node-mass-storage
+- **Upstream**: https://github.com/asivery/node-mass-storage
+- **Copyright**: Copyright (c) asivery & contributors
+- **License**: GNU General Public License v2.0 (GPL-2.0)

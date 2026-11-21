@@ -40,6 +40,7 @@ if(APPLE)
     set(CARTA_PORFFOR_CARTA3_LINK "${CARTA_PORFFOR_LIB_DIR}/libcarta3_porffor.dylib")
     set(CARTA_PORFFOR_CARTA5_LINK "${CARTA_PORFFOR_LIB_DIR}/libcarta5_porffor.dylib")
     set(CARTA_PORFFOR_NETMD_LINK "${CARTA_PORFFOR_LIB_DIR}/libnetmd_porffor.dylib")
+    set(CARTA_PORFFOR_HIMD_LINK "${CARTA_PORFFOR_LIB_DIR}/libhimd_porffor.dylib")
     set(CARTA_PORFFOR_CODEC_RUNTIME_LIBS
         "${CARTA_PORFFOR_CARTA1_LINK}" "${CARTA_PORFFOR_CARTA3_LINK}" "${CARTA_PORFFOR_CARTA5_LINK}")
 elseif(WIN32)
@@ -47,6 +48,7 @@ elseif(WIN32)
     set(CARTA_PORFFOR_CARTA3_LINK "${CARTA_PORFFOR_LIB_DIR}/carta3_porffor.lib")
     set(CARTA_PORFFOR_CARTA5_LINK "${CARTA_PORFFOR_LIB_DIR}/carta5_porffor.lib")
     set(CARTA_PORFFOR_NETMD_LINK "${CARTA_PORFFOR_LIB_DIR}/netmd_porffor.lib")
+    set(CARTA_PORFFOR_HIMD_LINK "${CARTA_PORFFOR_LIB_DIR}/himd_porffor.lib")
     set(CARTA_PORFFOR_CODEC_RUNTIME_LIBS
         "${CARTA_PORFFOR_LIB_DIR}/carta1_porffor.dll"
         "${CARTA_PORFFOR_LIB_DIR}/carta3_porffor.dll"
@@ -56,6 +58,7 @@ else()
     set(CARTA_PORFFOR_CARTA3_LINK "${CARTA_PORFFOR_LIB_DIR}/libcarta3_porffor.so")
     set(CARTA_PORFFOR_CARTA5_LINK "${CARTA_PORFFOR_LIB_DIR}/libcarta5_porffor.so")
     set(CARTA_PORFFOR_NETMD_LINK "${CARTA_PORFFOR_LIB_DIR}/libnetmd_porffor.so")
+    set(CARTA_PORFFOR_HIMD_LINK "${CARTA_PORFFOR_LIB_DIR}/libhimd_porffor.so")
     set(CARTA_PORFFOR_CODEC_RUNTIME_LIBS
         "${CARTA_PORFFOR_CARTA1_LINK}" "${CARTA_PORFFOR_CARTA3_LINK}" "${CARTA_PORFFOR_CARTA5_LINK}")
 endif()
@@ -72,6 +75,11 @@ add_custom_target(CartaPorfforNetMd
     COMMAND ${CARTA_NODE_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/Tools/build_porffor_netmd.mjs"
     BYPRODUCTS "${CARTA_PORFFOR_NETMD_LINK}"
     COMMENT "Building isolated Porffor NetMD + exploits library"
+    VERBATIM)
+add_custom_target(CartaPorfforHimd
+    COMMAND ${CARTA_NODE_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/Tools/build_porffor_himd.mjs"
+    BYPRODUCTS "${CARTA_PORFFOR_HIMD_LINK}"
+    COMMENT "Building isolated Porffor Hi-MD + FAT16 library"
     VERBATIM)
 
 function(carta_link_porffor_codecs target)
@@ -128,6 +136,35 @@ elseif(UNIX)
         "${CARTA_PORFFOR_NETMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" Threads::Threads "-Wl,-export-dynamic")
     set_target_properties(carta-netmd PROPERTIES
         BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};${CARTA_LIBUSB_LIBDIR};$ORIGIN;$ORIGIN/../lib"
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
+endif()
+
+# Standalone GPL-2.0 Hi-MD SCSI/UMSC helper CLI (links zero JUCE or Studio engine code).
+add_executable(carta-himd
+    carta-himd/main.cpp
+    carta-himd/HiMdHostBridge.cpp
+)
+target_include_directories(carta-himd PRIVATE carta-himd)
+target_compile_features(carta-himd PRIVATE cxx_std_17)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+    target_compile_options(carta-himd PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_dependencies(carta-himd CartaPorfforHimd)
+if(APPLE)
+    target_link_libraries(carta-himd PRIVATE iconv
+        "${CARTA_PORFFOR_HIMD_LINK}" "-Wl,-export_dynamic")
+    set_target_properties(carta-himd PROPERTIES
+        BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};@executable_path/../Frameworks"
+        INSTALL_RPATH "@executable_path/../Frameworks")
+elseif(WIN32)
+    target_link_libraries(carta-himd PRIVATE
+        "${CARTA_PORFFOR_HIMD_LINK}" bcrypt)
+elseif(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(carta-himd PRIVATE
+        "${CARTA_PORFFOR_HIMD_LINK}" Threads::Threads "-Wl,-export_dynamic")
+    set_target_properties(carta-himd PROPERTIES
+        BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};$ORIGIN;$ORIGIN/../lib"
         INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
 endif()
 
@@ -397,6 +434,27 @@ if(BUILD_TESTING)
         endif()
     endif()
     add_test(NAME carta-netmd COMMAND CartaNetMdTests)
+
+    juce_add_console_app(CartaHiMdTests PRODUCT_NAME "Carta Hi-MD Tests")
+    target_sources(CartaHiMdTests PRIVATE Tests/HiMdTests.cpp ${CARTA_CODEC_SOURCES} ${CARTA_ENGINE_SOURCES})
+    target_include_directories(CartaHiMdTests PRIVATE Source)
+    add_dependencies(CartaHiMdTests CartaPorfforCodecs carta-himd)
+    target_compile_features(CartaHiMdTests PRIVATE cxx_std_17)
+    target_compile_definitions(CartaHiMdTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        CARTA_STUDIO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+        CARTA_HIMD_BINARY="$<TARGET_FILE:carta-himd>"
+        CARTA_NODE_BINARY="${CARTA_NODE_EXECUTABLE}")
+    target_link_libraries(CartaHiMdTests PRIVATE juce::juce_audio_formats juce::juce_dsp juce::juce_graphics juce::juce_cryptography
+        PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+    carta_link_porffor_codecs(CartaHiMdTests)
+    if(WIN32)
+        add_custom_command(TARGET CartaHiMdTests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-himd>" "$<TARGET_FILE_DIR:CartaHiMdTests>/"
+            VERBATIM)
+    endif()
+    add_test(NAME carta-himd COMMAND CartaHiMdTests)
 endif()
 
 # The streaming reader adds gapless MPEG-1 MP3 import on Linux. The native
