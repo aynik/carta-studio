@@ -1349,7 +1349,7 @@ int runPipeSessionLoop(bool enableMock, const std::string& pipeName, const std::
 
 void printUsage() {
     std::cerr
-        << "carta-himd 0.1.0 (GPL-2.0) - Standalone Hi-MD SCSI/UMSC protocol helper\n"
+        << "carta-himd 0.3.0 (GPL-2.0) - Standalone Hi-MD SCSI/UMSC protocol helper\n"
         << "Built with himd-js, nufatfs, node-mass-storage (GPL-2.0) and Porffor (MIT).\n"
         << "Usage:\n"
         << "  carta-himd list [--mock]\n"
@@ -1381,7 +1381,7 @@ int main(int argc, char** argv) {
 
     const std::string cmd = argv[1];
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "carta-himd 0.1.0 (GPL-2.0)\n";
+        std::cout << "carta-himd 0.3.0 (GPL-2.0)\n";
         return 0;
     }
     if (cmd == "--help" || cmd == "-h") {
