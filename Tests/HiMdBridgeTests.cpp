@@ -921,6 +921,257 @@ int main() {
                     pre.error);
     }
 
-    std::cout << "[HiMdBridgeTests] All Hi-MD bridge, payload encoder, guard, and lifecycle tests passed.\n";
+    // 12. Continuous gapless Hi-MD encoding across all 5 codecs (`hi-sp`, `hi-lp`, `lp2`, `lp4`, `pcm`).
+    {
+        constexpr int kGapSamples = 264600; // 6.0 s at 44.1 kHz
+        std::vector<float> gapL, gapR;
+        fillTestTone(kGapSamples, 2, gapL, gapR);
+        const std::vector<int> splitBounds{88200, 176400, 264600};
+        const char* allModes[] = {"hi-sp", "hi-lp", "lp2", "lp4", "pcm"};
+        const std::size_t frameBytesByMode[] = {1488u, 376u, 384u, 192u, 64u};
+
+        for (int mi = 0; mi < 5; ++mi) {
+            const std::string mode = allModes[mi];
+            const std::size_t fb = frameBytesByMode[mi];
+            std::vector<std::uint8_t> singleFull;
+            REQUIRE(carta::encodeHiMdTrackPayload(mode, gapL.data(), gapR.data(), 2, kGapSamples,
+                                                  singleFull, {}, err),
+                    err);
+            if (mode == "pcm" && (singleFull.size() % 64u) != 0u) {
+                singleFull.resize(((singleFull.size() + 63u) / 64u) * 64u, 0u);
+            }
+
+            std::vector<std::vector<std::uint8_t>> oneTrack;
+            REQUIRE(carta::encodeHiMdContinuousTracks(mode, gapL.data(), gapR.data(), 2,
+                                                      {kGapSamples}, oneTrack, {}, err),
+                    err);
+            REQUIRE(oneTrack.size() == 1u &&
+                        (mode == "pcm" ? oneTrack[0].size() >= static_cast<std::size_t>(kGapSamples) * 4u
+                                       : oneTrack[0] == singleFull),
+                    "Single-boundary encodeHiMdContinuousTracks mismatch for " + mode);
+
+            std::vector<std::vector<std::uint8_t>> parts;
+            REQUIRE(carta::encodeHiMdContinuousTracks(mode, gapL.data(), gapR.data(), 2, splitBounds,
+                                                      parts, {}, err),
+                    "encodeHiMdContinuousTracks failed for " + mode + ": " + err);
+            REQUIRE(parts.size() == 3u, "Expected 3 sliced gapless payloads for " + mode);
+            std::vector<std::uint8_t> glued;
+            for (const auto& p : parts) {
+                REQUIRE(!p.empty() && (p.size() % fb) == 0u,
+                        "Gapless track slice misaligned for " + mode);
+                glued.insert(glued.end(), p.begin(), p.end());
+            }
+            REQUIRE(glued == singleFull,
+                    "Concatenated gapless payloads differ from single continuous encode for " +
+                        mode);
+
+            if (mode == "hi-sp" || mode == "lp2") {
+                carta::NativeAtracStreamDecoder dec;
+                REQUIRE(dec.open(mode, err), err);
+                const auto* spec = dec.modeSpec();
+                const int spf = spec->samplesPerFrame;
+                std::vector<float> decL, decR;
+                std::vector<float> blkL(static_cast<std::size_t>(spf));
+                std::vector<float> blkR(static_cast<std::size_t>(spf));
+                for (std::size_t off = 0; off + fb <= glued.size(); off += fb) {
+                    const int nDec = dec.decodeFrame(glued.data() + off, fb, blkL.data(), blkR.data(),
+                                                     err);
+                    REQUIRE(nDec == spf, "decodeFrame failed for " + mode + ": " + err);
+                    decL.insert(decL.end(), blkL.begin(), blkL.end());
+                    decR.insert(decR.end(), blkR.begin(), blkR.end());
+                }
+                const int boundaries[] = {88200, 176400};
+                for (int bSample : boundaries) {
+                    // Check a window spanning the boundary (+/- 4096 samples) has no >=128-sample zero gap.
+                    const int winStart = std::max(0, bSample - 2048);
+                    const int winEnd = std::min(static_cast<int>(decL.size()), bSample + 4096);
+                    int maxSilentRun = 0;
+                    int curSilent = 0;
+                    for (int s = winStart; s < winEnd; ++s) {
+                        if (std::abs(decL[static_cast<std::size_t>(s)]) < 1e-4f &&
+                            std::abs(decR[static_cast<std::size_t>(s)]) < 1e-4f) {
+                            ++curSilent;
+                            maxSilentRun = std::max(maxSilentRun, curSilent);
+                        } else {
+                            curSilent = 0;
+                        }
+                    }
+                    REQUIRE(maxSilentRun < 128,
+                            "Detected unexpected silence gap at gapless boundary for " + mode);
+                }
+            }
+        }
+    }
+
+    // 13. Single-session deduplicated + gapless `recordHiMdDisc`, `writeHiMdIndex`, & incremental sync.
+    {
+        REQUIRE(carta::resetHiMdTestMockSession(err), "mock reset for batch tests failed: " + err);
+        std::string snapBefore;
+        REQUIRE(carta::fetchHiMdTestMockSnapshot(snapBefore, err), err);
+        juce::var vBefore;
+        REQUIRE(juce::JSON::parse(juce::String::fromUTF8(snapBefore.c_str()), vBefore).wasOk(),
+                "snapBefore parse failed");
+        const int authBefore = static_cast<int>(vBefore["auth_completed_count"]);
+
+        const std::vector<int> gapSegLens{88200, 88200, 65536};
+        const auto gapSess = makeFiveTrackHiMdSession(gapSegLens);
+
+        carta::MdDisc disc2;
+        disc2.medium = carta::MdMedium::himd300;
+        disc2.defaultCodec = carta::MdCodecMode::hiSp;
+        disc2.halfWidthTitle = "Gapless Alias Disc";
+
+        carta::MdTrack trA;
+        trA.id = carta::makeMdTrackId();
+        trA.halfWidthTitle = "Gap A";
+        trA.artist = "Carta";
+        trA.album = "Album G";
+        trA.parts = {{0, 88200}};
+
+        carta::MdTrack trB;
+        trB.id = carta::makeMdTrackId();
+        trB.halfWidthTitle = "Gap B";
+        trB.artist = "Carta";
+        trB.album = "Album G";
+        trB.parts = {{88200, 176400}};
+
+        carta::MdTrack trM;
+        trM.id = carta::makeMdTrackId();
+        trM.audioId = "theme-audio-id";
+        trM.halfWidthTitle = "Theme";
+        trM.artist = "Carta";
+        trM.album = "Album G";
+        trM.parts = {{176400, 176400 + 65536}};
+
+        disc2.tracks.push_back(trA);
+        disc2.tracks.push_back(trB);
+        for (int k = 0; k < 3; ++k) {
+            carta::MdTrack alias = trM;
+            alias.id = carta::makeMdTrackId();
+            disc2.tracks.push_back(std::move(alias));
+        }
+        disc2.groups = {{1, 2, "Opening", ""}, {3, 5, "Loops", ""}};
+
+        carta::HiMdRecordResult batchRes;
+        REQUIRE(carta::recordHiMdDisc(gapSess, disc2, "mock:mz-rh1", false, batchRes, err),
+                "Batch aliased+gapless recordHiMdDisc failed: " + err);
+        REQUIRE(batchRes.ok && batchRes.uploadedTracks == 5 &&
+                    batchRes.uniqueAudioTracksUploaded == 3 && batchRes.gaplessRuns == 1 &&
+                    batchRes.icvUpdated,
+                "Expected 5 Play Order tracks, 3 unique uploads, and 1 gapless run");
+
+        std::string snapAfter;
+        REQUIRE(carta::fetchHiMdTestMockSnapshot(snapAfter, err), err);
+        juce::var vAfter;
+        REQUIRE(juce::JSON::parse(juce::String::fromUTF8(snapAfter.c_str()), vAfter).wasOk(),
+                "snapAfter parse failed");
+        REQUIRE(static_cast<int>(vAfter["auth_completed_count"]) == authBefore + 1,
+                "Expected single Sony authentication across all deduplicated tracks");
+
+        // Verify dumped Track 0 + Track 1 equals continuous encoding of [0, 176400)
+        std::vector<float> abL, abR;
+        REQUIRE(carta::renderSessionMixRange(gapSess, 0, 176400, 2, abL, abR, err), err);
+        std::vector<std::uint8_t> expContinuousAB;
+        REQUIRE(carta::encodeHiMdTrackPayload("hi-sp", abL.data(), abR.data(), 2,
+                                              static_cast<int>(abL.size()), expContinuousAB, {},
+                                              err),
+                err);
+        const auto d0File = tmpDir.getChildFile("gap_dump0.bin");
+        const auto d1File = tmpDir.getChildFile("gap_dump1.bin");
+        REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", 0, d0File.getFullPathName().toStdString(), true,
+                                     err) &&
+                    carta::dumpHiMdTrack("mock:mz-rh1", 1, d1File.getFullPathName().toStdString(),
+                                         true, err),
+                err);
+        std::vector<std::uint8_t> got0, got1, gotAB;
+        REQUIRE(readFileBytes(d0File, got0, err) && readFileBytes(d1File, got1, err), err);
+        gotAB = got0;
+        gotAB.insert(gotAB.end(), got1.begin(), got1.end());
+        REQUIRE(gotAB == expContinuousAB,
+                "Recorded gapless Hi-MD tracks do not match continuous single-stream encoding");
+
+        // Load back from mock device -> verifies repeated slot & hiMdSlot assignment
+        carta::MdDisc loaded2;
+        carta::HiMdDeviceStatus loadedSt2;
+        REQUIRE(carta::loadHiMdDiscIntoSession("mock:mz-rh1", loaded2, &loadedSt2, err), err);
+        REQUIRE(loaded2.loadedDisc.regions.size() == 3u && loaded2.tracks.size() == 5u &&
+                    loaded2.loadedDisc.regions[0].hiMdSlot > 0 &&
+                    loaded2.loadedDisc.regions[1].hiMdSlot > 0 &&
+                    loaded2.loadedDisc.regions[2].hiMdSlot > 0 &&
+                    carta::effectiveMdAudioId(loaded2.tracks[2]) ==
+                        carta::effectiveMdAudioId(loaded2.tracks[4]),
+                "loadHiMdDiscIntoSession did not preserve hiMdSlot and shared audioId");
+
+        // Guarded non-destructive writeHiMdIndex rejection before any write
+        loaded2.halfWidthTitle = "Edited Index";
+        loaded2.tracks[0].artist = "Gap Artist";
+        loaded2.tracks[0].album = "Gap Album";
+        carta::MdTrack extraAlias = loaded2.tracks[2];
+        extraAlias.id = carta::makeMdTrackId();
+        loaded2.tracks.insert(loaded2.tracks.begin(), extraAlias); // Now 6 Play Order tracks
+        loaded2.groups = {{1, 6, "All Six", ""}};
+
+        REQUIRE(carta::setHiMdTestMockGuard(true, err), err);
+        carta::HiMdRecordResult blockedIdx;
+        std::string blockErr;
+        REQUIRE(!carta::writeHiMdIndex(loaded2, "mock:mz-rh1", false, blockedIdx, blockErr) &&
+                    blockErr.find("confirmation") != std::string::npos,
+                "Unconfirmed writeHiMdIndex must be blocked when guard armed");
+        REQUIRE(carta::setHiMdTestMockGuard(false, err), err);
+
+        carta::HiMdRecordResult idxRes1;
+        REQUIRE(carta::writeHiMdIndex(loaded2, "mock:mz-rh1", false, idxRes1, err),
+                "writeHiMdIndex (metadata + alias + group edit) failed: " + err);
+        REQUIRE(idxRes1.ok && idxRes1.uploadedTracks == 6 && idxRes1.preservedAudioSlots == 3 &&
+                    idxRes1.freedAudioSlots == 0 && !idxRes1.icvUpdated,
+                "Keeping all slots in writeHiMdIndex must not bump ICV");
+
+        carta::HiMdDeviceStatus afterIdx1;
+        REQUIRE(carta::probeHiMdDevice("mock:mz-rh1", afterIdx1, err), err);
+        REQUIRE(afterIdx1.trackCount == 6 && afterIdx1.discTitle == "Edited Index" &&
+                    afterIdx1.tracks[1].artist == "Gap Artist" &&
+                    afterIdx1.tracks[1].album == "Gap Album" && afterIdx1.groups.size() == 1u &&
+                    afterIdx1.groups[0].title == "All Six" && afterIdx1.groups[0].trackCount == 6,
+                "probeHiMdDevice mismatch after writeHiMdIndex");
+
+        // Delete all 4 aliases of Theme via writeHiMdIndex -> frees Theme slot cleanly
+        std::vector<carta::MdTrack> keptOnlyAB{loaded2.tracks[1], loaded2.tracks[2]};
+        loaded2.tracks = std::move(keptOnlyAB);
+        loaded2.groups = {{1, 2, "Pair", ""}};
+        carta::HiMdRecordResult idxRes2;
+        REQUIRE(carta::writeHiMdIndex(loaded2, "mock:mz-rh1", false, idxRes2, err),
+                "writeHiMdIndex deleting shared slot failed: " + err);
+        REQUIRE(idxRes2.ok && idxRes2.uploadedTracks == 2 && idxRes2.preservedAudioSlots == 2 &&
+                    idxRes2.freedAudioSlots == 1 && idxRes2.icvUpdated,
+                "Removing last alias in writeHiMdIndex must free slot and update ICV");
+
+        // Reload and append a new local Hi-LP track via recordHiMdDisc incrementally
+        carta::MdDisc reloaded;
+        REQUIRE(carta::loadHiMdDiscIntoSession("mock:mz-rh1", reloaded, nullptr, err), err);
+        carta::MdTrack newLocal;
+        newLocal.id = carta::makeMdTrackId();
+        newLocal.halfWidthTitle = "Appended Hi-LP";
+        newLocal.artist = "New";
+        newLocal.album = "Inc";
+        newLocal.codecOverride = carta::MdCodecMode::hiLp;
+        newLocal.parts = {{176400, 176400 + 65536}};
+        reloaded.tracks.push_back(std::move(newLocal));
+        reloaded.groups = {{1, 3, "Three", ""}};
+
+        carta::HiMdRecordResult incRes;
+        REQUIRE(carta::recordHiMdDisc(gapSess, reloaded, "mock:mz-rh1", false, incRes, err),
+                "Incremental recordHiMdDisc on loaded Hi-MD failed: " + err);
+        REQUIRE(incRes.ok && incRes.uploadedTracks == 3 && incRes.preservedAudioSlots == 2 &&
+                    incRes.uniqueAudioTracksUploaded == 1 && incRes.icvUpdated,
+                "Incremental recordHiMdDisc result mismatch");
+        carta::HiMdDeviceStatus finalSt;
+        REQUIRE(carta::probeHiMdDevice("mock:mz-rh1", finalSt, err), err);
+        REQUIRE(finalSt.trackCount == 3 && finalSt.tracks[2].title == "Appended Hi-LP" &&
+                    finalSt.tracks[2].bitrate == 64 && finalSt.groups.size() == 1u &&
+                    finalSt.groups[0].trackCount == 3,
+                "Final probe mismatch after incremental Hi-MD recording");
+    }
+
+    std::cout << "[HiMdBridgeTests] All Hi-MD bridge, gapless, batch PlayOrder, writeIndex, guard, and lifecycle tests passed.\n";
     return 0;
 }

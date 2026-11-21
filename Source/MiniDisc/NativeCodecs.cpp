@@ -723,6 +723,119 @@ bool encodeHiMdTrackPayload(const std::string& mode, const float* left, const fl
     return true;
 }
 
+bool encodeHiMdContinuousTracks(const std::string& mode, const float* left, const float* right,
+                                int channels, const std::vector<int>& trackEndSamples,
+                                std::vector<std::vector<std::uint8_t>>& outTrackPayloads,
+                                const std::function<void(int, int)>& progressCallback,
+                                std::string& error) {
+    outTrackPayloads.clear();
+    if (trackEndSamples.empty()) {
+        error = "Continuous Hi-MD encoding requires at least one track boundary.";
+        return false;
+    }
+    int prevEnd = 0;
+    for (std::size_t i = 0; i < trackEndSamples.size(); ++i) {
+        if (trackEndSamples[i] <= prevEnd) {
+            error = "Continuous Hi-MD track end sample boundaries must be strictly positive and "
+                    "increasing.";
+            return false;
+        }
+        prevEnd = trackEndSamples[i];
+    }
+    if (channels < 1 || channels > 2 || left == nullptr) {
+        error = "Invalid PCM input geometry for continuous Hi-MD encoding.";
+        return false;
+    }
+
+    if (trackEndSamples.size() == 1u) {
+        outTrackPayloads.resize(1u);
+        if (!encodeHiMdTrackPayload(mode, left, right, channels, trackEndSamples[0],
+                                    outTrackPayloads[0], progressCallback, error)) {
+            outTrackPayloads.clear();
+            return false;
+        }
+        return true;
+    }
+
+    std::string normalized = normalizeAsciiLower(mode);
+    if (normalized == "hisp") {
+        normalized = "hi-sp";
+    } else if (normalized == "hilp") {
+        normalized = "hi-lp";
+    } else if (normalized == "lpcm") {
+        normalized = "pcm";
+    }
+
+    int frameSamples = 0;
+    int frameBytes = 0;
+    if (normalized == "pcm") {
+        frameSamples = 16;
+        frameBytes = 64;
+    } else if (normalized == "lp2") {
+        frameSamples = 1024;
+        frameBytes = 384;
+    } else if (normalized == "lp4") {
+        frameSamples = 1024;
+        frameBytes = 192;
+    } else if (normalized == "hi-sp") {
+        frameSamples = 2048;
+        frameBytes = 1488;
+    } else if (normalized == "hi-lp") {
+        frameSamples = 2048;
+        frameBytes = 376;
+    } else {
+        error = "Unsupported Hi-MD codec mode '" + mode +
+                "' (expected hi-sp, hi-lp, lp2, lp4, or pcm).";
+        return false;
+    }
+
+    const int totalSamples = trackEndSamples.back();
+    std::vector<std::uint8_t> fullBytes;
+    if (!encodeHiMdTrackPayload(normalized, left, right, channels, totalSamples, fullBytes,
+                                progressCallback, error)) {
+        return false;
+    }
+
+    const std::size_t fb = static_cast<std::size_t>(frameBytes);
+    if (normalized == "pcm" && (fullBytes.size() % fb) != 0u) {
+        const std::size_t padded = ((fullBytes.size() + fb - 1u) / fb) * fb;
+        fullBytes.resize(padded, 0u);
+    }
+    if (fullBytes.empty() || (fullBytes.size() % fb) != 0u) {
+        error = "Continuous Hi-MD encoded stream is not aligned to codec frames.";
+        return false;
+    }
+
+    const int totalFrames = static_cast<int>(fullBytes.size() / fb);
+    const std::size_t kCount = trackEndSamples.size();
+    if (totalFrames < static_cast<int>(kCount)) {
+        error = "Continuous Hi-MD track run is too short to assign at least one codec frame per "
+                "track.";
+        return false;
+    }
+
+    outTrackPayloads.resize(kCount);
+    int prevF = 0;
+    for (std::size_t j = 0; j + 1u < kCount; ++j) {
+        const std::int64_t s = static_cast<std::int64_t>(trackEndSamples[j]);
+        const int ideal =
+            static_cast<int>((s + frameSamples / 2) / static_cast<std::int64_t>(frameSamples));
+        const int minF = prevF + 1;
+        const int maxF = totalFrames - static_cast<int>(kCount - 1u - j);
+        const int cutF = std::max(minF, std::min(maxF, ideal));
+        outTrackPayloads[j].assign(
+            fullBytes.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(prevF) * fb),
+            fullBytes.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(cutF) * fb));
+        prevF = cutF;
+    }
+    outTrackPayloads[kCount - 1u].assign(
+        fullBytes.begin() + static_cast<std::ptrdiff_t>(static_cast<std::size_t>(prevF) * fb),
+        fullBytes.end());
+
+    error.clear();
+    return true;
+}
+
 // ============================================================================
 // Offline Session Rendering & File Export
 // ============================================================================

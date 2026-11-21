@@ -29,6 +29,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -848,9 +849,354 @@ int main() {
         REQUIRE(sess.send({"mock-guard", "0"}, res, err), "mock-guard 0 failed: " + err);
     }
 
+    // 10. 240-track, 125-unique-audio, 24-group 24HCLK Mechanism-1 batch commit,
+    //     reference-counted deletion & group overwrite check
+    {
+        juce::var res;
+        REQUIRE(sess.send({"mock-reset"}, res, err), "mock-reset failed: " + err);
+
+        const auto hclkDir = tmpDir.getChildFile("hclk_batch");
+        REQUIRE(hclkDir.createDirectory(), "Failed creating 24HCLK temp dir");
+
+        juce::Array<juce::var> audioUploads;
+        juce::Array<juce::var> playOrder;
+        juce::Array<juce::var> groups;
+        std::map<std::string, std::vector<std::uint8_t>> expectedPayloads;
+        std::int64_t expectedTotalBytes = 0;
+
+        // 4 shared music loops (9 * 2048 = 18,432 samples -> 11 frames -> 2 blocks each)
+        for (int m = 0; m < 4; ++m) {
+            std::vector<std::uint8_t> wire;
+            REQUIRE(encodeTestTrackWire("hi-sp", m, 9 * 2048, wire, err), err);
+            const auto f = hclkDir.getChildFile("music_" + juce::String(m) + ".bin");
+            REQUIRE(writeFileBytes(f, wire, err), err);
+            const std::string id = "music_" + std::to_string(m);
+            expectedTotalBytes += static_cast<std::int64_t>(wire.size());
+            expectedPayloads.emplace(id, std::move(wire));
+
+            auto* uo = new juce::DynamicObject();
+            uo->setProperty("id", juce::String::fromUTF8(id.c_str()));
+            uo->setProperty("codec", "hi-sp");
+            uo->setProperty("file", f.getFullPathName());
+            uo->setProperty("title", juce::String("MUS ") + juce::String(m + 1));
+            uo->setProperty("artist", "Maybe Pablo");
+            uo->setProperty("album", "24HCLK");
+            uo->setProperty("durationSeconds", 0.42);
+            audioUploads.add(juce::var(uo));
+        }
+
+        // 1 shared bridge ("AND NOW", 2 * 2048 = 4,096 samples -> 4 frames -> 1 block)
+        {
+            std::vector<std::uint8_t> wire;
+            REQUIRE(encodeTestTrackWire("hi-sp", 7, 2 * 2048, wire, err), err);
+            const auto f = hclkDir.getChildFile("bridge.bin");
+            REQUIRE(writeFileBytes(f, wire, err), err);
+            expectedTotalBytes += static_cast<std::int64_t>(wire.size());
+            expectedPayloads.emplace("bridge", std::move(wire));
+
+            auto* uo = new juce::DynamicObject();
+            uo->setProperty("id", "bridge");
+            uo->setProperty("codec", "hi-sp");
+            uo->setProperty("file", f.getFullPathName());
+            uo->setProperty("title", "AND NOW");
+            uo->setProperty("artist", "Nora");
+            uo->setProperty("album", "24HCLK");
+            uo->setProperty("durationSeconds", 0.18);
+            audioUploads.add(juce::var(uo));
+        }
+
+        // 120 unique voice announcements + 240 Play Order entries + 24 hour groups
+        for (int h = 0; h < 24; ++h) {
+            const int groupStart = playOrder.size();
+            for (int s = 0; s < 5; ++s) {
+                const int seed = 20 + h * 5 + s;
+                std::vector<std::uint8_t> wire;
+                REQUIRE(encodeTestTrackWire("hi-sp", seed, 2 * 2048, wire, err), err);
+                const std::string vid = "v_" + std::to_string(h) + "_" + std::to_string(s);
+                const auto f = hclkDir.getChildFile(juce::String::fromUTF8((vid + ".bin").c_str()));
+                REQUIRE(writeFileBytes(f, wire, err), err);
+                expectedTotalBytes += static_cast<std::int64_t>(wire.size());
+                expectedPayloads.emplace(vid, std::move(wire));
+
+                const juce::String vTitle =
+                    (s < 4) ? (juce::String::formatted("%02d:%02d", h, s * 15))
+                            : (juce::String::formatted("MSG %02d", h));
+                auto* uo = new juce::DynamicObject();
+                uo->setProperty("id", juce::String::fromUTF8(vid.c_str()));
+                uo->setProperty("codec", "hi-sp");
+                uo->setProperty("file", f.getFullPathName());
+                uo->setProperty("title", vTitle);
+                uo->setProperty("artist", "Nora");
+                uo->setProperty("album", "24HCLK");
+                uo->setProperty("durationSeconds", 0.18);
+                audioUploads.add(juce::var(uo));
+
+                auto* pVoice = new juce::DynamicObject();
+                pVoice->setProperty("uploadId", juce::String::fromUTF8(vid.c_str()));
+                playOrder.add(juce::var(pVoice));
+
+                auto* pSecond = new juce::DynamicObject();
+                if (s < 4) {
+                    pSecond->setProperty("uploadId", juce::String("music_") + juce::String(s));
+                } else {
+                    pSecond->setProperty("uploadId", "bridge");
+                }
+                playOrder.add(juce::var(pSecond));
+            }
+            auto* go = new juce::DynamicObject();
+            go->setProperty("title", juce::String::formatted("%02d:00", h));
+            go->setProperty("startIndex", groupStart);
+            go->setProperty("endIndex", playOrder.size());
+            groups.add(juce::var(go));
+        }
+
+        auto* manifestObj = new juce::DynamicObject();
+        manifestObj->setProperty("requireEmpty", true);
+        manifestObj->setProperty("discTitle", "24HCLK");
+        manifestObj->setProperty("audioUploads", juce::var(audioUploads));
+        manifestObj->setProperty("playOrder", juce::var(playOrder));
+        manifestObj->setProperty("groups", juce::var(groups));
+
+        const auto manifestFile = hclkDir.getChildFile("manifest.json");
+        REQUIRE(manifestFile.replaceWithText(juce::JSON::toString(juce::var(manifestObj), true),
+                                             false, false, "\n"),
+                "Failed writing 24HCLK batch manifest");
+
+        REQUIRE(sess.send({"commit-batch", "mock:mz-rh1",
+                           manifestFile.getFullPathName().toStdString(), "0"},
+                          res, err),
+                "commit-batch 24HCLK failed: " + err);
+        const auto* batchObj = res.getDynamicObject()->getProperty("batch").getDynamicObject();
+        REQUIRE(batchObj != nullptr && static_cast<int>(batchObj->getProperty("trackCount")) == 240 &&
+                    static_cast<int>(batchObj->getProperty("uniqueAudioUploaded")) == 125 &&
+                    static_cast<bool>(batchObj->getProperty("icvUpdated")) &&
+                    static_cast<juce::int64>(batchObj->getProperty("bytesWritten")) ==
+                        expectedTotalBytes,
+                "Unexpected commit-batch 24HCLK summary");
+
+        REQUIRE(sess.send({"mock-snapshot"}, res, err), "mock-snapshot after commit-batch failed");
+        const int authCountAfterBatch =
+            static_cast<int>(res.getDynamicObject()->getProperty("auth_completed_count"));
+        const int icvCountAfterBatch =
+            static_cast<int>(res.getDynamicObject()->getProperty("icv_write_count"));
+        REQUIRE(authCountAfterBatch == 1 && icvCountAfterBatch == 1,
+                "24HCLK commit-batch must authenticate and sign ICV in one single session");
+        const std::string m1HeadKey =
+            res.getDynamicObject()->getProperty("head_key").toString().toStdString();
+        const std::string m1BodyKey =
+            res.getDynamicObject()->getProperty("body_key").toString().toStdString();
+        const std::string m1DiscId =
+            res.getDynamicObject()->getProperty("disc_id").toString().toStdString();
+        const std::string m1Icv =
+            res.getDynamicObject()->getProperty("last_icv").toString().toStdString();
+
+        REQUIRE(sess.send({"probe", "mock:mz-rh1"}, res, err), "probe after commit-batch failed");
+        const auto* st = res.getDynamicObject()->getProperty("status").getDynamicObject();
+        REQUIRE(static_cast<int>(st->getProperty("trackCount")) == 240 &&
+                    st->getProperty("discTitle").toString() == "24HCLK",
+                "Expected 240 tracks and discTitle 24HCLK after commit-batch");
+        const auto* tracksArr = st->getProperty("tracks").getArray();
+        REQUIRE(tracksArr != nullptr && tracksArr->size() == 240, "Expected 240 tracks in probe");
+        std::vector<int> uniqueSlots;
+        auto hasSlot = [&](int s) {
+            for (int x : uniqueSlots) {
+                if (x == s) return true;
+            }
+            return false;
+        };
+        for (int i = 0; i < 240; ++i) {
+            const int s = static_cast<int>((*tracksArr)[i].getDynamicObject()->getProperty("slot"));
+            REQUIRE(s >= 1, "Expected valid non-zero slot on Play Order track");
+            if (!hasSlot(s)) {
+                uniqueSlots.push_back(s);
+            }
+        }
+        REQUIRE(uniqueSlots.size() == 125u, "Expected exactly 125 unique TrackInfo slots for 24HCLK");
+        const int mus1Slot = static_cast<int>((*tracksArr)[1].getDynamicObject()->getProperty("slot"));
+        const int bridgeSlot =
+            static_cast<int>((*tracksArr)[9].getDynamicObject()->getProperty("slot"));
+        for (int h = 0; h < 24; ++h) {
+            REQUIRE(static_cast<int>((*tracksArr)[h * 10 + 1].getDynamicObject()->getProperty("slot")) ==
+                        mus1Slot,
+                    "Expected MUS 1 Play Order aliasing across all 24 hours");
+            REQUIRE(static_cast<int>((*tracksArr)[h * 10 + 9].getDynamicObject()->getProperty("slot")) ==
+                        bridgeSlot,
+                    "Expected AND NOW Play Order aliasing across all 24 hours");
+        }
+        const auto* grpArr = st->getProperty("groups").getArray();
+        int nonNegGroups = 0;
+        if (grpArr != nullptr) {
+            for (const auto& gVar : *grpArr) {
+                if (static_cast<int>(gVar.getDynamicObject()->getProperty("groupIndex")) >= 0) {
+                    ++nonNegGroups;
+                }
+            }
+        }
+        REQUIRE(nonNegGroups == 24, "Expected 24 groups in 24HCLK probe response");
+
+        // Dump aliased tracks (1 vs 231, 9 vs 239) and unique voice tracks (0, 230)
+        const std::pair<int, std::string> dumpChecks[] = {
+            {0, "v_0_0"},
+            {1, "music_0"},
+            {231, "music_0"},
+            {9, "bridge"},
+            {239, "bridge"},
+            {230, "v_23_0"},
+        };
+        for (const auto& dc : dumpChecks) {
+            const auto outF = hclkDir.getChildFile("dump_" + juce::String(dc.first) + ".bin");
+            REQUIRE(sess.send({"dump", "mock:mz-rh1", std::to_string(dc.first),
+                               outF.getFullPathName().toStdString(), "1"},
+                              res, err),
+                    "24HCLK dump failed at index " + std::to_string(dc.first) + ": " + err);
+            std::vector<std::uint8_t> got;
+            REQUIRE(readFileBytes(outF, got, err), err);
+            REQUIRE(got == expectedPayloads.at(dc.second),
+                    "24HCLK audio payload mismatch at track index " + std::to_string(dc.first));
+        }
+
+        // Cross-verify 240-track FAT16 image & ICV with unmodified upstream Node.js `himd-js`
+        const auto m1ImgFile = hclkDir.getChildFile("himd_24hclk_m1.img");
+        REQUIRE(sess.send({"mock-save-image", m1ImgFile.getFullPathName().toStdString()}, res, err),
+                "mock-save-image for 24HCLK failed: " + err);
+        {
+            const juce::File depsModules = juce::File(juce::String::fromUTF8(srcDir.c_str()))
+                                               .getChildFile("build/porffor/himd-deps/node_modules");
+            const auto vScript = hclkDir.getChildFile("verify_m1_24hclk.mjs");
+            std::ostringstream js;
+            js << "import fs from 'node:fs'\n"
+               << "import { createRequire } from 'node:module'\n"
+               << "const require = createRequire(" << juce::JSON::toString(depsModules.getChildFile("_anchor.js").getFullPathName()).toStdString() << ")\n"
+               << "const himdJs = require(" << juce::JSON::toString(depsModules.getChildFile("himd-js/dist/index.js").getFullPathName()).toStdString() << ")\n"
+               << "const nufatfs = require(" << juce::JSON::toString(depsModules.getChildFile("nufatfs/dist/index.js").getFullPathName()).toStdString() << ")\n"
+               << "const { decryptMaclistKey, retailMac } = require(" << juce::JSON::toString(depsModules.getChildFile("himd-js/dist/encryption.js").getFullPathName()).toStdString() << ")\n"
+               << "const imgBuf = fs.readFileSync(" << juce::JSON::toString(m1ImgFile.getFullPathName()).toStdString() << ")\n"
+               << "const sectorSize = 2048\n"
+               << "const fatfs = await nufatfs.FatFilesystem.create({ sectorSize, numSectors: Math.floor(imgBuf.length / sectorSize), async readSectors(i, c) { return new Uint8Array(imgBuf.subarray(i*sectorSize, (i+c)*sectorSize)) }, writeSectors: null }, false)\n"
+               << "class F { constructor(h){this.h=h} get length(){return this.h.length} seek(o){return this.h.seek(o)} read(l){return this.h.read(l===undefined?this.length:l)} async close(){await this.h.close()} }\n"
+               << "class R extends himdJs.HiMDFilesystem {\n"
+               << "  async _list(p){ const l = await fatfs.listDir('/'+p.replace(/^\\/+/, '')); return l ? l.map(f=>({ name:('/'+p.replace(/^\\/+/, '')+'/'+f.replace(/\\/$/, '')).replace(/\\/+/, '/'), type: f.endsWith('/')?'directory':'file' })) : [] }\n"
+               << "  async open(fp){ const v = await this.transformToValidCase(fp); const h = await fatfs.open(v, false); if(!h) throw new Error('open '+v); return new F(h) }\n"
+               << "  getSize(p){return fatfs.getSizeOf(p)} getTotalSpace(){return imgBuf.length} getName(){return 'Raw'}\n"
+               << "}\n"
+               << "const himd = await himdJs.HiMD.init(new R())\n"
+               << "const trs = himdJs.getAllTracks(himd)\n"
+               << "if (trs.length !== 240) throw new Error('Expected 240 tracks, got ' + trs.length)\n"
+               << "if (himd.trackIndexToTrackSlot(1) !== himd.trackIndexToTrackSlot(231)) throw new Error('MUS 1 alias slot mismatch')\n"
+               << "if (himd.trackIndexToTrackSlot(9) !== himd.trackIndexToTrackSlot(239)) throw new Error('Bridge alias slot mismatch')\n"
+               << "const readSlot = async (slot) => { const st = await himd.openNonMP3Stream(slot); const ps = []; let b; while((b = await st.readBlock()) !== null) ps.push(Buffer.from(b.block)); await st.blockStream.close(); return Buffer.concat(ps); }\n"
+               << "if (Buffer.compare(await readSlot(himd.trackIndexToTrackSlot(1)), fs.readFileSync(" << juce::JSON::toString(hclkDir.getChildFile("music_0.bin").getFullPathName()).toStdString() << ")) !== 0) throw new Error('music_0 audio mismatch')\n"
+               << "if (Buffer.compare(await readSlot(himd.trackIndexToTrackSlot(9)), fs.readFileSync(" << juce::JSON::toString(hclkDir.getChildFile("bridge.bin").getFullPathName()).toStdString() << ")) !== 0) throw new Error('bridge audio mismatch')\n"
+               << "if (Buffer.compare(await readSlot(himd.trackIndexToTrackSlot(0)), fs.readFileSync(" << juce::JSON::toString(hclkDir.getChildFile("v_0_0.bin").getFullPathName()).toStdString() << ")) !== 0) throw new Error('v_0_0 audio mismatch')\n"
+               << "const mh = await himd.openMaclistForReading(); const mraw = await mh.read(); await mh.close();\n"
+               << "const hk = decryptMaclistKey(mraw.subarray(0x10, 0x20)); const bk = decryptMaclistKey(mraw.subarray(0x60, 0x70));\n"
+               << "const head = Buffer.concat([mraw.subarray(0x20,0x24), Buffer.alloc(20), Buffer.from([0,1,0,0x12]), Buffer.alloc(4), mraw.subarray(0x40,0x50), Buffer.alloc(16)])\n"
+               << "const icv = Buffer.concat([Buffer.from(retailMac(head, hk)), Buffer.from(retailMac(mraw.subarray(0x70, 0x70+32000), bk))]).toString('hex')\n"
+               << "if (icv !== " << juce::JSON::toString(juce::String(m1Icv)).toStdString() << ") throw new Error('24HCLK ICV mismatch')\n"
+               << "if (Buffer.from(hk).toString('hex') !== " << juce::JSON::toString(juce::String(m1HeadKey)).toStdString() << " || Buffer.from(bk).toString('hex') !== " << juce::JSON::toString(juce::String(m1BodyKey)).toStdString() << " || Buffer.from(mraw.subarray(0x40,0x50)).toString('hex') !== " << juce::JSON::toString(juce::String(m1DiscId)).toStdString() << ") throw new Error('key/discId mismatch')\n"
+               << "console.log('UPSTREAM_24HCLK_M1_OK')\n";
+            REQUIRE(vScript.replaceWithText(juce::String::fromUTF8(js.str().c_str())),
+                    "Failed writing 24HCLK upstream verification script");
+            juce::ChildProcess np;
+            REQUIRE(np.start(juce::StringArray{juce::String::fromUTF8(nodeBin.c_str()),
+                                               vScript.getFullPathName()}),
+                    "Failed launching node for 24HCLK check");
+            const auto out = np.readAllProcessOutput();
+            REQUIRE(np.waitForProcessToFinish(30000) && np.getExitCode() == 0 &&
+                        out.contains("UPSTREAM_24HCLK_M1_OK"),
+                    "Upstream Node.js 24HCLK M1 verification failed:\n" + out.toStdString());
+        }
+
+        // Reference-counted deletion: delete 1 alias of AND NOW (index 9) -> keeps slot & skips ICV bump
+        REQUIRE(sess.send({"delete-tracks", "mock:mz-rh1", "9", "0"}, res, err),
+                "delete-tracks single alias failed: " + err);
+        REQUIRE(sess.send({"mock-snapshot"}, res, err), "mock-snapshot failed");
+        REQUIRE(static_cast<int>(res.getDynamicObject()->getProperty("icv_write_count")) == 1,
+                "Deleting one alias of a shared slot must NOT free the slot or rewrite ICV");
+
+        REQUIRE(sess.send({"probe", "mock:mz-rh1"}, res, err), "probe after alias delete failed");
+        const auto* stAfter1 = res.getDynamicObject()->getProperty("status").getDynamicObject();
+        REQUIRE(static_cast<int>(stAfter1->getProperty("trackCount")) == 239,
+                "Expected 239 tracks after deleting 1 alias");
+        {
+            const auto outF = hclkDir.getChildFile("dump_remaining_bridge.bin");
+            REQUIRE(sess.send({"dump", "mock:mz-rh1", "238", outF.getFullPathName().toStdString(),
+                               "1"},
+                              res, err),
+                    "dump remaining bridge alias failed: " + err);
+            std::vector<std::uint8_t> got;
+            REQUIRE(readFileBytes(outF, got, err), err);
+            REQUIRE(got == expectedPayloads.at("bridge"),
+                    "Remaining AND NOW alias audio corrupted after partial alias delete");
+        }
+
+        // Now delete ALL 23 remaining aliases of AND NOW -> frees the shared slot cleanly
+        std::ostringstream remCsv;
+        for (int h = 1; h < 24; ++h) {
+            if (h > 1) remCsv << ",";
+            remCsv << (10 * h + 8);
+        }
+        REQUIRE(sess.send({"delete-tracks", "mock:mz-rh1", remCsv.str(), "0"}, res, err),
+                "delete-tracks remaining 23 aliases failed: " + err);
+        REQUIRE(sess.send({"mock-snapshot"}, res, err), "mock-snapshot failed");
+        REQUIRE(static_cast<int>(res.getDynamicObject()->getProperty("icv_write_count")) == 2,
+                "Deleting last references of shared slot must free slot and update ICV");
+        REQUIRE(sess.send({"probe", "mock:mz-rh1"}, res, err), "probe after freeing bridge failed");
+        REQUIRE(static_cast<int>(res.getDynamicObject()->getProperty("status").getDynamicObject()->getProperty("trackCount")) ==
+                    216,
+                "Expected 216 remaining tracks after freeing all 24 AND NOW aliases");
+
+        // Remaining tracks (including still-aliased MUS 1 at new index 10 and v_23_0 at index 207) are intact
+        {
+            const auto outMus = hclkDir.getChildFile("dump_mus1_after_free.bin");
+            REQUIRE(sess.send({"dump", "mock:mz-rh1", "10", outMus.getFullPathName().toStdString(),
+                               "1"},
+                              res, err),
+                    "dump MUS 1 after bridge free failed: " + err);
+            std::vector<std::uint8_t> gotMus;
+            REQUIRE(readFileBytes(outMus, gotMus, err), err);
+            REQUIRE(gotMus == expectedPayloads.at("music_0"),
+                    "MUS 1 corrupted after freeing AND NOW slot");
+
+            const auto outVoice = hclkDir.getChildFile("dump_v23_after_free.bin");
+            REQUIRE(sess.send({"dump", "mock:mz-rh1", "207",
+                               outVoice.getFullPathName().toStdString(), "1"},
+                              res, err),
+                    "dump v_23_0 after bridge free failed: " + err);
+            std::vector<std::uint8_t> gotVoice;
+            REQUIRE(readFileBytes(outVoice, gotVoice, err), err);
+            REQUIRE(gotVoice == expectedPayloads.at("v_23_0"),
+                    "v_23_0 shifted fragment offset corrupted after freeing AND NOW slot");
+        }
+
+        // Overwrite 24 groups with 2 groups (verifying rewriteGroups reverse deletion fix)
+        REQUIRE(sess.send({"set-groups", "mock:mz-rh1",
+                           "[{\"title\":\"First\",\"indices\":[0,1,2]},{\"title\":\"Second\",\"indices\":[3,4]}]",
+                           "0"},
+                          res, err),
+                "set-groups overwrite 24->2 failed: " + err);
+        REQUIRE(sess.send({"probe", "mock:mz-rh1"}, res, err), "probe after set-groups failed");
+        const auto* ovGrps = res.getDynamicObject()
+                                 ->getProperty("status")
+                                 .getDynamicObject()
+                                 ->getProperty("groups")
+                                 .getArray();
+        int ovCount = 0;
+        if (ovGrps != nullptr) {
+            for (const auto& gv : *ovGrps) {
+                if (static_cast<int>(gv.getDynamicObject()->getProperty("groupIndex")) >= 0) {
+                    ++ovCount;
+                }
+            }
+        }
+        REQUIRE(ovCount == 2,
+                "Expected exactly 2 groups after overwriting 24 groups (got " +
+                    std::to_string(ovCount) + ")");
+    }
+
     sess.stop();
 
-    // 10. Constrained 544 KB thread stack self-test (6 MiB PCM roundtrip = 386 Hi-MD blocks)
+    // 11. Constrained 544 KB thread stack self-test (6 MiB PCM roundtrip = 386 Hi-MD blocks)
     {
         juce::ChildProcess stackProc;
         juce::StringArray cmd{juce::String::fromUTF8(himdBin.c_str()), "selftest-stack"};
@@ -862,6 +1208,6 @@ int main() {
                 "Unexpected selftest-stack output: " + out.toStdString());
     }
 
-    std::cout << "[HiMdTests] All 10 offline Hi-MD protocol & upstream cross-verification phases passed.\n";
+    std::cout << "[HiMdTests] All 11 offline Hi-MD protocol, 24HCLK Mechanism-1, & upstream cross-verification phases passed.\n";
     return 0;
 }

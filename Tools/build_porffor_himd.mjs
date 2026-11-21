@@ -372,6 +372,14 @@ function stageHimdPackages(babel) {
     }`,
         'himd.js await atdata.seek'
       )
+
+      // Cap getGroupCount() fallback at 255 (group table indices 1..255).
+      code = replaceOrThrow(
+        code,
+        `        return 256;`,
+        `        return 255;`,
+        'himd.js getGroupCount cap 255'
+      )
     }
 
     if (rel === 'utils.js') {
@@ -471,6 +479,61 @@ function stageHimdPackages(babel) {
     trackData.firstFragment = himd.addFragment(fragment);`,
         'himd-functions.js duplicate addFragment fix'
       )
+      // Fix rewriteGroups deleting forward while deleteGroup shifts remaining groups down.
+      code = replaceOrThrow(
+        code,
+        `function rewriteGroups(himd, groups) {
+    let groupCount = himd.getGroupCount();
+    for (let i = 0; i < groupCount; i++) {
+        deleteGroup(himd, i);
+    }`,
+        `function rewriteGroups(himd, groups) {
+    let groupCount = himd.getGroupCount();
+    for (let i = groupCount - 1; i >= 0; i--) {
+        deleteGroup(himd, i);
+    }`,
+        'himd-functions.js rewriteGroups reverse delete'
+      )
+
+      // Update track.trackNumber once per unique TrackInfo slot in moveTrack (Play Order safe).
+      code = replaceOrThrow(
+        code,
+        `function moveTrack(himd, from, to) {
+    const tracks = Array(himd.getTrackCount())
+        .fill(0)
+        .map((_, i) => himd.trackIndexToTrackSlot(i));
+    let [i] = tracks.splice(from, 1);
+    tracks.splice(to, 0, i);
+    tracks.forEach((v, i) => {
+        himd.writeTrackIndexToTrackSlot(i, v);
+        const track = himd.getTrack(v);
+        track.trackNumber = i + 1;
+        himd.writeTrack(v, track);
+    });
+}`,
+        `function moveTrack(himd, from, to) {
+    const count = himd.getTrackCount();
+    const tracks = [];
+    for (let idx = 0; idx < count; idx++) {
+        tracks.push(himd.trackIndexToTrackSlot(idx));
+    }
+    const moved = tracks.splice(from, 1)[0];
+    tracks.splice(to, 0, moved);
+    const seenSlots = {};
+    for (let idx = 0; idx < tracks.length; idx++) {
+        const slot = tracks[idx];
+        himd.writeTrackIndexToTrackSlot(idx, slot);
+        if (!seenSlots[slot]) {
+            seenSlots[slot] = true;
+            const track = himd.getTrack(slot);
+            track.trackNumber = idx + 1;
+            himd.writeTrack(slot, track);
+        }
+    }
+}`,
+        'himd-functions.js moveTrack PlayOrder safe'
+      )
+
       // Avoid Set.prototype.has with thisArg in rewriteGroups.
       code = replaceOrThrow(
         code,
@@ -499,8 +562,8 @@ function stageHimdPackages(babel) {
         'himd-functions.js rewriteGroups plain object map'
       )
 
-      // Replace async-generator dump* and MP3/streaming upload functions with lightweight stubs
-      // (dumpTrack & streaming upload live in himd_core_entry.js using host chunked file I/O).
+      // Replace async-generator dump*, MP3/streaming upload functions, and deleteTracks
+      // (dumpTrack & streaming upload live in himd_core_entry.js; deleteTracks is PlayOrder ref-counted).
       const dumpStart = code.indexOf('function getTotal({ blockStream })')
       const rewriteGroupsStart = code.indexOf('function rewriteGroups(himd, groups)')
       if (dumpStart === -1 || rewriteGroupsStart === -1 || rewriteGroupsStart <= dumpStart) {
@@ -518,6 +581,161 @@ function stageHimdPackages(babel) {
       ) {
         throw new Error('[himd-stage] Missing upload/delete section markers in himd-functions.js')
       }
+      const refCountedDeleteTracksCode = `async function deleteTracks(himd, tracksToDelete) {
+    if (!himd.filesystem.freeFileRegions) {
+        throw new himd_1.HiMDError("Track deletion is not supported by this driver.");
+    }
+    const oldCount = himd.getTrackCount();
+    const oldPlayOrder = [];
+    for (let i = 0; i < oldCount; i++) {
+        oldPlayOrder.push(himd.trackIndexToTrackSlot(i));
+    }
+    const delIdxMap = {};
+    for (let i = 0; i < tracksToDelete.length; i++) {
+        const idx = tracksToDelete[i] | 0;
+        if (idx < 0 || idx >= oldCount) {
+            throw new himd_1.HiMDError("Delete track index out of range: " + idx);
+        }
+        delIdxMap[idx] = true;
+    }
+    const newPlayOrder = [];
+    const newSlotRefCount = {};
+    for (let i = 0; i < oldCount; i++) {
+        if (!delIdxMap[i]) {
+            const slot = oldPlayOrder[i];
+            newPlayOrder.push(slot);
+            newSlotRefCount[slot] = (newSlotRefCount[slot] || 0) + 1;
+        }
+    }
+    const slotsToFree = [];
+    const freedSeen = {};
+    for (let i = 0; i < oldCount; i++) {
+        const slot = oldPlayOrder[i];
+        if (!newSlotRefCount[slot] && !freedSeen[slot]) {
+            freedSeen[slot] = true;
+            slotsToFree.push(slot);
+        }
+    }
+    const keptSlots = [];
+    const keptSeen = {};
+    for (let i = 0; i < newPlayOrder.length; i++) {
+        const slot = newPlayOrder[i];
+        if (!keptSeen[slot]) {
+            keptSeen[slot] = true;
+            keptSlots.push(slot);
+        }
+    }
+    const blocksToFree = [];
+    for (let s = 0; s < slotsToFree.length; s++) {
+        const slot = slotsToFree[s];
+        const track = himd.getTrack(slot);
+        let fragment = track.firstFragment;
+        while (fragment !== 0) {
+            const fragmentObject = himd.getFragment(fragment);
+            let firstBlock = fragmentObject.firstBlock;
+            let length = fragmentObject.lastBlock - fragmentObject.firstBlock + 1;
+            if ((firstBlock % 2) === 1) {
+                firstBlock++;
+                length--;
+            }
+            if ((length % 2) === 1) {
+                length--;
+            }
+            if (length > 0) {
+                blocksToFree.push({ firstBlock, length });
+            }
+            const nextFragment = fragmentObject.nextFragment;
+            himd.removeFragment(fragment);
+            fragment = nextFragment;
+        }
+        if (track.albumIndex) himd.removeString(track.albumIndex);
+        if (track.artistIndex) himd.removeString(track.artistIndex);
+        if (track.titleIndex) himd.removeString(track.titleIndex);
+        himd.removeTrack(slot);
+    }
+    for (let i = 0; i < newPlayOrder.length; i++) {
+        himd.writeTrackIndexToTrackSlot(i, newPlayOrder[i]);
+    }
+    for (let i = newPlayOrder.length; i < oldCount; i++) {
+        himd.writeTrackIndexToTrackSlot(i, 0);
+    }
+    himd.writeTrackCount(newPlayOrder.length);
+    const numUpdated = {};
+    for (let i = 0; i < newPlayOrder.length; i++) {
+        const slot = newPlayOrder[i];
+        if (!numUpdated[slot]) {
+            numUpdated[slot] = true;
+            const trk = himd.getTrack(slot);
+            trk.trackNumber = i + 1;
+            himd.writeTrack(slot, trk);
+        }
+    }
+    if (blocksToFree.length > 0) {
+        const visitedFrags = {};
+        for (let s = 0; s < keptSlots.length; s++) {
+            let frag = himd.getTrack(keptSlots[s]).firstFragment;
+            while (frag !== 0 && !visitedFrags[frag]) {
+                visitedFrags[frag] = true;
+                const fragObject = himd.getFragment(frag);
+                const origFirst = fragObject.firstBlock;
+                let shift = 0;
+                for (let b = 0; b < blocksToFree.length; b++) {
+                    if (origFirst > blocksToFree[b].firstBlock) {
+                        shift += blocksToFree[b].length;
+                    }
+                }
+                if (shift > 0) {
+                    fragObject.firstBlock -= shift;
+                    fragObject.lastBlock -= shift;
+                    himd.writeFragment(frag, fragObject);
+                }
+                frag = fragObject.nextFragment;
+            }
+        }
+        const regions = [];
+        for (let b = 0; b < blocksToFree.length; b++) {
+            regions.push({
+                startByte: blocksToFree[b].firstBlock * streams_1.BLOCK_SIZE,
+                length: blocksToFree[b].length * streams_1.BLOCK_SIZE,
+            });
+        }
+        await himd.filesystem.freeFileRegions(himd.getDatanumDependentName("ATDATA"), regions);
+    }
+    const oldGroupCount = himd.getGroupCount();
+    if (oldGroupCount > 0) {
+        const oldToNew = [];
+        let newPos = 0;
+        for (let i = 0; i < oldCount; i++) {
+            if (!delIdxMap[i]) {
+                oldToNew.push(newPos);
+                newPos++;
+            } else {
+                oldToNew.push(-1);
+            }
+        }
+        const keptGroups = [];
+        for (let gi = 1; gi <= oldGroupCount; gi++) {
+            const grp = himd.getGroup(gi);
+            const gIndices = [];
+            for (let oi = grp.startTrackIndex; oi < grp.endTrackIndex; oi++) {
+                if (oi >= 0 && oi < oldCount && oldToNew[oi] >= 0) {
+                    gIndices.push(oldToNew[oi]);
+                }
+            }
+            if (gIndices.length > 0 &&
+                gIndices[gIndices.length - 1] - gIndices[0] === gIndices.length - 1) {
+                keptGroups.push({
+                    title: grp.titleIndex === 0 ? null : himd.getString(grp.titleIndex),
+                    indices: gIndices,
+                });
+            }
+        }
+        rewriteGroups(himd, keptGroups);
+    }
+    await himd.flush();
+    return slotsToFree;
+}
+`
       code =
         code.slice(0, dumpStart) +
         `function dumpTrack() { throw new himd_1.HiMDError('Use himdDumpTrackToFile'); }\n` +
@@ -525,7 +743,7 @@ function stageHimdPackages(babel) {
         `async function uploadMP3Track() { throw new himd_1.HiMDError('MP3 upload unsupported'); }\n` +
         code.slice(uploadMacStart, uploadStreamStart) +
         `async function uploadStreamingMacDependent() { throw new himd_1.HiMDError('Use himdUploadTrackFromFile'); }\n` +
-        code.slice(deleteTracksStart)
+        refCountedDeleteTracksCode
     }
 
     const dst = path.join(stagedDir, 'himd-js', rel)
@@ -1658,6 +1876,7 @@ const {
   HiMDError,
   HiMDCodec,
   HiMDStringType,
+  HiMDWriteStream,
   DOSTIME_NULL,
   BLOCK_SIZE,
   HIMD_AUDIO_SIZE,
@@ -1671,6 +1890,8 @@ const {
   getFramesPerBlock,
   getAllTracks,
   getGroups,
+  addGroup,
+  deleteGroup,
   renameDisc,
   renameTrack,
   moveTrack,
@@ -1698,6 +1919,273 @@ function hostOrThrow() {
 function reportHostStep(done, total) {
   const h = globalThis.__cartaHiMdHost;
   if (h && h.reportStep) h.reportStep(done | 0, total | 0);
+}
+
+function jsonSkipWs(st) {
+  const s = st.s;
+  const n = st.n;
+  let i = st.i;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10 || c === 13) {
+      i++;
+    } else {
+      break;
+    }
+  }
+  st.i = i;
+}
+
+function jsonHexDigit(c) {
+  if (c >= 48 && c <= 57) return c - 48;
+  if (c >= 65 && c <= 70) return c - 55;
+  if (c >= 97 && c <= 102) return c - 87;
+  return -1;
+}
+
+function jsonParseString(st) {
+  const s = st.s;
+  const n = st.n;
+  let i = st.i + 1;
+  let out = '';
+  while (i < n) {
+    const c = s.charCodeAt(i++);
+    if (c === 34) {
+      st.i = i;
+      return out;
+    }
+    if (c < 32) {
+      throw new Error('Unescaped control character in JSON string');
+    }
+    if (c === 92) {
+      if (i >= n) {
+        throw new Error('Unterminated escape in JSON string');
+      }
+      const esc = s.charCodeAt(i++);
+      if (esc === 34) out += String.fromCharCode(34);
+      else if (esc === 92) out += String.fromCharCode(92);
+      else if (esc === 47) out += '/';
+      else if (esc === 98) out += String.fromCharCode(8);
+      else if (esc === 102) out += String.fromCharCode(12);
+      else if (esc === 110) out += String.fromCharCode(10);
+      else if (esc === 114) out += String.fromCharCode(13);
+      else if (esc === 116) out += String.fromCharCode(9);
+      else if (esc === 117) {
+        if (i + 4 > n) {
+          throw new Error('Incomplete unicode escape in JSON string');
+        }
+        const h0 = jsonHexDigit(s.charCodeAt(i));
+        const h1 = jsonHexDigit(s.charCodeAt(i + 1));
+        const h2 = jsonHexDigit(s.charCodeAt(i + 2));
+        const h3 = jsonHexDigit(s.charCodeAt(i + 3));
+        if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) {
+          throw new Error('Invalid unicode escape in JSON string');
+        }
+        i += 4;
+        out += String.fromCharCode((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+      } else {
+        throw new Error('Invalid escape in JSON string');
+      }
+    } else {
+      out += String.fromCharCode(c);
+    }
+  }
+  throw new Error('Unterminated JSON string');
+}
+
+function jsonParseNumber(st) {
+  const s = st.s;
+  const n = st.n;
+  let i = st.i;
+  let numStr = '';
+  if (i < n && s.charCodeAt(i) === 45) {
+    numStr += '-';
+    i++;
+  }
+  if (i >= n) {
+    throw new Error('Invalid JSON number');
+  }
+  const d0 = s.charCodeAt(i);
+  if (d0 === 48) {
+    numStr += '0';
+    i++;
+    if (i < n) {
+      const nextC = s.charCodeAt(i);
+      if (nextC >= 48 && nextC <= 57) {
+        throw new Error('Invalid leading zero in JSON number');
+      }
+    }
+  } else if (d0 >= 49 && d0 <= 57) {
+    while (i < n) {
+      const d = s.charCodeAt(i);
+      if (d >= 48 && d <= 57) {
+        numStr += String.fromCharCode(d);
+        i++;
+      } else {
+        break;
+      }
+    }
+  } else {
+    throw new Error('Invalid JSON number');
+  }
+  if (i < n && s.charCodeAt(i) === 46) {
+    numStr += '.';
+    i++;
+    if (i >= n || s.charCodeAt(i) < 48 || s.charCodeAt(i) > 57) {
+      throw new Error('Invalid JSON fraction');
+    }
+    while (i < n) {
+      const d = s.charCodeAt(i);
+      if (d >= 48 && d <= 57) {
+        numStr += String.fromCharCode(d);
+        i++;
+      } else {
+        break;
+      }
+    }
+  }
+  if (i < n && (s.charCodeAt(i) === 101 || s.charCodeAt(i) === 69)) {
+    numStr += 'e';
+    i++;
+    if (i < n && (s.charCodeAt(i) === 43 || s.charCodeAt(i) === 45)) {
+      numStr += String.fromCharCode(s.charCodeAt(i));
+      i++;
+    }
+    if (i >= n || s.charCodeAt(i) < 48 || s.charCodeAt(i) > 57) {
+      throw new Error('Invalid JSON exponent');
+    }
+    while (i < n) {
+      const d = s.charCodeAt(i);
+      if (d >= 48 && d <= 57) {
+        numStr += String.fromCharCode(d);
+        i++;
+      } else {
+        break;
+      }
+    }
+  }
+  st.i = i;
+  return Number(numStr);
+}
+
+function jsonParseArray(st) {
+  st.i++;
+  jsonSkipWs(st);
+  const arr = [];
+  if (st.i < st.n && st.s.charCodeAt(st.i) === 93) {
+    st.i++;
+    return arr;
+  }
+  while (true) {
+    arr.push(jsonParseValue(st));
+    jsonSkipWs(st);
+    if (st.i >= st.n) {
+      throw new Error('Unterminated JSON array');
+    }
+    const c = st.s.charCodeAt(st.i);
+    if (c === 93) {
+      st.i++;
+      return arr;
+    }
+    if (c === 44) {
+      st.i++;
+      jsonSkipWs(st);
+      continue;
+    }
+    throw new Error('Expected comma or ] in JSON array');
+  }
+}
+
+function jsonParseObject(st) {
+  st.i++;
+  jsonSkipWs(st);
+  const obj = {};
+  if (st.i < st.n && st.s.charCodeAt(st.i) === 125) {
+    st.i++;
+    return obj;
+  }
+  while (true) {
+    if (st.i >= st.n || st.s.charCodeAt(st.i) !== 34) {
+      throw new Error('Expected string key in JSON object');
+    }
+    const key = jsonParseString(st);
+    jsonSkipWs(st);
+    if (st.i >= st.n || st.s.charCodeAt(st.i) !== 58) {
+      throw new Error('Expected colon in JSON object');
+    }
+    st.i++;
+    jsonSkipWs(st);
+    const val = jsonParseValue(st);
+    if (key !== '__proto__') {
+      obj[key] = val;
+    }
+    jsonSkipWs(st);
+    if (st.i >= st.n) {
+      throw new Error('Unterminated JSON object');
+    }
+    const c = st.s.charCodeAt(st.i);
+    if (c === 125) {
+      st.i++;
+      return obj;
+    }
+    if (c === 44) {
+      st.i++;
+      jsonSkipWs(st);
+      continue;
+    }
+    throw new Error('Expected comma or } in JSON object');
+  }
+}
+
+function jsonParseValue(st) {
+  jsonSkipWs(st);
+  if (st.i >= st.n) {
+    throw new Error('Unexpected end of JSON input');
+  }
+  const s = st.s;
+  const i = st.i;
+  const c = s.charCodeAt(i);
+  if (c === 34) return jsonParseString(st);
+  if (c === 123) return jsonParseObject(st);
+  if (c === 91) return jsonParseArray(st);
+  if (c === 116) {
+    if (i + 4 <= st.n && s.charCodeAt(i + 1) === 114 && s.charCodeAt(i + 2) === 117 && s.charCodeAt(i + 3) === 101) {
+      st.i = i + 4;
+      return true;
+    }
+    throw new Error('Invalid token in JSON at position ' + i);
+  }
+  if (c === 102) {
+    if (i + 5 <= st.n && s.charCodeAt(i + 1) === 97 && s.charCodeAt(i + 2) === 108 && s.charCodeAt(i + 3) === 115 && s.charCodeAt(i + 4) === 101) {
+      st.i = i + 5;
+      return false;
+    }
+    throw new Error('Invalid token in JSON at position ' + i);
+  }
+  if (c === 110) {
+    if (i + 4 <= st.n && s.charCodeAt(i + 1) === 117 && s.charCodeAt(i + 2) === 108 && s.charCodeAt(i + 3) === 108) {
+      st.i = i + 4;
+      return null;
+    }
+    throw new Error('Invalid token in JSON at position ' + i);
+  }
+  if (c === 45 || (c >= 48 && c <= 57)) {
+    return jsonParseNumber(st);
+  }
+  throw new Error('Unexpected token in JSON at position ' + i);
+}
+
+function parseJsonStrict(input) {
+  if (typeof input !== 'string') {
+    throw new Error('Expected JSON string');
+  }
+  const st = { s: input, i: 0, n: input.length };
+  const val = jsonParseValue(st);
+  jsonSkipWs(st);
+  if (st.i !== st.n) {
+    throw new Error('Unexpected trailing content in JSON at position ' + st.i);
+  }
+  return val;
 }
 
 function toHex2(n) {
@@ -1807,7 +2295,7 @@ class HostScsiDevice {
 
 function findDeviceById(deviceId) {
   const listJson = hostOrThrow().scsiListJson();
-  const list = JSON.parse(listJson);
+  const list = parseJsonStrict(listJson);
   for (let i = 0; i < list.length; i++) {
     if (list[i].id === deviceId) return list[i];
   }
@@ -2026,7 +2514,13 @@ export async function himdUploadTrackFromFile(deviceId, codecSpec, filePath, tit
       while (true) {
         const nRead = h.fileRead(fd, readBuf, blockPayloadCap);
         if (nRead <= 0) break;
-        const framesInThisBlock = Math.floor(nRead / bytesPerFrame);
+        let effectiveRead = nRead;
+        if (typeString === 'LPCM' && (nRead % bytesPerFrame) !== 0) {
+          const paddedBytes = Math.ceil(nRead / bytesPerFrame) * bytesPerFrame;
+          for (let z = nRead; z < paddedBytes; z++) readBuf[z] = 0;
+          effectiveRead = paddedBytes;
+        }
+        const framesInThisBlock = Math.floor(effectiveRead / bytesPerFrame);
         if (framesInThisBlock === 0) break;
         const bytesInThisBlock = framesInThisBlock * bytesPerFrame;
         bytesReadTotal += bytesInThisBlock;
@@ -2238,7 +2732,7 @@ export async function himdMoveTrack(deviceId, fromIndex, toIndex) {
 }
 
 export async function himdSetGroups(deviceId, groupsJson) {
-  const parsed = JSON.parse(groupsJson);
+  const parsed = parseJsonStrict(groupsJson);
   if (!Array.isArray(parsed)) {
     throw new Error('Expected JSON array for Hi-MD groups');
   }
@@ -2252,32 +2746,560 @@ export async function himdSetGroups(deviceId, groupsJson) {
 }
 
 export async function himdDeleteTracks(deviceId, indicesJson) {
-  const indices = JSON.parse(indicesJson);
+  const indices = parseJsonStrict(indicesJson);
   if (!Array.isArray(indices)) {
     throw new Error('Expected JSON array for delete-tracks indices');
   }
   const { fs, himd } = await openHiMdSession(deviceId);
   try {
     const count = himd.getTrackCount();
-    const deletedSlots = [];
+    const delMap = {};
+    const cleanIndices = [];
     for (let i = 0; i < indices.length; i++) {
       const idx = indices[i] | 0;
       if (idx < 0 || idx >= count) {
         throw new HiMDError('Delete track index out of range: ' + idx);
       }
-      deletedSlots.push(himd.trackIndexToTrackSlot(idx));
-    }
-    const session = new HiMDSecureSession(himd, fs.driver);
-    await session.performAuthentication();
-    await deleteTracks(himd, indices.slice());
-    const zeroMac = new Uint8Array(8).fill(0);
-    for (let i = 0; i < deletedSlots.length; i++) {
-      const slot = deletedSlots[i];
-      if (slot >= 1) {
-        session.allMacs.set(zeroMac, (slot - 1) * 8);
+      if (!delMap[idx]) {
+        delMap[idx] = true;
+        cleanIndices.push(idx);
       }
     }
-    await session.finalizeSession();
+    const keptSlotMap = {};
+    for (let i = 0; i < count; i++) {
+      if (!delMap[i]) {
+        keptSlotMap[himd.trackIndexToTrackSlot(i)] = true;
+      }
+    }
+    let freesAnySlot = false;
+    for (let i = 0; i < count; i++) {
+      const s = himd.trackIndexToTrackSlot(i);
+      if (!keptSlotMap[s]) {
+        freesAnySlot = true;
+        break;
+      }
+    }
+    if (!freesAnySlot) {
+      await deleteTracks(himd, cleanIndices);
+    } else {
+      const session = new HiMDSecureSession(himd, fs.driver);
+      await session.performAuthentication();
+      const freedSlots = await deleteTracks(himd, cleanIndices);
+      const zeroMac = new Uint8Array(8).fill(0);
+      for (let i = 0; i < freedSlots.length; i++) {
+        const slot = freedSlots[i];
+        if (slot >= 1) {
+          session.allMacs.set(zeroMac, (slot - 1) * 8);
+        }
+      }
+      await session.finalizeSession();
+    }
+  } finally {
+    await fs.driver.close();
+  }
+}
+
+function readHostUtf8File(h, filePath) {
+  const fd = h.fileOpen(filePath, 0);
+  try {
+    const size = h.fileSize(fd);
+    if (size <= 0) {
+      throw new Error('Batch manifest file is empty: ' + filePath);
+    }
+    const total = size | 0;
+    const buf = new Uint8Array(total);
+    let off = 0;
+    while (off < total) {
+      const want = Math.min(16384, total - off);
+      const view = buf.subarray(off, off + want);
+      const n = h.fileRead(fd, view, want);
+      if (n <= 0) break;
+      off += n;
+    }
+    return __utf8DecodeImpl(off === total ? buf : buf.subarray(0, off));
+  } finally {
+    h.fileClose(fd);
+  }
+}
+
+function countFreeTrackSlots(himd) {
+  let amt = 0;
+  let cur = himd.getTrack(0).trackNumber;
+  while (cur !== 0 && amt <= 2048) {
+    amt++;
+    cur = himd.getTrack(cur).trackNumber;
+  }
+  return amt;
+}
+
+export async function himdCommitBatch(deviceId, manifestFilePath) {
+  const h = hostOrThrow();
+  const manifest = parseJsonStrict(readHostUtf8File(h, manifestFilePath));
+  if (!manifest || typeof manifest !== 'object') {
+    throw new Error('Invalid Hi-MD batch manifest JSON');
+  }
+
+  const audioUploads = Array.isArray(manifest.audioUploads) ? manifest.audioUploads : [];
+  const playOrder = Array.isArray(manifest.playOrder) ? manifest.playOrder : [];
+  const slotMetadata = Array.isArray(manifest.slotMetadata) ? manifest.slotMetadata : [];
+  const groups = Array.isArray(manifest.groups) ? manifest.groups : null;
+
+  if (playOrder.length > 2047) {
+    throw new HiMDError('Hi-MD PlayOrder exceeds maximum of 2047 tracks');
+  }
+
+  const uploadById = {};
+  const uploadPlans = [];
+  let totalEstBlocks = 0;
+  for (let i = 0; i < audioUploads.length; i++) {
+    const u = audioUploads[i];
+    if (!u || typeof u.id !== 'string' || u.id.length === 0 || uploadById[u.id]) {
+      throw new HiMDError('Invalid or duplicate audioUpload id at index ' + i);
+    }
+    if (typeof u.file !== 'string' || u.file.length === 0) {
+      throw new HiMDError('Missing audioUpload file path for ' + u.id);
+    }
+    const { codecInfo, typeString } = parseCodecSpec(u.codec);
+    const bytesPerFrame = getBytesPerFrame(codecInfo);
+    const maxBytesInBlock = HIMD_AUDIO_SIZE - (typeString === 'LPCM' ? 0 : 1);
+    const framesPerBlockCap = Math.floor(maxBytesInBlock / bytesPerFrame);
+    if (framesPerBlockCap <= 0) {
+      throw new HiMDError('Invalid Hi-MD frame/block geometry');
+    }
+    const blockPayloadCap = framesPerBlockCap * bytesPerFrame;
+
+    const ufd = h.fileOpen(u.file, 0);
+    let fsize = 0;
+    try {
+      fsize = h.fileSize(ufd);
+    } finally {
+      h.fileClose(ufd);
+    }
+    if (fsize <= 0) {
+      throw new HiMDError('Hi-MD batch upload input file is empty: ' + u.file);
+    }
+    const estBlocks = Math.max(1, Math.ceil(fsize / blockPayloadCap));
+    totalEstBlocks += estBlocks;
+
+    const uPlan = {
+      id: u.id,
+      file: u.file,
+      fileSize: fsize,
+      codecInfo,
+      typeString,
+      bytesPerFrame,
+      blockPayloadCap,
+      title: typeof u.title === 'string' ? u.title : '',
+      artist: typeof u.artist === 'string' ? u.artist : '',
+      album: typeof u.album === 'string' ? u.album : '',
+      durationSeconds: typeof u.durationSeconds === 'number' ? u.durationSeconds : 0,
+    };
+    uploadById[u.id] = uPlan;
+    uploadPlans.push(uPlan);
+  }
+
+  const sortedGroups = [];
+  if (groups !== null) {
+    if (groups.length > 255) {
+      throw new HiMDError('Hi-MD group count exceeds maximum of 255');
+    }
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (!g || typeof g.startIndex !== 'number' || typeof g.endIndex !== 'number') {
+        throw new HiMDError('Invalid group entry at index ' + i);
+      }
+      const s = g.startIndex | 0;
+      const e = g.endIndex | 0;
+      if (s < 0 || e <= s || e > playOrder.length) {
+        throw new HiMDError('Group range out of bounds: ' + s + '..' + e);
+      }
+      sortedGroups.push({
+        title: typeof g.title === 'string' ? g.title : '',
+        startIndex: s,
+        endIndex: e,
+      });
+    }
+    sortedGroups.sort((a, b) => a.startIndex - b.startIndex);
+    for (let i = 1; i < sortedGroups.length; i++) {
+      if (sortedGroups[i].startIndex < sortedGroups[i - 1].endIndex) {
+        throw new HiMDError('Overlapping Hi-MD group ranges are not supported');
+      }
+    }
+  }
+
+  const { fs, himd } = await openHiMdSession(deviceId);
+  try {
+    if (manifest.expectedDiscId && String(manifest.expectedDiscId).length > 0) {
+      const actualId = bytesToHexStr(himd.getDiscId()).toLowerCase();
+      const wantId = String(manifest.expectedDiscId).toLowerCase();
+      if (actualId !== wantId) {
+        throw new HiMDError('Inserted Hi-MD disc ID mismatch (' + actualId + ' != ' + wantId + ')');
+      }
+    }
+
+    const oldCount = himd.getTrackCount();
+    if (manifest.requireEmpty && oldCount > 0) {
+      throw new HiMDError('Inserted Hi-MD disc is not empty (' + oldCount + ' track(s))');
+    }
+
+    const oldPlayOrder = [];
+    const oldSlotSet = {};
+    for (let i = 0; i < oldCount; i++) {
+      const s = himd.trackIndexToTrackSlot(i);
+      oldPlayOrder.push(s);
+      if (s >= 1) oldSlotSet[s] = true;
+    }
+
+    const keptSlotSet = {};
+    for (let i = 0; i < playOrder.length; i++) {
+      const entry = playOrder[i];
+      if (entry && typeof entry.uploadId === 'string' && entry.uploadId.length > 0) {
+        if (!uploadById[entry.uploadId]) {
+          throw new HiMDError('PlayOrder references unknown uploadId: ' + entry.uploadId);
+        }
+      } else if (entry && typeof entry.existingSlot === 'number') {
+        const slot = entry.existingSlot | 0;
+        if (slot < 1 || slot > 2047 || !oldSlotSet[slot] || himd.getTrack(slot).firstFragment === 0) {
+          throw new HiMDError('PlayOrder references missing on-disc TrackInfo slot: ' + slot);
+        }
+        keptSlotSet[slot] = true;
+      } else {
+        throw new HiMDError('Invalid PlayOrder entry at index ' + i);
+      }
+    }
+
+    for (let i = 0; i < slotMetadata.length; i++) {
+      const sm = slotMetadata[i];
+      if (!sm || typeof sm.slot !== 'number' || !keptSlotSet[sm.slot | 0]) {
+        throw new HiMDError('slotMetadata entry references unkept or invalid slot at index ' + i);
+      }
+    }
+
+    const slotsToFree = [];
+    const slotsToFreeSet = {};
+    if (manifest.freeUnreferencedSlots !== false) {
+      for (let i = 0; i < oldCount; i++) {
+        const s = oldPlayOrder[i];
+        if (s >= 1 && !keptSlotSet[s] && !slotsToFreeSet[s]) {
+          slotsToFreeSet[s] = true;
+          slotsToFree.push(s);
+        }
+      }
+    }
+
+    if (countFreeTrackSlots(himd) + slotsToFree.length < uploadPlans.length) {
+      throw new HiMDError('Not enough free Hi-MD TrackInfo slots for batch upload');
+    }
+
+    const needsSecureSession = uploadPlans.length > 0 || slotsToFree.length > 0;
+    let session = null;
+    if (needsSecureSession) {
+      session = new HiMDSecureSession(himd, fs.driver);
+      await session.performAuthentication();
+    }
+
+    if (slotsToFree.length > 0) {
+      const blocksToFree = [];
+      const zeroMac = new Uint8Array(8).fill(0);
+      for (let i = 0; i < slotsToFree.length; i++) {
+        const slot = slotsToFree[i];
+        const trk = himd.getTrack(slot);
+        let frag = trk.firstFragment;
+        while (frag !== 0) {
+          const fragObj = himd.getFragment(frag);
+          let firstBlock = fragObj.firstBlock;
+          let length = fragObj.lastBlock - fragObj.firstBlock + 1;
+          if ((firstBlock % 2) === 1) {
+            firstBlock++;
+            length--;
+          }
+          if ((length % 2) === 1) {
+            length--;
+          }
+          if (length > 0) {
+            blocksToFree.push({ firstBlock, length });
+          }
+          const nextFrag = fragObj.nextFragment;
+          himd.removeFragment(frag);
+          frag = nextFrag;
+        }
+        if (trk.albumIndex) himd.removeString(trk.albumIndex);
+        if (trk.artistIndex) himd.removeString(trk.artistIndex);
+        if (trk.titleIndex) himd.removeString(trk.titleIndex);
+        himd.removeTrack(slot);
+        session.allMacs.set(zeroMac, (slot - 1) * 8);
+      }
+      if (blocksToFree.length > 0) {
+        const keptKeys = Object.keys(keptSlotSet);
+        const visitedFrags = {};
+        for (let k = 0; k < keptKeys.length; k++) {
+          const slot = Number(keptKeys[k]) | 0;
+          let frag = himd.getTrack(slot).firstFragment;
+          while (frag !== 0 && !visitedFrags[frag]) {
+            visitedFrags[frag] = true;
+            const fragObj = himd.getFragment(frag);
+            const origFirst = fragObj.firstBlock;
+            let shift = 0;
+            for (let b = 0; b < blocksToFree.length; b++) {
+              if (origFirst > blocksToFree[b].firstBlock) {
+                shift += blocksToFree[b].length;
+              }
+            }
+            if (shift > 0) {
+              fragObj.firstBlock -= shift;
+              fragObj.lastBlock -= shift;
+              himd.writeFragment(frag, fragObj);
+            }
+            frag = fragObj.nextFragment;
+          }
+        }
+        const fileRegions = [];
+        for (let b = 0; b < blocksToFree.length; b++) {
+          fileRegions.push({
+            startByte: blocksToFree[b].firstBlock * BLOCK_SIZE,
+            length: blocksToFree[b].length * BLOCK_SIZE,
+          });
+        }
+        await himd.filesystem.freeFileRegions(himd.getDatanumDependentName('ATDATA'), fileRegions);
+      }
+    }
+
+    const uploadIdToSlot = {};
+    let blocksWrittenTotal = 0;
+    let bytesWrittenTotal = 0;
+
+    if (uploadPlans.length > 0) {
+      const atdata = await himd.openAtdataForWriting();
+      try {
+        const readBuf = new Uint8Array(HIMD_AUDIO_SIZE);
+        const ivZero = new Uint8Array(8).fill(0);
+        const resvZero = new Uint8Array(4).fill(0);
+        const progTotal = Math.max(1, totalEstBlocks);
+        reportHostStep(0, progTotal);
+
+        for (let i = 0; i < uploadPlans.length; i++) {
+          const uPlan = uploadPlans[i];
+          const type = __utf8EncodeImpl(uPlan.typeString);
+          const mCode = uPlan.typeString === 'LPCM' ? 0x0124 : 3;
+          const slot = himd.getNextFreeTrackSlot();
+          if (slot <= 0) {
+            throw new HiMDError('Hi-MD TrackInfo freelist exhausted');
+          }
+          const totalFramesEst = Math.ceil(uPlan.fileSize / uPlan.bytesPerFrame);
+          const estSeconds =
+            uPlan.durationSeconds > 0
+              ? Math.round(uPlan.durationSeconds)
+              : Math.round(getSeconds(uPlan.codecInfo, totalFramesEst));
+          const trackData = {
+            albumIndex: 0,
+            artistIndex: 0,
+            titleIndex: 0,
+            trackNumber: slot,
+            firstFragment: 0,
+            ekbNumber: 0x00010012,
+            cc: 68,
+            cn: 0,
+            ct: 0,
+            dest: 0,
+            lt: 1,
+            xcc: 1,
+            key: new Uint8Array(0),
+            mac: new Uint8Array(0),
+            contentId: new Uint8Array(0),
+            licenseEndTime: DOSTIME_NULL,
+            licenseStartTime: DOSTIME_NULL,
+            seconds: Math.max(0, Math.min(65535, estSeconds)),
+            recordingTime: DOSTIME_NULL,
+            trackInAlbum: 0,
+            codecId: uPlan.codecInfo.codecId,
+            codecInfo: uPlan.codecInfo.codecInfo,
+          };
+
+          const cryptoSignedData = await session.createAndSignNewTrack(trackData);
+          const keyForFragment = createRandomBytes(8);
+          const lo32ContentId = getUint32(cryptoSignedData.contentId, 16) >>> 0;
+
+          const writeStream = new HiMDWriteStream(
+            himd,
+            atdata,
+            true,
+            cryptoSignedData.trackKey,
+            keyForFragment
+          );
+
+          let blockIdx = 0;
+          let lastFrameInFragment = 0;
+          const ufd = h.fileOpen(uPlan.file, 0);
+          try {
+            while (true) {
+              const nRead = h.fileRead(ufd, readBuf, uPlan.blockPayloadCap);
+              if (nRead <= 0) break;
+              let effectiveRead = nRead;
+              if (uPlan.typeString === 'LPCM' && (nRead % uPlan.bytesPerFrame) !== 0) {
+                const paddedBytes = Math.ceil(nRead / uPlan.bytesPerFrame) * uPlan.bytesPerFrame;
+                for (let z = nRead; z < paddedBytes; z++) readBuf[z] = 0;
+                effectiveRead = paddedBytes;
+              }
+              const framesInThisBlock = Math.floor(effectiveRead / uPlan.bytesPerFrame);
+              if (framesInThisBlock === 0) break;
+              const bytesInThisBlock = framesInThisBlock * uPlan.bytesPerFrame;
+              bytesWrittenTotal += bytesInThisBlock;
+              lastFrameInFragment = framesInThisBlock - 1;
+
+              const keyForBlock = createRandomBytes(8);
+              const audioSlice =
+                bytesInThisBlock === readBuf.length
+                  ? readBuf
+                  : readBuf.subarray(0, bytesInThisBlock);
+
+              const audioBlock = {
+                audioData: audioSlice,
+                backupKey: keyForBlock,
+                backupMCode: mCode,
+                backupReserved: 0,
+                backupSerialNumber: blockIdx,
+                backupType: type,
+                iv: ivZero,
+                key: keyForBlock,
+                lendata: 0,
+                lo32ContentId,
+                mCode,
+                nFrames: 0,
+                reserved1: 0,
+                reserved2: resvZero,
+                serialNumber: blockIdx,
+                type,
+              };
+              await writeStream.writeAndEncryptAudioBlock(audioBlock);
+              blockIdx++;
+              blocksWrittenTotal++;
+              reportHostStep(Math.min(blocksWrittenTotal, progTotal), progTotal);
+            }
+          } finally {
+            h.fileClose(ufd);
+          }
+
+          if (blockIdx === 0) {
+            await writeStream.close();
+            throw new HiMDError('Input file contained fewer than one complete Hi-MD audio frame');
+          }
+
+          const { firstBlock, lastBlock } = await writeStream.close();
+          const fragment = {
+            firstBlock,
+            lastBlock,
+            key: keyForFragment,
+            nextFragment: 0,
+            fragmentType: 0,
+            firstFrame: 0,
+            lastFrame: Math.max(0, lastFrameInFragment),
+          };
+          trackData.firstFragment = himd.addFragment(fragment);
+          if (uPlan.title.length > 0) {
+            trackData.titleIndex = himd.addString(uPlan.title, HiMDStringType.TITLE);
+          }
+          if (uPlan.artist.length > 0) {
+            trackData.artistIndex = himd.addString(uPlan.artist, HiMDStringType.ARTIST);
+          }
+          if (uPlan.album.length > 0) {
+            trackData.albumIndex = himd.addString(uPlan.album, HiMDStringType.ALBUM);
+          }
+
+          const allocatedSlot = himd.addTrack(trackData);
+          if (allocatedSlot !== slot) {
+            throw new HiMDError('Unexpected TrackInfo slot allocation mismatch');
+          }
+          uploadIdToSlot[uPlan.id] = allocatedSlot;
+        }
+      } finally {
+        await atdata.close();
+      }
+    }
+
+    for (let i = 0; i < slotMetadata.length; i++) {
+      const sm = slotMetadata[i];
+      const slot = sm.slot | 0;
+      const trk = himd.getTrack(slot);
+      if (sm.title !== undefined) {
+        if (trk.titleIndex) himd.removeString(trk.titleIndex);
+        const sTitle = sm.title === null ? '' : String(sm.title);
+        trk.titleIndex = sTitle.length > 0 ? himd.addString(sTitle, HiMDStringType.TITLE) : 0;
+      }
+      if (sm.artist !== undefined) {
+        if (trk.artistIndex) himd.removeString(trk.artistIndex);
+        const sArtist = sm.artist === null ? '' : String(sm.artist);
+        trk.artistIndex = sArtist.length > 0 ? himd.addString(sArtist, HiMDStringType.ARTIST) : 0;
+      }
+      if (sm.album !== undefined) {
+        if (trk.albumIndex) himd.removeString(trk.albumIndex);
+        const sAlbum = sm.album === null ? '' : String(sm.album);
+        trk.albumIndex = sAlbum.length > 0 ? himd.addString(sAlbum, HiMDStringType.ALBUM) : 0;
+      }
+      himd.writeTrack(slot, trk);
+    }
+
+    const finalSlots = [];
+    for (let i = 0; i < playOrder.length; i++) {
+      const entry = playOrder[i];
+      finalSlots.push(
+        entry.uploadId ? uploadIdToSlot[entry.uploadId] : (entry.existingSlot | 0)
+      );
+    }
+    for (let i = 0; i < finalSlots.length; i++) {
+      himd.writeTrackIndexToTrackSlot(i, finalSlots[i]);
+    }
+    for (let i = finalSlots.length; i < oldCount; i++) {
+      himd.writeTrackIndexToTrackSlot(i, 0);
+    }
+    himd.writeTrackCount(finalSlots.length);
+
+    const seenFinalSlot = {};
+    for (let i = 0; i < finalSlots.length; i++) {
+      const s = finalSlots[i];
+      if (!seenFinalSlot[s]) {
+        seenFinalSlot[s] = true;
+        const trk = himd.getTrack(s);
+        trk.trackNumber = i + 1;
+        himd.writeTrack(s, trk);
+      }
+    }
+
+    if (manifest.discTitle !== undefined) {
+      const dt = manifest.discTitle === null ? '' : String(manifest.discTitle);
+      renameDisc(himd, dt.length > 0 ? dt : null);
+    }
+
+    if (groups !== null) {
+      const curGroupCount = himd.getGroupCount();
+      for (let i = curGroupCount - 1; i >= 0; i--) {
+        deleteGroup(himd, i);
+      }
+      for (let i = 0; i < sortedGroups.length; i++) {
+        const g = sortedGroups[i];
+        addGroup(
+          himd,
+          g.title.length > 0 ? g.title : null,
+          g.startIndex,
+          g.endIndex - g.startIndex
+        );
+      }
+    }
+
+    await himd.flush();
+    if (session !== null) {
+      await session.finalizeSession();
+    }
+    reportHostStep(Math.max(1, totalEstBlocks), Math.max(1, totalEstBlocks));
+
+    return asciiJsonStringify({
+      trackCount: finalSlots.length,
+      uniqueAudioUploaded: uploadPlans.length,
+      freedSlots: slotsToFree.length,
+      blocksWritten: blocksWrittenTotal,
+      bytesWritten: bytesWrittenTotal,
+      datanum: himd.datanum,
+      icvUpdated: session !== null,
+    });
   } finally {
     await fs.driver.close();
   }
@@ -3041,6 +4063,19 @@ export function bridgeWipeDisc(idPtr, idLen, reformat) {
   }
 }
 
+export function bridgeCommitBatch(idPtr, idLen, manifestPtr, manifestLen) {
+  globalThis.__resetPromiseJobs();
+  try {
+    const devId = __utf8DecodeImpl(copyInBytes(idPtr, idLen));
+    const manifestPath = __utf8DecodeImpl(copyInBytes(manifestPtr, manifestLen));
+    const json = __syncAwait(himdCommitBatch(devId, manifestPath));
+    return writeScratchBytes(__utf8EncodeImpl(json));
+  } catch (err) {
+    copyLastHostError(err && err.message ? err.message : String(err));
+    return -1;
+  }
+}
+
 if (globalThis.__cartaPorfforRetain) {
   bridgeListDevices();
   bridgeProbeDevice(0, 0);
@@ -3052,6 +4087,7 @@ if (globalThis.__cartaPorfforRetain) {
   bridgeSetGroups(0, 0, 0, 0);
   bridgeDeleteTracks(0, 0, 0, 0);
   bridgeWipeDisc(0, 0, 0);
+  bridgeCommitBatch(0, 0, 0, 0);
 }
 `
   fs.writeFileSync(entryPath, entryCode, 'utf8')
@@ -3084,6 +4120,7 @@ function patchGeneratedC(cSource) {
   const fnSetGroups = findFn('bridgeSetGroups', 4)
   const fnDeleteTracks = findFn('bridgeDeleteTracks', 4)
   const fnWipeDisc = findFn('bridgeWipeDisc', 3)
+  const fnCommitBatch = findFn('bridgeCommitBatch', 4)
 
   const mainAnchor = `int main(int argc, char** argv) {
   porf_init(argc, argv);
@@ -3356,6 +4393,24 @@ int himd_pf_wipe_disc(const char* id_ptr, int id_len, int reformat) {
     porf_box(0, 0), porf_box(0, 0),
     (f64)(uintptr_t)id_ptr, (f64)id_len,
     (f64)reformat
+  ).val;
+}
+
+CARTA_PF_EXPORT
+int himd_pf_commit_batch(const char* id_ptr,
+                         int id_len,
+                         const char* manifest_ptr,
+                         int manifest_len) {
+  volatile int anchor = 0;
+  porf_c_stack_top = (void*)&anchor;
+  himd_ensure_init();
+  if (!id_ptr || id_len <= 0 || !manifest_ptr || manifest_len <= 0) return -1;
+  g_pf_err[0] = 0;
+  g_pf_out_len = 0;
+  return (int)${fnCommitBatch}(
+    porf_box(0, 0), porf_box(0, 0),
+    (f64)(uintptr_t)id_ptr, (f64)id_len,
+    (f64)(uintptr_t)manifest_ptr, (f64)manifest_len
   ).val;
 }
 

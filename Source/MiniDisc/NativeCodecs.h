@@ -109,6 +109,20 @@ bool encodeHiMdTrackPayload(const std::string& mode, const float* left, const fl
                             std::string& error);
 
 /**
+ * Encodes `trackEndSamples.size()` contiguous tracks continuously inside a single
+ * codec instance and slices frame-aligned raw Hi-MD track payloads at the cumulative
+ * sample boundaries `trackEndSamples = [s_1, s_2, ..., s_K]` (`0 < s_1 < ... < s_K`).
+ * When `trackEndSamples.size() == 1`, delegates directly to `encodeHiMdTrackPayload`.
+ * For `K >= 2`, concatenating `outTrackPayloads[0..K-1]` equals the continuous single-stream
+ * encoding of `[0, s_K)` bit-for-bit (preserving MDCT overlap across track boundaries).
+ */
+bool encodeHiMdContinuousTracks(const std::string& mode, const float* left, const float* right,
+                                int channels, const std::vector<int>& trackEndSamples,
+                                std::vector<std::vector<std::uint8_t>>& outTrackPayloads,
+                                const std::function<void(int, int)>& progressCallback,
+                                std::string& error);
+
+/**
  * Renders a half-open session timeline range `[startSample, endSample)` at 44.1 kHz.
  * Clears output vectors and populates `error` on invalid geometry or unsupported sample rate.
  */

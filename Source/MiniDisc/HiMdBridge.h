@@ -95,6 +95,8 @@ struct HiMdPreflightReport {
     bool valid = false;
     int tracksToUpload = 0;
     int uniqueAudioTracksToUpload = 0;
+    int preservedOnDiscTracks = 0;
+    int newUniqueAudioTracks = 0;
     std::int64_t estimatedAudioBytes = 0;
     std::int64_t unaliasedAudioBytes = 0;
     std::int64_t savedBytes = 0;
@@ -104,7 +106,7 @@ struct HiMdPreflightReport {
     std::string error;
 };
 
-/** Summary of a completed `recordHiMdDisc` operation. */
+/** Summary of a completed `recordHiMdDisc` or `writeHiMdIndex` operation. */
 struct HiMdRecordResult {
     bool ok = false;
     bool hardwareConfirmed = false;
@@ -112,9 +114,14 @@ struct HiMdRecordResult {
     std::string deviceName;
     std::string discTitle;
     int uploadedTracks = 0;
+    int uniqueAudioTracksUploaded = 0;
+    int preservedAudioSlots = 0;
+    int freedAudioSlots = 0;
+    int gaplessRuns = 0;
     std::int64_t uploadedBytes = 0;
     std::int64_t blocksWritten = 0;
     int datanum = 0;
+    bool icvUpdated = false;
     std::string error;
 };
 
@@ -172,11 +179,20 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
                                            const HiMdDeviceStatus* deviceStatus = nullptr);
 
 /**
- * Renders, encodes, and uploads all tracks in `disc` from `session` to `deviceId`, then applies
- * disc title and groups. Hardware confirmation is verified BEFORE rendering or encoding begins.
+ * Renders, encodes, and commits all unique audio items, Play Order aliases,
+ * gapless continuous runs, disc title, and groups in `disc` from `session` to `deviceId`
+ * in one atomic session. Hardware confirmation is verified BEFORE rendering or encoding.
  */
 bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::string& deviceId,
                     bool confirmHardware, HiMdRecordResult& outResult, std::string& error);
+
+/**
+ * Commits non-destructive Play Order, slot metadata, disc title, group, and deletion changes
+ * for a loaded Hi-MD disc (`disc.loadedDisc.active == true`) without re-encoding or uploading
+ * new local audio. Hardware confirmation is verified BEFORE any device write.
+ */
+bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confirmHardware,
+                    HiMdRecordResult& outResult, std::string& error);
 
 /** Dumps track `trackIndex` (0-based) to `outPath` as raw decrypted audio (`rawAudio=true`) or
  * EA3/WAV container (`rawAudio=false`). */

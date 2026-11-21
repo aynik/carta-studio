@@ -4962,8 +4962,9 @@ struct Studio::IpcRouter {
     static juce::var handleHiMd(Studio& studio, const juce::StringArray& args) {
         if (args.size() < 2) {
             return ipcReply(false,
-                            "Usage: himd devices|status|probe|preflight|load-disc|record|dump|"
-                            "rename-disc|rename-track|move-track|set-groups|delete-tracks|wipe ...");
+                            "Usage: himd devices|status|probe|preflight|load-disc|write-index|"
+                            "record|dump|rename-disc|rename-track|move-track|set-groups|"
+                            "delete-tracks|wipe ...");
         }
         const auto sub = args[1];
         if (sub == "devices") {
@@ -5051,6 +5052,8 @@ struct Studio::IpcRouter {
             preObj->setProperty("valid", pre.valid);
             preObj->setProperty("tracks_to_upload", pre.tracksToUpload);
             preObj->setProperty("unique_audio_tracks_to_upload", pre.uniqueAudioTracksToUpload);
+            preObj->setProperty("preserved_on_disc_tracks", pre.preservedOnDiscTracks);
+            preObj->setProperty("new_unique_audio_tracks", pre.newUniqueAudioTracks);
             preObj->setProperty("estimated_audio_bytes",
                                 static_cast<juce::int64>(pre.estimatedAudioBytes));
             preObj->setProperty("unaliased_audio_bytes",
@@ -5196,6 +5199,9 @@ struct Studio::IpcRouter {
             }
             const auto masterSamples = carta::projectEndSample(snapshot);
             for (size_t ti = 0; ti < snapshot.mdDisc.tracks.size(); ++ti) {
+                if (carta::mdTrackUsesOnDiscAudio(snapshot.mdDisc, snapshot.mdDisc.tracks[ti])) {
+                    continue;
+                }
                 for (const auto& part : snapshot.mdDisc.tracks[ti].parts) {
                     if (part.startSample < 0 || part.endSample <= part.startSample ||
                         part.endSample > masterSamples) {
@@ -5209,6 +5215,58 @@ struct Studio::IpcRouter {
             auto* root = new juce::DynamicObject();
             root->setProperty("started", true);
             root->setProperty("operation", "record");
+            root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+            return ipcReply(true, juce::var(root));
+        }
+
+        if (sub == "write-index") {
+            if (args.size() > 4) {
+                return ipcReply(false, "Usage: himd write-index [DEVICE_ID] [confirm-hardware]");
+            }
+            if (studio.hiMdBusy.load() || studio.netMdBusy.load()) {
+                return ipcReply(false, "Wait for the active MiniDisc hardware operation to finish.");
+            }
+            bool confirmHw = false;
+            juce::String explicitDevId;
+            for (int i = 2; i < args.size(); ++i) {
+                if (args[i] == "confirm-hardware") {
+                    confirmHw = true;
+                } else if (explicitDevId.isEmpty()) {
+                    explicitDevId = args[i];
+                } else {
+                    return ipcReply(false,
+                                    "Usage: himd write-index [DEVICE_ID] [confirm-hardware]");
+                }
+            }
+            std::string resolveErr;
+            const std::string devId = studio.resolveActiveHiMdDeviceId(explicitDevId, resolveErr);
+            if (devId.empty()) {
+                return ipcReply(false, juce::String::fromUTF8(resolveErr.c_str()));
+            }
+            juce::String guardErr;
+            if (!checkConfirm(devId, confirmHw, guardErr)) {
+                return ipcReply(false, guardErr);
+            }
+            carta::Session snapshot;
+            {
+                const juce::ScopedLock guard(studio.lock);
+                studio.copyWorkerSnapshot(snapshot);
+            }
+            if (!snapshot.mdDisc.loadedDisc.active) {
+                return ipcReply(false, "himd write-index requires a loaded Hi-MD disc.");
+            }
+            for (std::size_t ti = 0; ti < snapshot.mdDisc.tracks.size(); ++ti) {
+                if (!carta::mdTrackUsesOnDiscAudio(snapshot.mdDisc, snapshot.mdDisc.tracks[ti])) {
+                    return ipcReply(false,
+                                    "Hi-MD write-index cannot upload new local audio on track " +
+                                        juce::String(static_cast<int>(ti + 1)) +
+                                        "; use himd record instead.");
+                }
+            }
+            studio.startHiMdWriteIndexJob(snapshot, devId, confirmHw, false);
+            auto* root = new juce::DynamicObject();
+            root->setProperty("started", true);
+            root->setProperty("operation", "write-index");
             root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
             return ipcReply(true, juce::var(root));
         }
@@ -5512,8 +5570,9 @@ struct Studio::IpcRouter {
         }
 
         return ipcReply(false,
-                        "Usage: himd devices|status|probe|preflight|load-disc|record|dump|"
-                        "rename-disc|rename-track|move-track|set-groups|delete-tracks|wipe ...");
+                        "Usage: himd devices|status|probe|preflight|load-disc|write-index|"
+                        "record|dump|rename-disc|rename-track|move-track|set-groups|"
+                        "delete-tracks|wipe ...");
     }
 
     static juce::var handleStatus(Studio& studio) {

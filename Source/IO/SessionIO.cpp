@@ -1654,6 +1654,9 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
             ro->setProperty("timelineStartSample", static_cast<juce::int64>(r.timelineStartSample));
             ro->setProperty("timelineEndSample", static_cast<juce::int64>(r.timelineEndSample));
             ro->setProperty("audioDownloaded", r.audioDownloaded);
+            if (r.hiMdSlot > 0) {
+                ro->setProperty("hiMdSlot", r.hiMdSlot);
+            }
             regs.add(rv);
         }
         lo->setProperty("regions", regs);
@@ -1987,6 +1990,15 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
                         return false;
                     }
                     reg.audioDownloaded = static_cast<bool>(rv["audioDownloaded"]);
+                }
+                if (rv.getDynamicObject()->hasProperty("hiMdSlot")) {
+                    juce::int64 hiMdSlot = 0;
+                    if (!integerValue(rv["hiMdSlot"], hiMdSlot) || hiMdSlot < 0 ||
+                        hiMdSlot > kHiMdMaxAudioSlots) {
+                        error = "Invalid hiMdSlot in loadedDisc region.";
+                        return false;
+                    }
+                    reg.hiMdSlot = static_cast<int>(hiMdSlot);
                 }
                 ld.regions.push_back(std::move(reg));
             }

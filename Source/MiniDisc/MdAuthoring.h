@@ -112,13 +112,14 @@ struct MdOnDiscRegion {
     std::int64_t timelineStartSample = 0;
     std::int64_t timelineEndSample = 0;
     bool audioDownloaded = false;
+    int hiMdSlot = 0;
 
     bool operator==(const MdOnDiscRegion& o) const noexcept {
         return id == o.id && codec == o.codec && rawModeByte == o.rawModeByte &&
                physStart == o.physStart && physEnd == o.physEnd && unitCount == o.unitCount &&
                timelineStartSample == o.timelineStartSample &&
                timelineEndSample == o.timelineEndSample &&
-               audioDownloaded == o.audioDownloaded;
+               audioDownloaded == o.audioDownloaded && hiMdSlot == o.hiMdSlot;
     }
     bool operator!=(const MdOnDiscRegion& o) const noexcept { return !(*this == o); }
 };

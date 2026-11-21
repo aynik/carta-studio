@@ -1129,16 +1129,78 @@ void Studio::startHiMdRecordJob(carta::Session&& snapshotIn, const std::string& 
             o->setProperty("device_name", juce::String::fromUTF8(rec.deviceName.c_str()));
             o->setProperty("disc_title", juce::String::fromUTF8(rec.discTitle.c_str()));
             o->setProperty("uploaded_tracks", rec.uploadedTracks);
+            o->setProperty("unique_audio_tracks", rec.uniqueAudioTracksUploaded);
+            o->setProperty("preserved_slots", rec.preservedAudioSlots);
+            o->setProperty("freed_slots", rec.freedAudioSlots);
+            o->setProperty("gapless_runs", rec.gaplessRuns);
             o->setProperty("uploaded_bytes", static_cast<juce::int64>(rec.uploadedBytes));
             o->setProperty("blocks_written", static_cast<juce::int64>(rec.blocksWritten));
             o->setProperty("datanum", rec.datanum);
+            o->setProperty("icv_updated", rec.icvUpdated);
             o->setProperty("hardware_confirmed", rec.hardwareConfirmed);
             result = juce::var(o);
 
-            uiStatus = "Recorded " + juce::String(rec.uploadedTracks) +
-                       " track(s) (" +
-                       juce::String(static_cast<double>(rec.uploadedBytes) / (1024.0 * 1024.0), 2) +
-                       " MB) to Hi-MD.";
+            const juce::String mbStr(static_cast<double>(rec.uploadedBytes) / (1024.0 * 1024.0),
+                                     2);
+            if (rec.preservedAudioSlots > 0) {
+                uiStatus = "Committed Hi-MD (" + juce::String(rec.uploadedTracks) +
+                           " Play Order track(s): " + juce::String(rec.preservedAudioSlots) +
+                           " preserved, " + juce::String(rec.uniqueAudioTracksUploaded) +
+                           " new, " + mbStr + " MB).";
+            } else if (rec.uniqueAudioTracksUploaded > 0 &&
+                       rec.uniqueAudioTracksUploaded < rec.uploadedTracks) {
+                uiStatus = "Recorded " + juce::String(rec.uploadedTracks) +
+                           " Play Order track(s) (" + juce::String(rec.uniqueAudioTracksUploaded) +
+                           " unique audio, " + mbStr + " MB) to Hi-MD.";
+            } else {
+                uiStatus = "Recorded " + juce::String(rec.uploadedTracks) + " track(s) (" + mbStr +
+                           " MB) to Hi-MD.";
+            }
+            return true;
+        });
+}
+
+void Studio::startHiMdWriteIndexJob(const carta::Session& snapshot, const std::string& devId,
+                                    bool confirmHardware, bool showAlerts) {
+    launchHiMdWorker(
+        "write-index", devId, "Writing Hi-MD Play Order & metadata index...",
+        [snapCopy = snapshot, devId, confirmHardware, showAlerts](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody, std::optional<carta::HiMdDeviceStatus>& afterStatus) mutable {
+            carta::HiMdRecordResult rec{};
+            if (!carta::writeHiMdIndex(snapCopy.mdDisc, devId, confirmHardware, rec, err)) {
+                uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Write Hi-MD Index Failed";
+                    alertBody = uiStatus;
+                }
+                return false;
+            }
+
+            carta::HiMdDeviceStatus refreshed{};
+            std::string probeErr;
+            if (carta::probeHiMdDevice(devId, refreshed, probeErr)) {
+                afterStatus = refreshed;
+            }
+
+            auto* o = new juce::DynamicObject();
+            o->setProperty("committed_index", true);
+            o->setProperty("device_id", juce::String::fromUTF8(rec.deviceId.c_str()));
+            o->setProperty("disc_title", juce::String::fromUTF8(rec.discTitle.c_str()));
+            o->setProperty("track_count", rec.uploadedTracks);
+            o->setProperty("preserved_slots", rec.preservedAudioSlots);
+            o->setProperty("freed_slots", rec.freedAudioSlots);
+            o->setProperty("datanum", rec.datanum);
+            o->setProperty("icv_updated", rec.icvUpdated);
+            result = juce::var(o);
+
+            uiStatus = "Committed Hi-MD index (" + juce::String(rec.uploadedTracks) +
+                       " Play Order track(s), " + juce::String(rec.preservedAudioSlots) +
+                       " preserved slot(s)" +
+                       (rec.freedAudioSlots > 0
+                            ? (", freed " + juce::String(rec.freedAudioSlots) + " slot(s)")
+                            : juce::String()) +
+                       ").";
             return true;
         });
 }
@@ -1587,26 +1649,44 @@ void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt)
             snap.badgeText = "Hi-MD USB" + dot + vid + " " + pid + dot +
                              juce::String(st.trackCount) + " trk" + dot + "DATANUM " +
                              juce::String(st.datanum);
+            const bool loadedActive = session.mdDisc.loadedDisc.active;
             snap.canLoadDisc = true;
             snap.canDumpTrack = !st.tracks.empty();
             snap.canErase = true;
             snap.canManageHiMd = true;
-            snap.canRecord = discIsHiMd && pre.valid && st.trackCount == 0 &&
+            snap.canRecord = discIsHiMd && pre.valid &&
+                             (loadedActive || st.trackCount == 0) &&
+                             (!session.mdDisc.tracks.empty() || loadedActive) &&
                              pendingImports.empty();
 
             if (!discIsHiMd) {
                 snap.statusText =
                     "Switch Target Medium to Hi-MD 300M or Hi-MD 1GB to record to this Hi-MD "
                     "device.";
-            } else if (st.trackCount > 0) {
+            } else if (!loadedActive && st.trackCount > 0) {
                 snap.statusText = "Hi-MD disc has " + juce::String(st.trackCount) +
                                   " track(s) — click Load Disc, Dump Track..., Disc Tools..., or "
                                   "Wipe Disc...";
-            } else if (session.mdDisc.tracks.empty()) {
+            } else if (session.mdDisc.tracks.empty() && !loadedActive) {
                 snap.statusText = "Hi-MD ready (" + juce::String::fromUTF8(st.deviceName.c_str()) +
                                   "). Add tracks or click Load Disc.";
             } else if (!pre.valid) {
                 snap.statusText = juce::String::fromUTF8(pre.error.c_str());
+            } else if (loadedActive) {
+                const double reqMb =
+                    static_cast<double>(pre.requiredBytes) / (1024.0 * 1024.0);
+                if (pre.newUniqueAudioTracks == 0) {
+                    snap.statusText = "Ready to update Hi-MD Play Order/index (preserving " +
+                                      juce::String(pre.preservedOnDiscTracks) +
+                                      " on-disc track(s), 0 new audio).";
+                } else {
+                    snap.statusText = "Ready (preserve " +
+                                      juce::String(pre.preservedOnDiscTracks) +
+                                      " on-disc, upload " +
+                                      juce::String(pre.newUniqueAudioTracks) +
+                                      " new unique audio, " +
+                                      juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB).";
+                }
             } else {
                 const double reqMb =
                     static_cast<double>(pre.requiredBytes) / (1024.0 * 1024.0);
@@ -1944,10 +2024,30 @@ void Studio::triggerRecordStartFromUi() {
         const auto pre = carta::preflightHiMdRecording(
             discCopy, cachedHiMdStatus.has_value() ? &(*cachedHiMdStatus) : nullptr);
         const double reqMb = static_cast<double>(pre.requiredBytes) / (1024.0 * 1024.0);
-        const juce::String promptMsg =
-            "Encode and upload " + juce::String(pre.tracksToUpload) + " track(s) (" +
-            juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB) to Hi-MD device '" + selectedId +
-            "'?";
+        juce::String promptMsg;
+        if (discCopy.loadedDisc.active) {
+            if (pre.newUniqueAudioTracks == 0) {
+                promptMsg = "Update Hi-MD index on '" + selectedId + "' (preserving " +
+                            juce::String(pre.preservedOnDiscTracks) +
+                            " on-disc track(s), 0 new uploads)?";
+            } else {
+                promptMsg = "Preserve " + juce::String(pre.preservedOnDiscTracks) +
+                            " on-disc track(s) and upload " +
+                            juce::String(pre.newUniqueAudioTracks) + " new unique audio item(s) (" +
+                            juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) +
+                            " MB) to Hi-MD device '" + selectedId + "'?";
+            }
+        } else if (pre.uniqueAudioTracksToUpload < pre.tracksToUpload) {
+            promptMsg = "Encode and upload " + juce::String(pre.uniqueAudioTracksToUpload) +
+                        " unique audio item(s) for " + juce::String(pre.tracksToUpload) +
+                        " Play Order track(s) (" +
+                        juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB) to Hi-MD device '" +
+                        selectedId + "'?";
+        } else {
+            promptMsg = "Encode and upload " + juce::String(pre.tracksToUpload) + " track(s) (" +
+                        juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB) to Hi-MD device '" +
+                        selectedId + "'?";
+        }
         showGuardedStudioAlert(
             juce::MessageBoxOptions()
                 .withIconType(juce::MessageBoxIconType::WarningIcon)
@@ -2088,10 +2188,21 @@ void Studio::triggerHiMdDiscToolsMenuFromUi() {
     const int nTracks =
         cachedHiMdStatus.has_value() ? static_cast<int>(cachedHiMdStatus->tracks.size()) : 0;
     const bool hasTracks = selTrack >= 0 && selTrack < nTracks;
+    bool canWriteIndex = session.mdDisc.loadedDisc.active &&
+                         carta::isHiMdMedium(session.mdDisc.medium);
+    if (canWriteIndex) {
+        for (const auto& tr : session.mdDisc.tracks) {
+            if (!carta::mdTrackUsesOnDiscAudio(session.mdDisc, tr)) {
+                canWriteIndex = false;
+                break;
+            }
+        }
+    }
 
     juce::PopupMenu menu;
     menu.addItem(1, "Rename Hi-MD Disc...");
     menu.addItem(2, "Sync Session Groups to Hi-MD", !session.mdDisc.groups.empty() && nTracks > 0);
+    menu.addItem(8, "Write Session Index Only...", canWriteIndex);
     menu.addSeparator();
     menu.addItem(3, "Edit Selected Track Metadata...", hasTracks);
     menu.addItem(4, "Move Selected Track Up", hasTracks && selTrack > 0);
@@ -2108,6 +2219,8 @@ void Studio::triggerHiMdDiscToolsMenuFromUi() {
                                safe->triggerHiMdRenameDiscFromUi();
                            } else if (choice == 2) {
                                safe->triggerHiMdSyncGroupsFromUi();
+                           } else if (choice == 8) {
+                               safe->triggerHiMdWriteIndexFromUi();
                            } else if (choice == 3) {
                                safe->triggerHiMdRenameTrackFromUi(selTrack);
                            } else if (choice == 4) {
@@ -2238,6 +2351,44 @@ void Studio::triggerHiMdSyncGroupsFromUi() {
     }
     startHiMdSetGroupsJob(selectedId.toStdString(), session.mdDisc.groups,
                           cachedHiMdStatus->trackCount, true, true);
+}
+
+void Studio::triggerHiMdWriteIndexFromUi() {
+    if (netMdBusy.load() || hiMdBusy.load() || !discWorkspace.selectedRecordDeviceIsHiMd()) {
+        status.setText("Wait for the current MiniDisc operation to finish.",
+                       juce::dontSendNotification);
+        return;
+    }
+    const auto selectedId = discWorkspace.selectedRecordDeviceId();
+    if (selectedId.isEmpty()) {
+        status.setText("Select or refresh a Hi-MD device first.", juce::dontSendNotification);
+        return;
+    }
+    const std::string devId = selectedId.toStdString();
+    showGuardedStudioAlert(
+        juce::MessageBoxOptions()
+            .withIconType(juce::MessageBoxIconType::WarningIcon)
+            .withTitle("Write Hi-MD Session Index")
+            .withMessage("Write edited Play Order, titles, metadata, and groups from the "
+                         "current session to Hi-MD device '" +
+                         selectedId +
+                         "' without re-encoding preserved audio? Unreferenced deleted tracks "
+                         "will be freed.")
+            .withButton("Write Index")
+            .withButton("Cancel")
+            .withAssociatedComponent(this),
+        [safe = juce::Component::SafePointer<Studio>(this), devId](int answer) {
+            if (safe == nullptr || answer != 0 || safe->netMdBusy.load() ||
+                safe->hiMdBusy.load()) {
+                return;
+            }
+            carta::Session snapshot;
+            {
+                const juce::ScopedLock guard(safe->lock);
+                safe->copyWorkerSnapshot(snapshot);
+            }
+            safe->startHiMdWriteIndexJob(snapshot, devId, true, true);
+        });
 }
 
 // ============================================================================

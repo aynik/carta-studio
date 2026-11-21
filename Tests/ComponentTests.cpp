@@ -1576,11 +1576,29 @@ struct StudioComponentTests {
                           studio.session.mdDisc.medium == carta::MdMedium::himd300 &&
                           studio.session.mdDisc.halfWidthTitle == "Renamed Hi-MD" &&
                           static_cast<int>(studio.session.mdDisc.tracks.size()) == expectedTracks &&
+                          !studio.session.mdDisc.loadedDisc.regions.empty() &&
+                          studio.session.mdDisc.loadedDisc.regions[0].hiMdSlot > 0 &&
                           studio.session.mdDisc.tracks[1].halfWidthTitle == "New Tr0" &&
                           studio.session.mdDisc.tracks[1].artist == "New Artist" &&
                           studio.session.mdDisc.tracks[1].album == "New Album",
-                      "Async himd load-disc populates session loadedDisc, renamed disc, moved "
-                      "track metadata, and groups");
+                      "Async himd load-disc populates session loadedDisc, hiMdSlot, renamed disc, "
+                      "moved track metadata, and groups");
+
+                check(static_cast<bool>(studio.ipcCommand({"disc", "title", "Index Edited"})["ok"]) &&
+                          static_cast<bool>(
+                              studio.ipcCommand({"disc", "track", "alias", "0", "0"})["ok"]) &&
+                          static_cast<bool>(
+                              studio.ipcCommand({"himd", "write-index", "mock:mz-rh1"})["ok"]),
+                      "IPC himd write-index starts async worker on loaded Hi-MD");
+                waitHiMdIdle("Async himd write-index timed out");
+                const auto idxDone = studio.ipcCommand({"himd", "status"});
+                const auto probeAfterIdx = studio.ipcCommand({"himd", "probe", "mock:mz-rh1"});
+                check(static_cast<bool>(idxDone["result"]["ok"]) &&
+                          static_cast<bool>(idxDone["result"]["result"]["committed_index"]) &&
+                          static_cast<int>(probeAfterIdx["result"]["track_count"]) ==
+                              expectedTracks + 1 &&
+                          probeAfterIdx["result"]["disc_title"].toString() == "Index Edited",
+                      "Async himd write-index commits aliased Play Order and title non-destructively");
 
                 check(static_cast<bool>(
                           studio.ipcCommand({"himd", "delete-tracks", "0", "mock:mz-rh1"})["ok"]),
@@ -1588,9 +1606,8 @@ struct StudioComponentTests {
                 waitHiMdIdle("Async himd delete-tracks timed out");
                 const auto probeAfterDel = studio.ipcCommand({"himd", "probe", "mock:mz-rh1"});
                 check(static_cast<bool>(probeAfterDel["ok"]) &&
-                          static_cast<int>(probeAfterDel["result"]["track_count"]) ==
-                              expectedTracks - 1,
-                      "Async himd delete-tracks decrements on-disc track count");
+                          static_cast<int>(probeAfterDel["result"]["track_count"]) == expectedTracks,
+                      "Async himd delete-tracks decrements on-disc aliased Play Order track count");
 
                 check(static_cast<bool>(studio.ipcCommand({"himd", "wipe", "mock:mz-rh1"})["ok"]),
                       "IPC himd wipe starts async worker");

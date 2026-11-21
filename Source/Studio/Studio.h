@@ -1064,6 +1064,8 @@ class Studio final : public juce::AudioAppComponent,
     void startHiMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
     void startHiMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
                             bool confirmHardware, bool showAlerts = true);
+    void startHiMdWriteIndexJob(const carta::Session& snapshot, const std::string& devId,
+                                bool confirmHardware, bool showAlerts = true);
     void startHiMdDumpJob(const std::string& devId, int trackIndex, const juce::File& outFile,
                           bool rawAudio, bool showAlerts = true);
     void startHiMdRenameDiscJob(const std::string& devId, const std::string& title,
@@ -1089,6 +1091,7 @@ class Studio final : public juce::AudioAppComponent,
     void triggerHiMdMoveTrackFromUi(int trackIndex, int delta);
     void triggerHiMdDeleteTrackFromUi(int trackIndex);
     void triggerHiMdSyncGroupsFromUi();
+    void triggerHiMdWriteIndexFromUi();
 
     // ------------------------------------------------------------------------
     // Analysis, Track Rendering, List Browsers, Audition, and Modal Prompts

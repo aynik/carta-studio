@@ -79,14 +79,6 @@ Usage:
   CartaStudio ipc disc group clear START_TRACK END_TRACK
   CartaStudio ipc disc focus TRACK_INDEX
   CartaStudio ipc disc preview [TRACK_INDEX | from TRACK_INDEX]
-  CartaStudio ipc disc track part add INDEX START END [PART_INDEX]
-  CartaStudio ipc disc track part set INDEX PART_INDEX START END
-  CartaStudio ipc disc track part repeat INDEX PART_INDEX COUNT
-  CartaStudio ipc disc track part remove INDEX PART_INDEX
-  CartaStudio ipc disc group set START_TRACK END_TRACK TITLE [FULL_WIDTH]
-  CartaStudio ipc disc group clear START_TRACK END_TRACK
-  CartaStudio ipc disc focus TRACK_INDEX [PART_INDEX]
-  CartaStudio ipc disc preview [TRACK_INDEX | from TRACK_INDEX]
   CartaStudio ipc meter status|reset  Inspect or reset held output sample peaks
   CartaStudio ipc history list       List undo/redo targets and generation
   CartaStudio ipc history undo|redo STEPS GENERATION REVISION

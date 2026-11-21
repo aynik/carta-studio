@@ -65,6 +65,8 @@ int himd_pf_set_groups(const char* id_ptr, int id_len, const char* groups_json_p
 int himd_pf_delete_tracks(const char* id_ptr, int id_len, const char* indices_json_ptr,
                           int indices_json_len);
 int himd_pf_wipe_disc(const char* id_ptr, int id_len, int reformat);
+int himd_pf_commit_batch(const char* id_ptr, int id_len, const char* manifest_ptr,
+                         int manifest_len);
 const unsigned char* himd_pf_output_ptr(void);
 std::size_t himd_pf_output_len(void);
 const char* himd_pf_last_error(void);
@@ -528,6 +530,33 @@ int cmdWipe(const std::string& deviceId, bool reformat, bool confirmHardware) {
     return 0;
 }
 
+int cmdCommitBatch(const std::string& deviceId, const std::string& manifestPath,
+                   bool confirmHardware) {
+    if (deviceId.empty() || manifestPath.empty()) {
+        emitErrorResult("commit-batch requires <deviceId> and --manifest <path>");
+        return 1;
+    }
+    if (needsHardwareConfirm(deviceId) && !confirmHardware) {
+        emitErrorResult("Refusing to modify Hi-MD hardware without explicit confirmation "
+                        "(--confirm-hardware).");
+        return 1;
+    }
+    carta::ScopedHiMdHardwareWriteConfirmation guard(confirmHardware);
+    carta::setHiMdProgress("commit-batch", "Committing Hi-MD batch session...", 0.0, 0, 1);
+    const int rc = himd_pf_commit_batch(deviceId.c_str(), static_cast<int>(deviceId.size()),
+                                        manifestPath.c_str(),
+                                        static_cast<int>(manifestPath.size()));
+    carta::clearHiMdProgress();
+    if (rc < 0) {
+        emitErrorResult(porfforErrorString("Failed committing Hi-MD batch session"));
+        return 1;
+    }
+    const std::string raw = copyPorfforOutputString();
+    emitJsonLine("{\"event\":\"result\",\"ok\":true,\"batch\":" +
+                 (raw.empty() ? std::string("{}") : raw) + "}");
+    return 0;
+}
+
 int cmdSelftestStack() {
     carta::setMockHiMdEnabled(true);
     carta::resetMockHiMdState();
@@ -787,6 +816,8 @@ bool dispatchSessionLine(const std::string& rawLine, bool enableMock) {
         cmdDeleteTracks(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
     } else if (op == "wipe" && tok.size() >= 4) {
         cmdWipe(percentDecode(tok[1]), tok[2] == "1", tok[3] == "1");
+    } else if (op == "commit-batch" && tok.size() >= 4) {
+        cmdCommitBatch(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
     } else if (op == "mock-reset" && enableMock) {
         carta::resetMockHiMdState();
         emitJsonLine("{\"event\":\"result\",\"ok\":true}");
@@ -1364,6 +1395,7 @@ void printUsage() {
         << "  carta-himd set-groups <device-id> --groups-json <json> [--confirm-hardware]\n"
         << "  carta-himd delete-tracks <device-id> --tracks <csv> [--confirm-hardware]\n"
         << "  carta-himd wipe <device-id> [--reformat] [--confirm-hardware]\n"
+        << "  carta-himd commit-batch <device-id> --manifest <path> [--confirm-hardware]\n"
         << "  carta-himd selftest-stack\n"
         << "  carta-himd session [--mock] [--socket <path> | --pipe <name>] [--client-uid <uid>] "
            "[--client-gid <gid>] [--token-file <path>] [--parent-pid <pid>]\n";
@@ -1591,6 +1623,26 @@ int main(int argc, char** argv) {
             carta::setMockHiMdEnabled(true);
         }
         return cmdWipe(argv[2], reformat, confirm);
+    }
+    if (cmd == "commit-batch") {
+        if (argc < 3) {
+            emitErrorResult(
+                "Usage: carta-himd commit-batch <device-id> --manifest <path> [--confirm-hardware]");
+            return 2;
+        }
+        std::string manifestPath;
+        bool confirm = false;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--manifest") == 0 && i + 1 < argc) {
+                manifestPath = argv[++i];
+            } else if (std::strcmp(argv[i], "--confirm-hardware") == 0) {
+                confirm = true;
+            }
+        }
+        if (carta::isHiMdMockDeviceId(argv[2])) {
+            carta::setMockHiMdEnabled(true);
+        }
+        return cmdCommitBatch(argv[2], manifestPath, confirm);
     }
     if (cmd == "selftest-stack") {
         return cmdSelftestStack();
