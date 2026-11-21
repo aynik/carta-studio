@@ -20,10 +20,11 @@ jobs:
           node-version: 22
       - name: Fetch pinned Porffor alpha-19
         run: node Tools/fetch_porffor.mjs
-      - name: Emit Porffor C sources (codecs + NetMD)
+      - name: Emit Porffor C sources (codecs + NetMD + Hi-MD)
         run: |
           node Tools/build_porffor_codecs.mjs --emit-c-only
           node Tools/build_porffor_netmd.mjs --emit-c-only
+          node Tools/build_porffor_himd.mjs --emit-c-only
       - name: Upload generated C sources
         uses: actions/upload-artifact@v4
         with:
@@ -82,6 +83,7 @@ jobs:
         run: |
           node Tools/build_porffor_codecs.mjs --compile-only
           node Tools/build_porffor_netmd.mjs --compile-only
+          node Tools/build_porffor_himd.mjs --compile-only
 
       - name: Configure & Build (macOS / Linux)
         if: runner.os != 'Windows'
@@ -91,7 +93,7 @@ jobs:
             extra_flags="-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCARTA_LIBUSB_INCLUDE_DIR=/tmp/libusb-prefix/include/libusb-1.0 -DCARTA_LIBUSB_LIBRARY=/tmp/libusb-prefix/lib/libusb-1.0.dylib"
           fi
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF $extra_flags
-          cmake --build build --config Release --target CartaStudio carta-netmd --parallel 4
+          cmake --build build --config Release --target CartaStudio carta-netmd carta-himd --parallel 4
 
       - name: Configure & Build (Windows)
         if: runner.os == 'Windows'
@@ -103,7 +105,7 @@ jobs:
             -DCARTA_LIBUSB_INCLUDE_DIR="$libusbRoot/include" `
             -DCARTA_LIBUSB_LIBRARY="$libusbRoot/VS2022/MS64/dll/libusb-1.0.lib" `
             -DCARTA_LIBUSB_DLL="$libusbRoot/VS2022/MS64/dll/libusb-1.0.dll"
-          cmake --build build --config Release --target CartaStudio carta-netmd --parallel 4
+          cmake --build build --config Release --target CartaStudio carta-netmd carta-himd --parallel 4
 
       - name: Package macOS bundle
         if: runner.os == 'macOS'
@@ -119,7 +121,7 @@ jobs:
           mkdir -p "dist/carta-studio-${{ github.ref_name }}"
           art="build/CartaStudio_artefacts/Release"
           if [ ! -d "$art" ]; then art="build/CartaStudio_artefacts"; fi
-          cp -a "$art/Carta Studio" "$art/carta-netmd" "$art"/*.so "$art/THIRD_PARTY_NOTICES.md" "$art/LICENSE-carta-netmd-GPL-2.0.txt" "dist/carta-studio-${{ github.ref_name }}/"
+          cp -a "$art/Carta Studio" "$art/carta-netmd" "$art/carta-himd" "$art"/*.so "$art/THIRD_PARTY_NOTICES.md" "$art/LICENSE-carta-netmd-GPL-2.0.txt" "$art/LICENSE-carta-himd-GPL-2.0.txt" "dist/carta-studio-${{ github.ref_name }}/"
           tar -czf "dist/Carta-Studio-${{ github.ref_name }}-${{ matrix.label }}.tar.gz" -C dist "carta-studio-${{ github.ref_name }}"
           rm -rf "dist/carta-studio-${{ github.ref_name }}"
 
@@ -129,7 +131,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $art = "build/CartaStudio_artefacts/Release"
-          Compress-Archive -Path "$art/Carta Studio.exe", "$art/carta-netmd.exe", "$art/carta*_porffor.dll", "$art/libusb-1.0.dll", "$art/THIRD_PARTY_NOTICES.md", "$art/LICENSE-carta-netmd-GPL-2.0.txt" -DestinationPath "dist/Carta-Studio-${{ github.ref_name }}-${{ matrix.label }}.zip"
+          Compress-Archive -Path "$art/Carta Studio.exe", "$art/carta-netmd.exe", "$art/carta-himd.exe", "$art/carta*_porffor.dll", "$art/libusb-1.0.dll", "$art/THIRD_PARTY_NOTICES.md", "$art/LICENSE-carta-netmd-GPL-2.0.txt", "$art/LICENSE-carta-himd-GPL-2.0.txt" -DestinationPath "dist/Carta-Studio-${{ github.ref_name }}-${{ matrix.label }}.zip"
 
       - name: Upload release asset
         uses: actions/upload-artifact@v4

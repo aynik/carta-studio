@@ -10,6 +10,10 @@
 #include <juce_core/juce_core.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +21,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #if defined(_WIN32)
@@ -28,10 +33,16 @@
 #endif
 #include <fcntl.h>
 #include <io.h>
+#include <shellapi.h>
 #include <windows.h>
 #else
+#include <cerrno>
 #include <csignal>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -90,6 +101,124 @@ bool& mockGuardStorage() {
     static bool armed = false;
     return armed;
 }
+
+std::atomic<bool>& elevationPromptEnabledStorage() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
+bool containsCaseInsensitive(const std::string& hay, const char* needle) noexcept {
+    if (!needle || needle[0] == '\0') {
+        return false;
+    }
+    const std::size_t nLen = std::strlen(needle);
+    if (hay.size() < nLen) {
+        return false;
+    }
+    for (std::size_t i = 0; i + nLen <= hay.size(); ++i) {
+        bool match = true;
+        for (std::size_t j = 0; j < nLen; ++j) {
+            if (std::tolower(static_cast<unsigned char>(hay[i + j])) !=
+                std::tolower(static_cast<unsigned char>(needle[j]))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class HiMdElevationMode { Auto, Off, Direct, Sudo };
+
+HiMdElevationMode readElevationMode() {
+    const char* raw = std::getenv("CARTA_HIMD_ELEVATION");
+    if (!raw || raw[0] == '\0') {
+        return HiMdElevationMode::Auto;
+    }
+    std::string v(raw);
+    for (char& ch : v) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    if (v == "off" || v == "0" || v == "never" || v == "none") {
+        return HiMdElevationMode::Off;
+    }
+    if (v == "direct") {
+        return HiMdElevationMode::Direct;
+    }
+    if (v == "sudo") {
+        return HiMdElevationMode::Sudo;
+    }
+    return HiMdElevationMode::Auto;
+}
+
+std::string generateSessionTokenHex() {
+    auto& rng = juce::Random::getSystemRandom();
+    std::string out;
+    out.reserve(32);
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (int i = 0; i < 4; ++i) {
+        const auto v = static_cast<std::uint32_t>(rng.nextInt());
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            out.push_back(kHex[(v >> shift) & 0x0Fu]);
+        }
+    }
+    return out;
+}
+
+#if !defined(_WIN32)
+std::string quotePosixShellArg(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+#endif
+
+#if defined(__APPLE__)
+std::string escapeAppleScriptString(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (char c : s) {
+        if (c == '\\' || c == '"') {
+            out.push_back('\\');
+        }
+        out.push_back(c);
+    }
+    return out;
+}
+#endif
+
+#if defined(_WIN32)
+std::string quoteWinCmdArg(const std::string& arg) {
+    std::string quoted = "\"";
+    int bsCount = 0;
+    for (char c : arg) {
+        if (c == '\\') {
+            ++bsCount;
+        } else if (c == '"') {
+            quoted.append(static_cast<std::size_t>(bsCount * 2 + 1), '\\');
+            quoted.push_back('"');
+            bsCount = 0;
+        } else {
+            quoted.append(static_cast<std::size_t>(bsCount), '\\');
+            quoted.push_back(c);
+            bsCount = 0;
+        }
+    }
+    quoted.append(static_cast<std::size_t>(bsCount * 2), '\\');
+    quoted.push_back('"');
+    return quoted;
+}
+#endif
 
 std::string percentEncodeField(const std::string& input) {
     static constexpr char kHex[] = "0123456789ABCDEF";
@@ -603,19 +732,651 @@ bool runOneShotHelper(const std::string& helperPath, const std::vector<std::stri
 
 bool invokeHiMdUnlocked(const std::vector<std::string>& sessionFields,
                         const std::vector<std::string>& cliArgs, bool preferMockSession,
-                        const HelperProgressWindow* window, juce::var& outResult,
-                        std::string& error) {
+                        bool allowElevationPrompt, const HelperProgressWindow* window,
+                        juce::var& outResult, std::string& error);
+
+class PersistentElevatedHiMdSession final {
+  public:
+    ~PersistentElevatedHiMdSession() { stop(); }
+
+    bool isRunning() const noexcept { return activeFlag_.load(std::memory_order_acquire); }
+    bool isMockMode() const noexcept { return mockMode_.load(std::memory_order_acquire); }
+
+    bool ensureStarted(const std::string& helperPath, bool enableMock, bool allowPrompt,
+                       std::string& error) {
+        if (isRunning() && loadedHelperPath_ == helperPath && mockMode_.load() == enableMock) {
+            return true;
+        }
+        stop();
+
+        const auto mode = readElevationMode();
+        if (mode == HiMdElevationMode::Off) {
+            error = "Hi-MD administrator elevation is disabled (CARTA_HIMD_ELEVATION=off).";
+            return false;
+        }
+        if (mode == HiMdElevationMode::Auto && (!allowPrompt || !isHiMdElevationPromptEnabled())) {
+            error = "Administrator privileges required for Hi-MD USB access.";
+            return false;
+        }
+
+        const std::string tokenHex = generateSessionTokenHex();
+        static std::atomic<std::uint64_t> sessSeq{0};
+        const auto seq = ++sessSeq;
+        const auto stamp = static_cast<unsigned long long>(juce::Time::getHighResolutionTicks());
+
+        const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory);
+        const juce::File tokenFile = tempDir.getChildFile(
+            "carta_himd_tok_" + juce::String(static_cast<juce::int64>(stamp)) + "_" +
+            juce::String(static_cast<juce::int64>(seq)) + ".txt");
+        if (!tokenFile.replaceWithText(juce::String::fromUTF8(tokenHex.c_str()), false, false,
+                                       "\n")) {
+            error = "Failed creating temporary Hi-MD authentication token file.";
+            return false;
+        }
+        TempFileRemover tokenCleanup(tokenFile);
+        const std::string tokenPath = tokenFile.getFullPathName().toStdString();
+
+#if defined(_WIN32)
+        const std::string pipeName =
+            "\\\\.\\pipe\\carta-himd-" +
+            std::to_string(static_cast<unsigned long>(GetCurrentProcessId())) + "-" +
+            std::to_string(static_cast<unsigned long long>(seq));
+        const std::string parentPidStr =
+            std::to_string(static_cast<unsigned long>(GetCurrentProcessId()));
+
+        std::string params = "session";
+        if (enableMock) {
+            params += " --mock";
+        }
+        params += " --pipe " + quoteWinCmdArg(pipeName) + " --token-file " +
+                  quoteWinCmdArg(tokenPath) + " --parent-pid " + parentPidStr;
+
+        if (mode == HiMdElevationMode::Direct) {
+            const juce::String cmdStr =
+                juce::String::fromUTF8((quoteWinCmdArg(helperPath) + " " + params).c_str());
+            std::vector<wchar_t> cmdBuf(static_cast<std::size_t>(cmdStr.length()) + 1u, L'\0');
+            cmdStr.copyToUTF16(cmdBuf.data(), cmdBuf.size() * sizeof(wchar_t));
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                                nullptr, nullptr, &si, &pi)) {
+                error = "Failed launching direct carta-himd pipe session.";
+                return false;
+            }
+            CloseHandle(pi.hThread);
+            hDirectProc_ = pi.hProcess;
+        } else {
+            const juce::String wideFile = juce::String::fromUTF8(helperPath.c_str());
+            const juce::String wideParams = juce::String::fromUTF8(params.c_str());
+            SHELLEXECUTEINFOW sei{};
+            sei.cbSize = sizeof(sei);
+            sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+            sei.lpVerb = L"runas";
+            sei.lpFile = wideFile.toWideCharPointer();
+            sei.lpParameters = wideParams.toWideCharPointer();
+            sei.nShow = SW_HIDE;
+            if (!ShellExecuteExW(&sei)) {
+                const DWORD errCode = GetLastError();
+                error = (errCode == ERROR_CANCELLED)
+                            ? "Hi-MD administrator authorization was canceled."
+                            : ("Failed launching elevated carta-himd session (error " +
+                               std::to_string(errCode) + ").");
+                return false;
+            }
+            if (sei.hProcess != nullptr) {
+                CloseHandle(sei.hProcess);
+            }
+        }
+
+        const juce::String widePipe = juce::String::fromUTF8(pipeName.c_str());
+        const auto connectDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        HANDLE hPipe = INVALID_HANDLE_VALUE;
+        while (std::chrono::steady_clock::now() < connectDeadline) {
+            if (hDirectProc_ != nullptr && WaitForSingleObject(hDirectProc_, 0) != WAIT_TIMEOUT) {
+                error = "Direct carta-himd pipe session exited before becoming ready.";
+                stop();
+                return false;
+            }
+            hPipe = CreateFileW(widePipe.toWideCharPointer(), GENERIC_READ | GENERIC_WRITE, 0,
+                                nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hPipe != INVALID_HANDLE_VALUE) {
+                break;
+            }
+            const DWORD errCode = GetLastError();
+            if (errCode == ERROR_PIPE_BUSY) {
+                (void)WaitNamedPipeW(widePipe.toWideCharPointer(), 100);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            error = "Timed out waiting for elevated Hi-MD session pipe.";
+            stop();
+            return false;
+        }
+        hPipe_ = hPipe;
+        pipeName_ = pipeName;
+        carryBuf_.clear();
+        loadedHelperPath_ = helperPath;
+        mockMode_.store(enableMock, std::memory_order_release);
+        activeFlag_.store(true, std::memory_order_release);
+
+        juce::var authRes;
+        if (!send({"auth", tokenHex}, nullptr, authRes, error)) {
+            stop();
+            if (error.empty()) {
+                error = "Elevated Hi-MD session failed token authentication.";
+            }
+            return false;
+        }
+        return true;
+#else
+        std::signal(SIGPIPE, SIG_IGN);
+        (void)::chmod(tokenPath.c_str(), 0600);
+
+        const uid_t myUid = ::getuid();
+        const gid_t myGid = ::getgid();
+        const pid_t myPid = ::getpid();
+        const std::string sockPath =
+            "/tmp/carta-himd-" + std::to_string(static_cast<unsigned long>(myUid)) + "-" +
+            std::to_string(static_cast<long long>(myPid)) + "-" +
+            std::to_string(static_cast<unsigned long long>(seq)) + ".sock";
+        (void)::unlink(sockPath.c_str());
+
+        const std::string uidStr = std::to_string(static_cast<unsigned long>(myUid));
+        const std::string gidStr = std::to_string(static_cast<unsigned long>(myGid));
+        const std::string pidStr = std::to_string(static_cast<long long>(myPid));
+
+        std::vector<std::string> baseArgs{helperPath,
+                                          "session",
+                                          "--socket",
+                                          sockPath,
+                                          "--client-uid",
+                                          uidStr,
+                                          "--client-gid",
+                                          gidStr,
+                                          "--token-file",
+                                          tokenPath,
+                                          "--parent-pid",
+                                          pidStr};
+        if (enableMock) {
+            baseArgs.push_back("--mock");
+        }
+
+        if (mode == HiMdElevationMode::Direct || mode == HiMdElevationMode::Sudo) {
+            std::vector<std::string> execArgs;
+            if (mode == HiMdElevationMode::Sudo) {
+                execArgs.push_back("/usr/bin/sudo");
+                execArgs.push_back("-n");
+            }
+            execArgs.insert(execArgs.end(), baseArgs.begin(), baseArgs.end());
+
+            const pid_t child = ::fork();
+            if (child < 0) {
+                error = "fork() failed launching Hi-MD session.";
+                return false;
+            }
+            if (child == 0) {
+                const int devNull = ::open("/dev/null", O_RDWR);
+                if (devNull >= 0) {
+                    ::dup2(devNull, STDIN_FILENO);
+                    ::dup2(devNull, STDOUT_FILENO);
+                    ::dup2(devNull, STDERR_FILENO);
+                    if (devNull > STDERR_FILENO) {
+                        ::close(devNull);
+                    }
+                }
+                std::vector<char*> cArgs;
+                cArgs.reserve(execArgs.size() + 1u);
+                for (auto& s : execArgs) {
+                    cArgs.push_back(const_cast<char*>(s.c_str()));
+                }
+                cArgs.push_back(nullptr);
+                ::execv(cArgs[0], cArgs.data());
+                ::_exit(127);
+            }
+            directPid_ = child;
+        } else {
+            std::string shellCmd;
+            for (std::size_t i = 0; i < baseArgs.size(); ++i) {
+                if (i > 0) {
+                    shellCmd.push_back(' ');
+                }
+                shellCmd += quotePosixShellArg(baseArgs[i]);
+            }
+            shellCmd += " </dev/null >/dev/null 2>&1 &";
+
+            int errPipe[2]{-1, -1};
+            if (::pipe(errPipe) != 0) {
+                error = "pipe() failed launching Hi-MD authorization prompt.";
+                return false;
+            }
+            const pid_t child = ::fork();
+            if (child < 0) {
+                ::close(errPipe[0]);
+                ::close(errPipe[1]);
+                error = "fork() failed launching Hi-MD authorization prompt.";
+                return false;
+            }
+            if (child == 0) {
+                ::dup2(errPipe[1], STDERR_FILENO);
+                ::dup2(errPipe[1], STDOUT_FILENO);
+                ::close(errPipe[0]);
+                ::close(errPipe[1]);
+#if defined(__APPLE__)
+                const std::string script =
+                    "do shell script \"" + escapeAppleScriptString(shellCmd) +
+                    "\" with administrator privileges with prompt "
+                    "\"Carta Studio needs administrator access to communicate with your Sony Hi-MD "
+                    "recorder over USB.\"";
+                char* argv[] = {const_cast<char*>("/usr/bin/osascript"), const_cast<char*>("-e"),
+                                const_cast<char*>(script.c_str()), nullptr};
+                ::execv("/usr/bin/osascript", argv);
+#elif defined(__linux__)
+                char* argv[] = {const_cast<char*>("/usr/bin/pkexec"), const_cast<char*>("/bin/sh"),
+                                const_cast<char*>("-c"), const_cast<char*>(shellCmd.c_str()),
+                                nullptr};
+                ::execv("/usr/bin/pkexec", argv);
+#endif
+                ::_exit(127);
+            }
+            ::close(errPipe[1]);
+            std::string promptOut;
+            char buf[512];
+            while (true) {
+                const ssize_t n = ::read(errPipe[0], buf, sizeof(buf));
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if (n == 0) {
+                    break;
+                }
+                promptOut.append(buf, static_cast<std::size_t>(n));
+            }
+            ::close(errPipe[0]);
+            while (!promptOut.empty() &&
+                   (promptOut.back() == '\n' || promptOut.back() == '\r')) {
+                promptOut.pop_back();
+            }
+
+            int st = 0;
+            int exitCode = -1;
+            if (::waitpid(child, &st, 0) > 0 && WIFEXITED(st)) {
+                exitCode = WEXITSTATUS(st);
+            }
+            if (exitCode != 0) {
+                (void)::unlink(sockPath.c_str());
+#if defined(__APPLE__)
+                if (containsCaseInsensitive(promptOut, "user canceled") ||
+                    containsCaseInsensitive(promptOut, "-128")) {
+                    error = "Hi-MD administrator authorization was canceled.";
+                } else {
+                    error = promptOut.empty()
+                                ? "Hi-MD administrator authorization failed."
+                                : ("Hi-MD administrator authorization failed: " + promptOut);
+                }
+#elif defined(__linux__)
+                if (exitCode == 126 || exitCode == 127 ||
+                    containsCaseInsensitive(promptOut, "dismissed")) {
+                    error = "Hi-MD administrator authorization was canceled or pkexec is "
+                            "unavailable.";
+                } else {
+                    error = promptOut.empty()
+                                ? "Hi-MD administrator authorization failed."
+                                : ("Hi-MD administrator authorization failed: " + promptOut);
+                }
+#else
+                error = "Hi-MD administrator authorization is not supported on this platform.";
+#endif
+                return false;
+            }
+        }
+
+        const auto connectDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        int connectedFd = -1;
+        while (std::chrono::steady_clock::now() < connectDeadline) {
+            if (directPid_ > 0) {
+                int st = 0;
+                const pid_t wrc = ::waitpid(directPid_, &st, WNOHANG);
+                if (wrc == directPid_) {
+                    directPid_ = -1;
+                    error = (mode == HiMdElevationMode::Sudo)
+                                ? "sudo -n failed starting elevated Hi-MD session."
+                                : "Hi-MD socket session exited before becoming ready.";
+                    (void)::unlink(sockPath.c_str());
+                    return false;
+                }
+            }
+
+            const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            if (fd < 0) {
+                error = "socket() failed connecting to Hi-MD session.";
+                stop();
+                return false;
+            }
+            sockaddr_un addr{};
+            if (sockPath.size() >= sizeof(addr.sun_path)) {
+                ::close(fd);
+                error = "Hi-MD socket path exceeds sockaddr_un length.";
+                stop();
+                return false;
+            }
+            addr.sun_family = AF_UNIX;
+            std::memcpy(addr.sun_path, sockPath.c_str(), sockPath.size() + 1u);
+            if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) {
+                connectedFd = fd;
+                break;
+            }
+            ::close(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        if (connectedFd < 0) {
+            error = "Timed out waiting for elevated Hi-MD session socket.";
+            stop();
+            return false;
+        }
+
+        sockFd_ = connectedFd;
+        socketPath_ = sockPath;
+        carryBuf_.clear();
+        loadedHelperPath_ = helperPath;
+        mockMode_.store(enableMock, std::memory_order_release);
+        activeFlag_.store(true, std::memory_order_release);
+
+        juce::var authRes;
+        if (!send({"auth", tokenHex}, nullptr, authRes, error)) {
+            stop();
+            if (error.empty()) {
+                error = "Elevated Hi-MD session failed token authentication.";
+            }
+            return false;
+        }
+        return true;
+#endif
+    }
+
+    void stop() {
+        const bool wasOpen = isRunning();
+        activeFlag_.store(false, std::memory_order_release);
+        mockMode_.store(false, std::memory_order_release);
+        loadedHelperPath_.clear();
+        carryBuf_.clear();
+
+#if defined(_WIN32)
+        if (hPipe_ != INVALID_HANDLE_VALUE) {
+            if (wasOpen) {
+                const char quitCmd[] = "quit\n";
+                DWORD written = 0;
+                (void)WriteFile(hPipe_, quitCmd, static_cast<DWORD>(sizeof(quitCmd) - 1u),
+                                &written, nullptr);
+            }
+            CloseHandle(hPipe_);
+            hPipe_ = INVALID_HANDLE_VALUE;
+        }
+        if (hDirectProc_ != nullptr) {
+            WaitForSingleObject(hDirectProc_, 5000);
+            CloseHandle(hDirectProc_);
+            hDirectProc_ = nullptr;
+        }
+        pipeName_.clear();
+#else
+        if (sockFd_ >= 0) {
+            if (wasOpen) {
+                const char quitCmd[] = "quit\n";
+                (void)::write(sockFd_, quitCmd, sizeof(quitCmd) - 1u);
+            }
+            ::close(sockFd_);
+            sockFd_ = -1;
+        }
+        if (directPid_ > 0) {
+            int st = 0;
+            for (int i = 0; i < 40; ++i) {
+                const pid_t w = ::waitpid(directPid_, &st, WNOHANG);
+                if (w == directPid_ || w < 0) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            directPid_ = -1;
+        }
+        if (!socketPath_.empty()) {
+            (void)::unlink(socketPath_.c_str());
+            socketPath_.clear();
+        }
+#endif
+    }
+
+    bool send(const std::vector<std::string>& fields, const HelperProgressWindow* window,
+              juce::var& outResult, std::string& error) {
+        outResult = juce::var();
+        if (!isRunning()) {
+            error = "Elevated Hi-MD session is not running.";
+            return false;
+        }
+
+        std::string line;
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            if (i > 0) {
+                line.push_back('\t');
+            }
+            line += (i == 0 ? fields[i] : percentEncodeField(fields[i]));
+        }
+        line.push_back('\n');
+
+        if (!writeAllToSession(line.data(), line.size())) {
+            stop();
+            error = "Failed writing command to elevated Hi-MD session.";
+            return false;
+        }
+
+        std::string rawLine;
+        while (readLineFromSession(rawLine)) {
+            if (!rawLine.empty() && rawLine.back() == '\r') {
+                rawLine.pop_back();
+            }
+            if (rawLine.empty()) {
+                continue;
+            }
+            juce::var parsed;
+            if (juce::JSON::parse(juce::String::fromUTF8(rawLine.c_str()), parsed).failed() ||
+                !parsed.isObject()) {
+                stop();
+                error = "Malformed NDJSON line from elevated Hi-MD session: " + rawLine;
+                return false;
+            }
+            const auto* obj = parsed.getDynamicObject();
+            const auto ev = obj->getProperty("event").toString();
+            if (ev == "progress") {
+                publishHelperProgressLine(obj, window);
+                continue;
+            }
+            if (ev == "result") {
+                outResult = parsed;
+                if (!static_cast<bool>(obj->getProperty("ok"))) {
+                    error = obj->getProperty("error").toString().toStdString();
+                    if (error.empty()) {
+                        error = "Elevated Hi-MD session command failed.";
+                    }
+                    return false;
+                }
+                error.clear();
+                return true;
+            }
+        }
+
+        stop();
+        error = "Elevated Hi-MD session closed unexpectedly.";
+        return false;
+    }
+
+  private:
+    bool writeAllToSession(const char* data, std::size_t len) {
+#if defined(_WIN32)
+        if (hPipe_ == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        std::size_t off = 0;
+        while (off < len) {
+            DWORD chunk = 0;
+            const DWORD want = static_cast<DWORD>(std::min<std::size_t>(len - off, 65536u));
+            if (!WriteFile(hPipe_, data + off, want, &chunk, nullptr) || chunk == 0) {
+                return false;
+            }
+            off += static_cast<std::size_t>(chunk);
+        }
+        return true;
+#else
+        if (sockFd_ < 0) {
+            return false;
+        }
+        std::size_t off = 0;
+        while (off < len) {
+            const ssize_t n = ::write(sockFd_, data + off, len - off);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if (n == 0) {
+                return false;
+            }
+            off += static_cast<std::size_t>(n);
+        }
+        return true;
+#endif
+    }
+
+    bool readLineFromSession(std::string& outLine) {
+        outLine.clear();
+        while (true) {
+            const std::size_t nl = carryBuf_.find('\n');
+            if (nl != std::string::npos) {
+                outLine = carryBuf_.substr(0, nl);
+                carryBuf_.erase(0, nl + 1);
+                return true;
+            }
+#if defined(_WIN32)
+            if (hPipe_ == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+            char chunk[4096];
+            DWORD readLen = 0;
+            if (!ReadFile(hPipe_, chunk, static_cast<DWORD>(sizeof(chunk)), &readLen, nullptr) ||
+                readLen == 0) {
+                return false;
+            }
+            carryBuf_.append(chunk, static_cast<std::size_t>(readLen));
+#else
+            if (sockFd_ < 0) {
+                return false;
+            }
+            char chunk[4096];
+            const ssize_t n = ::read(sockFd_, chunk, sizeof(chunk));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            if (n == 0) {
+                return false;
+            }
+            carryBuf_.append(chunk, static_cast<std::size_t>(n));
+#endif
+        }
+    }
+
+#if defined(_WIN32)
+    HANDLE hPipe_ = INVALID_HANDLE_VALUE;
+    HANDLE hDirectProc_ = nullptr;
+    std::string pipeName_;
+#else
+    int sockFd_ = -1;
+    pid_t directPid_ = -1;
+    std::string socketPath_;
+#endif
+    std::string carryBuf_;
+    std::string loadedHelperPath_;
+    std::atomic<bool> activeFlag_{false};
+    std::atomic<bool> mockMode_{false};
+};
+
+PersistentElevatedHiMdSession& persistentElevatedSession() {
+    static PersistentElevatedHiMdSession sess;
+    return sess;
+}
+
+bool invokeHiMdUnlocked(const std::vector<std::string>& sessionFields,
+                        const std::vector<std::string>& cliArgs, bool preferMockSession,
+                        bool allowElevationPrompt, const HelperProgressWindow* window,
+                        juce::var& outResult, std::string& error) {
     std::string helperPath;
     if (!locateHiMdHelperUnlocked(helperPath, error)) {
         return false;
     }
+
+    const bool isListOp = !sessionFields.empty() && sessionFields[0] == "list";
     if (preferMockSession) {
+        if (persistentElevatedSession().isRunning() && persistentElevatedSession().isMockMode()) {
+            return persistentElevatedSession().send(sessionFields, window, outResult, error);
+        }
         if (!persistentMockSession().ensureStarted(helperPath, error)) {
             return false;
         }
         return persistentMockSession().send(sessionFields, window, outResult, error);
     }
-    return runOneShotHelper(helperPath, cliArgs, window, outResult, error);
+
+    if (isListOp) {
+        return runOneShotHelper(helperPath, cliArgs, window, outResult, error);
+    }
+
+    if (persistentElevatedSession().isRunning()) {
+        if (persistentElevatedSession().send(sessionFields, window, outResult, error)) {
+            return true;
+        }
+        // Only fall through to re-establish if the transport itself disconnected.
+        if (persistentElevatedSession().isRunning()) {
+            return false;
+        }
+    }
+
+    if (runOneShotHelper(helperPath, cliArgs, window, outResult, error)) {
+        return true;
+    }
+
+    if (!isHiMdPermissionError(error)) {
+        return false;
+    }
+
+    const auto mode = readElevationMode();
+    if (mode == HiMdElevationMode::Off ||
+        (mode == HiMdElevationMode::Auto &&
+         (!allowElevationPrompt || !isHiMdElevationPromptEnabled()))) {
+        return false;
+    }
+
+    if (window != nullptr) {
+        setHiMdProgress(window->operation, "Waiting for administrator authorization...",
+                        window->baseProgress);
+    }
+    std::string elevErr;
+    if (!persistentElevatedSession().ensureStarted(helperPath, false, allowElevationPrompt,
+                                                   elevErr)) {
+        if (!elevErr.empty()) {
+            error = elevErr;
+        }
+        return false;
+    }
+    if (window != nullptr) {
+        setHiMdProgress(window->operation, window->fallbackPhase, window->baseProgress);
+    }
+    return persistentElevatedSession().send(sessionFields, window, outResult, error);
 }
 
 bool requireWriteConfirmationUnlocked(const std::string& resolvedId, bool confirmHardware,
@@ -631,7 +1392,8 @@ bool requireWriteConfirmationUnlocked(const std::string& resolvedId, bool confir
 bool listHiMdDevicesUnlocked(std::vector<HiMdDeviceEntry>& out, std::string& error) {
     out.clear();
     juce::var res;
-    if (!invokeHiMdUnlocked({"list"}, {"list"}, mockSessionEnabledFlag(), nullptr, res, error)) {
+    if (!invokeHiMdUnlocked({"list"}, {"list"}, mockSessionEnabledFlag(),
+                            /*allowElevationPrompt=*/false, nullptr, res, error)) {
         return false;
     }
     const auto* rootObj = res.getDynamicObject();
@@ -680,12 +1442,12 @@ bool resolveTargetDeviceIdUnlocked(const std::string& preferredId, std::string& 
 }
 
 bool probeHiMdDeviceUnlocked(const std::string& resolvedId, HiMdDeviceStatus& out,
-                             std::string& error) {
+                             std::string& error, bool allowElevationPrompt = true) {
     out = {};
     juce::var res;
     const bool useMockSess = isHiMdMockDeviceId(resolvedId);
-    if (!invokeHiMdUnlocked({"probe", resolvedId}, {"probe", resolvedId}, useMockSess, nullptr, res,
-                            error)) {
+    if (!invokeHiMdUnlocked({"probe", resolvedId}, {"probe", resolvedId}, useMockSess,
+                            allowElevationPrompt, nullptr, res, error)) {
         return false;
     }
 
@@ -781,7 +1543,7 @@ bool renameHiMdDiscUnlocked(const std::string& resolvedId, const std::string& ti
     }
     juce::var res;
     return invokeHiMdUnlocked({"rename-disc", resolvedId, title, confirmArg}, cliArgs, useMockSess,
-                              nullptr, res, error);
+                              /*allowElevationPrompt=*/true, nullptr, res, error);
 }
 
 bool setHiMdGroupsUnlocked(const std::string& resolvedId, const std::vector<MdGroup>& groups,
@@ -821,7 +1583,7 @@ bool setHiMdGroupsUnlocked(const std::string& resolvedId, const std::vector<MdGr
     }
     juce::var res;
     return invokeHiMdUnlocked({"set-groups", resolvedId, groupsJson, confirmArg}, cliArgs,
-                              useMockSess, nullptr, res, error);
+                              useMockSess, /*allowElevationPrompt=*/true, nullptr, res, error);
 }
 
 MdCodecMode codecFromHiMdTrack(const std::string& encoding, int bitrate) noexcept {
@@ -868,12 +1630,53 @@ bool isHiMdMockDeviceId(const std::string& deviceId) noexcept {
     return deviceId.rfind("mock:", 0) == 0;
 }
 
+bool isHiMdPermissionError(const std::string& error) noexcept {
+    return containsCaseInsensitive(error, "access denied") ||
+           containsCaseInsensitive(error, "insufficient permissions") ||
+           containsCaseInsensitive(error, "permission denied") ||
+           containsCaseInsensitive(error, "eacces") ||
+           containsCaseInsensitive(error, "error_access_denied") ||
+           containsCaseInsensitive(error, "operation not permitted") ||
+           containsCaseInsensitive(error, "eperm") ||
+           containsCaseInsensitive(error, "run with sudo") ||
+           containsCaseInsensitive(error, "run as administrator") ||
+           containsCaseInsensitive(error, "iousbmassstoragedriver");
+}
+
+void setHiMdElevationPromptEnabled(bool enabled) noexcept {
+    elevationPromptEnabledStorage().store(enabled, std::memory_order_release);
+}
+
+bool isHiMdElevationPromptEnabled() noexcept {
+    return elevationPromptEnabledStorage().load(std::memory_order_acquire);
+}
+
+bool isHiMdElevatedSessionActive() noexcept {
+    return persistentElevatedSession().isRunning();
+}
+
+bool ensureHiMdElevatedSession(std::string& error) {
+    const std::lock_guard<std::mutex> guard(hiMdBridgeMutex());
+    std::string helperPath;
+    if (!locateHiMdHelperUnlocked(helperPath, error)) {
+        return false;
+    }
+    const bool useMock = mockSessionEnabledFlag();
+    return persistentElevatedSession().ensureStarted(helperPath, useMock, true, error);
+}
+
+void stopHiMdElevatedSession() {
+    const std::lock_guard<std::mutex> guard(hiMdBridgeMutex());
+    persistentElevatedSession().stop();
+}
+
 bool isHiMdTestMockGuardEnabled() noexcept {
     return mockGuardStorage();
 }
 
 void setHiMdHelperPathOverride(const std::string& path) {
     const std::lock_guard<std::mutex> guard(hiMdBridgeMutex());
+    persistentElevatedSession().stop();
     persistentMockSession().stop();
     helperOverrideStorage() = path;
 }
@@ -955,13 +1758,14 @@ bool listHiMdDevices(std::vector<HiMdDeviceEntry>& out, std::string& error) {
     return listHiMdDevicesUnlocked(out, error);
 }
 
-bool probeHiMdDevice(const std::string& deviceId, HiMdDeviceStatus& out, std::string& error) {
+bool probeHiMdDevice(const std::string& deviceId, HiMdDeviceStatus& out, std::string& error,
+                     bool allowElevationPrompt) {
     const std::lock_guard<std::mutex> guard(hiMdBridgeMutex());
     std::string resolvedId;
     if (!resolveTargetDeviceIdUnlocked(deviceId, resolvedId, error)) {
         return false;
     }
-    return probeHiMdDeviceUnlocked(resolvedId, out, error);
+    return probeHiMdDeviceUnlocked(resolvedId, out, error, allowElevationPrompt);
 }
 
 HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
@@ -1197,7 +2001,8 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
         juce::var res;
         if (!invokeHiMdUnlocked({"upload", resolvedId, up.codecSpec, inPath, up.title, up.artist,
                                  up.album, confirmArg},
-                                cliArgs, useMockSess, &win, res, error)) {
+                                cliArgs, useMockSess, /*allowElevationPrompt=*/true, &win, res,
+                                error)) {
             return false;
         }
         if (const auto* uObj =
@@ -1260,6 +2065,12 @@ bool dumpHiMdTrack(const std::string& deviceId, int trackIndex, const std::strin
         return false;
     }
 
+    const juce::File destFile(juce::String::fromUTF8(outPath.c_str()));
+    if (!destFile.getParentDirectory().isDirectory()) {
+        error = "Output parent directory does not exist for Hi-MD track dump.";
+        return false;
+    }
+
     ScopedHiMdProgress progressScope;
     HelperProgressWindow win;
     win.active = true;
@@ -1269,15 +2080,67 @@ bool dumpHiMdTrack(const std::string& deviceId, int trackIndex, const std::strin
     win.spanProgress = 1.0;
 
     const bool useMockSess = isHiMdMockDeviceId(resolvedId);
+    const bool useTempCopy = !useMockSess || persistentElevatedSession().isRunning();
+    juce::File helperOutFile = destFile;
+    std::unique_ptr<TempFileRemover> tempDumpCleanup;
+    if (useTempCopy) {
+        const auto ext = destFile.getFileExtension();
+        const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory);
+        const auto stamp = static_cast<juce::int64>(juce::Time::getHighResolutionTicks());
+        helperOutFile = tempDir.getChildFile("carta_himd_dump_" + juce::String(stamp) + ext);
+        tempDumpCleanup = std::make_unique<TempFileRemover>(helperOutFile);
+    }
+
+    const std::string helperOutPath = helperOutFile.getFullPathName().toStdString();
     std::vector<std::string> cliArgs{"dump",    resolvedId, "--track", std::to_string(trackIndex),
-                                     "--out",   outPath};
+                                     "--out",   helperOutPath};
     if (rawAudio) {
         cliArgs.emplace_back("--raw");
     }
     juce::var res;
-    return invokeHiMdUnlocked(
-        {"dump", resolvedId, std::to_string(trackIndex), outPath, rawAudio ? "1" : "0"}, cliArgs,
-        useMockSess, &win, res, error);
+    if (!invokeHiMdUnlocked(
+            {"dump", resolvedId, std::to_string(trackIndex), helperOutPath, rawAudio ? "1" : "0"},
+            cliArgs, useMockSess, /*allowElevationPrompt=*/true, &win, res, error)) {
+        return false;
+    }
+
+    if (useTempCopy) {
+        juce::FileInputStream inStream(helperOutFile);
+        if (!inStream.openedOk()) {
+            error = "Failed opening dumped Hi-MD temporary file: " + helperOutPath;
+            return false;
+        }
+        juce::TemporaryFile target(destFile);
+        {
+            juce::FileOutputStream outStream(target.getFile());
+            if (!outStream.openedOk()) {
+                error = "Failed creating destination Hi-MD dump file: " + outPath;
+                return false;
+            }
+            std::array<char, 65536> buf{};
+            while (!inStream.isExhausted()) {
+                const int n = inStream.read(buf.data(), static_cast<int>(buf.size()));
+                if (n < 0) {
+                    error = "Read error copying dumped Hi-MD audio.";
+                    return false;
+                }
+                if (n == 0) {
+                    break;
+                }
+                if (!outStream.write(buf.data(), static_cast<std::size_t>(n))) {
+                    error = "Write error saving Hi-MD dump file: " + outPath;
+                    return false;
+                }
+            }
+            outStream.flush();
+        }
+        if (!target.overwriteTargetFileWithTemporary()) {
+            error = "Failed saving Hi-MD dump file to: " + outPath;
+            return false;
+        }
+    }
+    error.clear();
+    return true;
 }
 
 bool renameHiMdDisc(const std::string& deviceId, const std::string& title, bool confirmHardware,
@@ -1336,7 +2199,8 @@ bool renameHiMdTrack(const std::string& deviceId, int trackIndex, bool hasTitle,
     return invokeHiMdUnlocked({"rename-track", resolvedId, std::to_string(trackIndex),
                                hasTitle ? "1" : "0", title, hasArtist ? "1" : "0", artist,
                                hasAlbum ? "1" : "0", album, confirmArg},
-                              cliArgs, useMockSess, nullptr, res, error);
+                              cliArgs, useMockSess, /*allowElevationPrompt=*/true, nullptr, res,
+                              error);
 }
 
 bool moveHiMdTrack(const std::string& deviceId, int fromIndex, int toIndex, bool confirmHardware,
@@ -1366,7 +2230,8 @@ bool moveHiMdTrack(const std::string& deviceId, int fromIndex, int toIndex, bool
     juce::var res;
     return invokeHiMdUnlocked({"move-track", resolvedId, std::to_string(fromIndex),
                                std::to_string(toIndex), confirmArg},
-                              cliArgs, useMockSess, nullptr, res, error);
+                              cliArgs, useMockSess, /*allowElevationPrompt=*/true, nullptr, res,
+                              error);
 }
 
 bool setHiMdGroups(const std::string& deviceId, const std::vector<MdGroup>& groups, int trackCount,
@@ -1424,7 +2289,7 @@ bool deleteHiMdTracks(const std::string& deviceId, const std::vector<int>& track
 
     juce::var res;
     return invokeHiMdUnlocked({"delete-tracks", resolvedId, csvStr, confirmArg}, cliArgs,
-                              useMockSess, nullptr, res, error);
+                              useMockSess, /*allowElevationPrompt=*/true, nullptr, res, error);
 }
 
 bool wipeHiMdDisc(const std::string& deviceId, bool reformat, bool confirmHardware,
@@ -1458,7 +2323,7 @@ bool wipeHiMdDisc(const std::string& deviceId, bool reformat, bool confirmHardwa
 
     juce::var res;
     return invokeHiMdUnlocked({"wipe", resolvedId, reformat ? "1" : "0", confirmArg}, cliArgs,
-                              useMockSess, &win, res, error);
+                              useMockSess, /*allowElevationPrompt=*/true, &win, res, error);
 }
 
 bool loadHiMdDiscIntoSession(const std::string& deviceId, MdDisc& outDisc,

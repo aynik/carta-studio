@@ -460,6 +460,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         std::vector<carta::HiMdDeviceEntry> hiMdDevices;
         std::string activeDeviceId;
         bool activeDeviceIsHiMd = false;
+        bool hiMdNeedsElevation = false;
         bool hasDeviceStatus = false;
         carta::NetMdDeviceStatus deviceStatus;
         bool hasHiMdStatus = false;

@@ -72,6 +72,7 @@ Studio::Studio(bool headless) : headlessMode(headless) {
 #if !CARTA_STUDIO_COMPONENT_TEST
     if (!headlessMode) {
         tooltipWindow = std::make_unique<juce::TooltipWindow>(this, 900);
+        carta::setHiMdElevationPromptEnabled(true);
     }
 #endif
 
@@ -105,7 +106,7 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     discWorkspace.onImportUtoc = [this] { importUtocDialog(); };
     discWorkspace.onExportUtoc = [this] { exportCurrentUtocDialog(); };
     discWorkspace.onReviewWav = [this] { startDiscProgramWavExport(); };
-    discWorkspace.onRefreshRecord = [this] { refreshRecordWorkspace(true); };
+    discWorkspace.onRefreshRecord = [this] { refreshRecordWorkspace(true, true); };
     discWorkspace.onRecordPreflight = [this] { triggerRecordProbeFromUi(); };
     discWorkspace.onLoadDisc = [this] { triggerLoadDiscFromUi(); };
     discWorkspace.onReadDiscToc = [this] { triggerReadDiscTocFromUi(); };
@@ -183,7 +184,7 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     };
     discWorkspace.onTabChanged = [this](const juce::String& view) {
         if (view == "record" && (!netMdScannedOnce || !hiMdScannedOnce)) {
-            refreshRecordWorkspace(true);
+            refreshRecordWorkspace(true, false);
         } else {
             refreshRecordWorkspace(false);
         }
@@ -473,6 +474,7 @@ Studio::~Studio() {
     netMdStopRequested.store(true);
     netMdWorker.reset();
     hiMdWorker.reset();
+    carta::stopHiMdElevatedSession();
 
     if (activeExport) {
         activeExport->cancelled.store(true);

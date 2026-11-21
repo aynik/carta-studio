@@ -118,6 +118,24 @@ struct HiMdRecordResult {
 /** Returns true when `deviceId` identifies the offline mock Sony MZ-RH1 device (`mock:...`). */
 bool isHiMdMockDeviceId(const std::string& deviceId) noexcept;
 
+/** Returns true when `error` indicates OS permission / exclusive-driver denial requiring elevation. */
+bool isHiMdPermissionError(const std::string& error) noexcept;
+
+/** Controls whether `HiMdBridge` may trigger an interactive OS administrator prompt on permission errors. */
+void setHiMdElevationPromptEnabled(bool enabled) noexcept;
+
+/** Returns true when interactive OS administrator prompting is enabled for Hi-MD operations. */
+bool isHiMdElevationPromptEnabled() noexcept;
+
+/** Returns true when the persistent elevated `carta-himd` session socket/pipe is currently connected. */
+bool isHiMdElevatedSessionActive() noexcept;
+
+/** Ensures the persistent elevated `carta-himd` session is running (prompting once if needed). */
+bool ensureHiMdElevatedSession(std::string& error);
+
+/** Gracefully terminates and cleans up any running persistent elevated `carta-himd` session. */
+void stopHiMdElevatedSession();
+
 /** Returns true when hardware-confirmation enforcement is armed on the persistent mock session. */
 bool isHiMdTestMockGuardEnabled() noexcept;
 
@@ -140,7 +158,8 @@ bool fetchHiMdTestMockSnapshot(std::string& outJson, std::string& error);
 bool listHiMdDevices(std::vector<HiMdDeviceEntry>& out, std::string& error);
 
 /** Probes device identity, capacity, OMGAUDIO filesystem space, tracks, and groups. */
-bool probeHiMdDevice(const std::string& deviceId, HiMdDeviceStatus& out, std::string& error);
+bool probeHiMdDevice(const std::string& deviceId, HiMdDeviceStatus& out, std::string& error,
+                     bool allowElevationPrompt = true);
 
 /**
  * Validates `disc` for Hi-MD recording (codec compatibility, non-empty track list, and capacity

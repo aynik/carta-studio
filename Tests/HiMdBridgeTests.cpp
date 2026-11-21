@@ -24,12 +24,33 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_core/juce_core.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -73,6 +94,172 @@ std::uint32_t readLe32(const std::uint8_t* p) noexcept {
     return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
            (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
 }
+
+#if !defined(_WIN32)
+std::string percentEncodeForSession(const std::string& input) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (char ch : input) {
+        const auto c = static_cast<unsigned char>(ch);
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '/' || c == ':') {
+            out.push_back(ch);
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0x0Fu]);
+            out.push_back(kHex[c & 0x0Fu]);
+        }
+    }
+    return out;
+}
+
+std::string findTestHelperPath() {
+    static constexpr const char* kName = "carta-himd";
+    const auto exeDir =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    std::vector<juce::File> candidates;
+#if defined(__APPLE__)
+    candidates.push_back(exeDir.getParentDirectory().getChildFile("Helpers").getChildFile(kName));
+#endif
+    candidates.push_back(exeDir.getChildFile(kName));
+    candidates.push_back(exeDir.getParentDirectory().getChildFile(kName));
+    auto probeDir = exeDir;
+    for (int depth = 0; depth < 4; ++depth) {
+        candidates.push_back(probeDir.getChildFile(kName));
+        candidates.push_back(probeDir.getChildFile("build").getChildFile(kName));
+        const auto parent = probeDir.getParentDirectory();
+        if (parent == probeDir) {
+            break;
+        }
+        probeDir = parent;
+    }
+    for (const auto& c : candidates) {
+        if (c.existsAsFile()) {
+            return c.getFullPathName().toStdString();
+        }
+    }
+    return {};
+}
+
+bool writeAllFd(int fd, const char* data, std::size_t len) {
+    std::size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+bool readLineFd(int fd, std::string& carry, std::string& outLine) {
+    outLine.clear();
+    while (true) {
+        const std::size_t nl = carry.find('\n');
+        if (nl != std::string::npos) {
+            outLine = carry.substr(0, nl);
+            carry.erase(0, nl + 1);
+            return true;
+        }
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int prc = ::poll(&pfd, 1, 8000);
+        if (prc <= 0) {
+            return false;
+        }
+        char buf[4096];
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+            return false;
+        }
+        carry.append(buf, static_cast<std::size_t>(n));
+    }
+}
+
+bool sendSocketCommand(int fd, std::string& carry, const std::string& rawLine, juce::var& outResult,
+                       std::string& error) {
+    outResult = juce::var();
+    if (!writeAllFd(fd, rawLine.data(), rawLine.size())) {
+        error = "Failed writing command to test socket.";
+        return false;
+    }
+    std::string line;
+    while (readLineFd(fd, carry, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+        juce::var parsed;
+        if (juce::JSON::parse(juce::String::fromUTF8(line.c_str()), parsed).failed() ||
+            !parsed.isObject()) {
+            error = "Malformed JSON line: " + line;
+            return false;
+        }
+        const auto ev = parsed.getDynamicObject()->getProperty("event").toString();
+        if (ev == "progress") {
+            continue;
+        }
+        if (ev == "result") {
+            outResult = parsed;
+            if (!static_cast<bool>(parsed.getDynamicObject()->getProperty("ok"))) {
+                error = parsed.getDynamicObject()->getProperty("error").toString().toStdString();
+                return false;
+            }
+            return true;
+        }
+    }
+    error = "EOF reading result from test socket.";
+    return false;
+}
+#endif
+
+struct ScopedElevationEnv {
+    explicit ScopedElevationEnv(const char* value) {
+#if defined(_WIN32)
+        const char* prev = std::getenv("CARTA_HIMD_ELEVATION");
+        if (prev != nullptr) {
+            hadPrev = true;
+            prevValue = prev;
+        }
+        _putenv_s("CARTA_HIMD_ELEVATION", value ? value : "");
+#else
+        const char* prev = std::getenv("CARTA_HIMD_ELEVATION");
+        if (prev != nullptr) {
+            hadPrev = true;
+            prevValue = prev;
+        }
+        if (value != nullptr) {
+            ::setenv("CARTA_HIMD_ELEVATION", value, 1);
+        } else {
+            ::unsetenv("CARTA_HIMD_ELEVATION");
+        }
+#endif
+    }
+    ~ScopedElevationEnv() {
+#if defined(_WIN32)
+        _putenv_s("CARTA_HIMD_ELEVATION", hadPrev ? prevValue.c_str() : "");
+#else
+        if (hadPrev) {
+            ::setenv("CARTA_HIMD_ELEVATION", prevValue.c_str(), 1);
+        } else {
+            ::unsetenv("CARTA_HIMD_ELEVATION");
+        }
+#endif
+    }
+    bool hadPrev = false;
+    std::string prevValue;
+};
 
 carta::Session makeFiveTrackHiMdSession(const std::vector<int>& segSamples) {
     int totalSamples = 0;
@@ -479,6 +666,214 @@ int main() {
 
     REQUIRE(carta::runHiMdHelperStackSelftest(err),
             "runHiMdHelperStackSelftest failed: " + err);
+
+    // 8. Permission error classification & default non-prompting elevation state.
+    REQUIRE(!carta::isHiMdElevationPromptEnabled(),
+            "Elevation prompts must default to disabled for headless/test safety");
+    carta::setHiMdElevationPromptEnabled(true);
+    REQUIRE(carta::isHiMdElevationPromptEnabled(), "Expected elevation prompt enable toggle");
+    carta::setHiMdElevationPromptEnabled(false);
+    REQUIRE(!carta::isHiMdElevationPromptEnabled(), "Expected elevation prompt disable toggle");
+
+    REQUIRE(carta::isHiMdPermissionError(
+                "Failed claiming Hi-MD USB Mass Storage interface #0: Access denied "
+                "(insufficient permissions). On macOS, IOUSBMassStorageDriver locks the "
+                "interface exclusively.") &&
+                carta::isHiMdPermissionError("Failed opening /dev/sg2: Permission denied") &&
+                carta::isHiMdPermissionError("Failed opening device: EACCES") &&
+                carta::isHiMdPermissionError(
+                    "ERROR_ACCESS_DENIED: Run as Administrator for direct SCSI access.") &&
+                !carta::isHiMdPermissionError("") &&
+                !carta::isHiMdPermissionError("Physical Hi-MD device is no longer connected.") &&
+                !carta::isHiMdPermissionError("Track index out of range."),
+            "isHiMdPermissionError classification mismatch");
+
+#if !defined(_WIN32)
+    // 9. POSIX Unix domain socket session authentication, command roundtrip & cleanup.
+    {
+        const std::string helperPath = findTestHelperPath();
+        REQUIRE(!helperPath.empty(), "Could not locate carta-himd helper binary for socket tests");
+
+        const juce::File tokFile = tmpDir.getChildFile("session_tok.txt");
+        const std::string secret = "0123456789abcdef0123456789fedcba";
+        REQUIRE(tokFile.replaceWithText(secret, false, false, "\n"),
+                "Failed writing session token test file");
+
+        const juce::File sockPcmFile = tmpDir.getChildFile("socket_test.pcm");
+        {
+            std::vector<std::uint8_t> pcm(44096u * 4u, 0x11u);
+            REQUIRE(sockPcmFile.replaceWithData(pcm.data(), pcm.size()),
+                    "Failed writing socket PCM payload");
+        }
+        const juce::File sockOmaFile = tmpDir.getChildFile("socket_dump.oma");
+
+        (void)::chmod(tokFile.getFullPathName().toRawUTF8(), 0600);
+        const std::string sockPath =
+            "/tmp/carta-himd-test-" + std::to_string(static_cast<long long>(::getpid())) + "-" +
+            std::to_string(static_cast<unsigned long long>(juce::Time::getHighResolutionTicks())) +
+            ".sock";
+        (void)::unlink(sockPath.c_str());
+
+        const std::string uidStr = std::to_string(static_cast<unsigned long>(::getuid()));
+        const std::string gidStr = std::to_string(static_cast<unsigned long>(::getgid()));
+        const std::string pidStr = std::to_string(static_cast<long long>(::getpid()));
+        const std::string tokPath = tokFile.getFullPathName().toStdString();
+
+        const pid_t child = ::fork();
+        REQUIRE(child >= 0, "fork() failed spawning carta-himd --socket test server");
+        if (child == 0) {
+            char* argv[] = {const_cast<char*>(helperPath.c_str()),
+                            const_cast<char*>("session"),
+                            const_cast<char*>("--socket"),
+                            const_cast<char*>(sockPath.c_str()),
+                            const_cast<char*>("--client-uid"),
+                            const_cast<char*>(uidStr.c_str()),
+                            const_cast<char*>("--client-gid"),
+                            const_cast<char*>(gidStr.c_str()),
+                            const_cast<char*>("--token-file"),
+                            const_cast<char*>(tokPath.c_str()),
+                            const_cast<char*>("--parent-pid"),
+                            const_cast<char*>(pidStr.c_str()),
+                            const_cast<char*>("--mock"),
+                            nullptr};
+            ::execv(helperPath.c_str(), argv);
+            ::_exit(127);
+        }
+
+        auto connectSock = [&]() -> int {
+            const auto deadline = juce::Time::getMillisecondCounterHiRes() + 8000.0;
+            while (juce::Time::getMillisecondCounterHiRes() < deadline) {
+                const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+                if (fd < 0) {
+                    return -1;
+                }
+                sockaddr_un addr{};
+                addr.sun_family = AF_UNIX;
+                std::memcpy(addr.sun_path, sockPath.c_str(), sockPath.size() + 1u);
+                if (::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) {
+                    return fd;
+                }
+                ::close(fd);
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            }
+            return -1;
+        };
+
+        // First client rejects invalid auth token and verifies token file was unlinked on startup.
+        const int badFd = connectSock();
+        REQUIRE(badFd >= 0, "Failed connecting first client to --socket session");
+        REQUIRE(!tokFile.existsAsFile(), "Token file must be removed immediately after server read");
+        std::string carry;
+        juce::var authBadRes;
+        std::string sockErr;
+        REQUIRE(!sendSocketCommand(badFd, carry, "auth\twrongtoken\n", authBadRes, sockErr) &&
+                    sockErr.find("Unauthorized") != std::string::npos,
+                "Wrong token on --socket session should be rejected: " + sockErr);
+        ::close(badFd);
+
+        // Second client authenticates with valid token and exercises commands + dump + quit.
+        const int goodFd = connectSock();
+        REQUIRE(goodFd >= 0, "Failed connecting authenticated client after bad-token rejection");
+        carry.clear();
+        juce::var okRes;
+        REQUIRE(sendSocketCommand(goodFd, carry, "auth\t" + secret + "\n", okRes, sockErr),
+                "Valid auth token failed: " + sockErr);
+        REQUIRE(sendSocketCommand(goodFd, carry, "probe\tmock%3Amz-rh1\n", okRes, sockErr),
+                "Socket probe failed: " + sockErr);
+        REQUIRE(okRes.getDynamicObject() != nullptr &&
+                    static_cast<int>(okRes.getDynamicObject()
+                                         ->getProperty("status")
+                                         .getDynamicObject()
+                                         ->getProperty("trackCount")) == 0,
+                "Expected blank mock trackCount over --socket session");
+
+        const std::string encPcm = percentEncodeForSession(sockPcmFile.getFullPathName().toStdString());
+        const std::string encOma = percentEncodeForSession(sockOmaFile.getFullPathName().toStdString());
+        REQUIRE(sendSocketCommand(goodFd, carry,
+                                  "upload\tmock%3Amz-rh1\tpcm\t" + encPcm +
+                                      "\tSocket%20Tr0\tSocket%20Artist\tSocket%20Album\t0\n",
+                                  okRes, sockErr),
+                "Socket upload failed: " + sockErr);
+        REQUIRE(sendSocketCommand(goodFd, carry, "dump\tmock%3Amz-rh1\t0\t" + encOma + "\t0\n",
+                                  okRes, sockErr),
+                "Socket dump failed: " + sockErr);
+        std::vector<std::uint8_t> dumped;
+        REQUIRE(sockOmaFile.existsAsFile() && readFileBytes(sockOmaFile, dumped, sockErr) &&
+                    dumped.size() == 44u + 44096u * 4u &&
+                    std::memcmp(dumped.data(), "RIFF", 4) == 0 &&
+                    std::memcmp(dumped.data() + 8, "WAVE", 4) == 0,
+                "Expected valid WAV/RIFF dump for PCM track over --socket session");
+        REQUIRE(sendSocketCommand(goodFd, carry, "rename-disc\tmock%3Amz-rh1\tSocket%20Disc\t0\n",
+                                  okRes, sockErr),
+                "Socket rename-disc failed: " + sockErr);
+        REQUIRE(sendSocketCommand(goodFd, carry, "wipe\tmock%3Amz-rh1\t0\t0\n", okRes, sockErr),
+                "Socket wipe failed: " + sockErr);
+        REQUIRE(sendSocketCommand(goodFd, carry, "quit\n", okRes, sockErr),
+                "Socket quit failed: " + sockErr);
+        ::close(goodFd);
+
+        int st = 0;
+        REQUIRE(::waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                "carta-himd --socket server did not exit cleanly with code 0");
+        REQUIRE(!juce::File(juce::String::fromUTF8(sockPath.c_str())).exists(),
+                "Socket file must be unlinked cleanly when server exits");
+    }
+#endif
+
+    // 10. HiMdBridge CARTA_HIMD_ELEVATION=direct end-to-end session + temp-copy dump test.
+    {
+        struct ScopedDirectCleanup {
+            ~ScopedDirectCleanup() {
+                std::string ignoreErr;
+                carta::stopHiMdElevatedSession();
+                carta::setHiMdTestMockSessionEnabled(false, ignoreErr);
+            }
+        } directCleanup;
+        ScopedElevationEnv env("direct");
+
+        REQUIRE(carta::setHiMdTestMockSessionEnabled(true, err) &&
+                    carta::resetHiMdTestMockSession(err),
+                "Failed initializing mock before direct elevation test: " + err);
+        REQUIRE(carta::ensureHiMdElevatedSession(err) && carta::isHiMdElevatedSessionActive(),
+                "ensureHiMdElevatedSession(direct) failed: " + err);
+
+        const std::vector<int> seg{44100};
+        const auto sess = makeFiveTrackHiMdSession(seg);
+        carta::MdDisc d;
+        d.medium = carta::MdMedium::himd300;
+        d.defaultCodec = carta::MdCodecMode::hiSp;
+        d.halfWidthTitle = "Direct Session";
+        carta::MdTrack tr;
+        tr.id = carta::makeMdTrackId();
+        tr.halfWidthTitle = "Direct Track";
+        tr.artist = "Direct Artist";
+        tr.album = "Direct Album";
+        tr.parts = {{0, 44100}};
+        d.tracks.push_back(std::move(tr));
+
+        carta::HiMdRecordResult directRecRes;
+        REQUIRE(carta::recordHiMdDisc(sess, d, "mock:mz-rh1", false, directRecRes, err) &&
+                    directRecRes.ok,
+                "recordHiMdDisc over direct socket/pipe session failed: " + err);
+        carta::HiMdDeviceStatus directStatus;
+        REQUIRE(carta::probeHiMdDevice("mock:mz-rh1", directStatus, err) &&
+                    directStatus.trackCount == 1 && directStatus.discTitle == "Direct Session",
+                "probeHiMdDevice over direct socket/pipe session mismatch: " + err);
+
+        const juce::File directOma = tmpDir.getChildFile("direct_session_dump.oma");
+        REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", 0, directOma.getFullPathName().toStdString(),
+                                     false, err),
+                "dumpHiMdTrack over direct socket/pipe session failed: " + err);
+        std::vector<std::uint8_t> directBytes;
+        REQUIRE(directOma.existsAsFile() && readFileBytes(directOma, directBytes, err) &&
+                    directBytes.size() > 96u && directBytes[0] == 'E' && directBytes[1] == 'A' &&
+                    directBytes[2] == '3',
+                "Expected valid EA3 .oma file copied from direct elevated session");
+
+        carta::stopHiMdElevatedSession();
+        REQUIRE(!carta::isHiMdElevatedSessionActive(),
+                "stopHiMdElevatedSession should clear active session flag");
+    }
 
     std::cout << "[HiMdBridgeTests] All Hi-MD bridge, payload encoder, guard, and lifecycle tests passed.\n";
     return 0;

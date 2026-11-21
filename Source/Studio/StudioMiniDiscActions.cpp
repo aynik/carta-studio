@@ -998,11 +998,13 @@ juce::var Studio::buildHiMdStatusJson() {
     root->setProperty("bytes_total", static_cast<juce::int64>(prog.bytesTotal));
     root->setProperty("ok", hiMdLastOk);
     root->setProperty("error", juce::String::fromUTF8(hiMdLastError.c_str()));
+    root->setProperty("elevated", carta::isHiMdElevatedSessionActive());
+    root->setProperty("elevation_required", hiMdNeedsElevation);
     root->setProperty("result", hiMdLastResult);
     return juce::var(root);
 }
 
-void Studio::startHiMdProbeJob(const std::string& devId) {
+void Studio::startHiMdProbeJob(const std::string& devId, bool allowElevationPrompt) {
     carta::Session snapshot;
     {
         const juce::ScopedLock guard(lock);
@@ -1011,11 +1013,20 @@ void Studio::startHiMdProbeJob(const std::string& devId) {
 
     launchHiMdWorker(
         "probe", devId, "Probing Hi-MD recorder...",
-        [snapshot, devId](std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
-                          juce::String&, std::optional<carta::HiMdDeviceStatus>& afterStatus) mutable {
+        [this, snapshot, devId, allowElevationPrompt](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String&,
+            juce::String&, std::optional<carta::HiMdDeviceStatus>& afterStatus) mutable {
             carta::HiMdDeviceStatus st{};
-            if (!carta::probeHiMdDevice(devId, st, err)) {
-                uiStatus = juce::String::fromUTF8(err.c_str());
+            if (!carta::probeHiMdDevice(devId, st, err, allowElevationPrompt)) {
+                const bool needsElev = carta::isHiMdPermissionError(err);
+                if (needsElev) {
+                    std::lock_guard<std::mutex> lk(hiMdMutex);
+                    hiMdPendingNeedsElevation = true;
+                    uiStatus = "Administrator privileges required for Hi-MD USB access. Click "
+                               "'Unlock...' to authorize once for this session.";
+                } else {
+                    uiStatus = juce::String::fromUTF8(err.c_str());
+                }
                 return false;
             }
             afterStatus = st;
@@ -1368,6 +1379,7 @@ void Studio::pollHiMdJobProgress() {
         bool alertIsWarning = false;
         std::optional<carta::HiMdDeviceStatus> afterStatus;
         std::optional<carta::MdDisc> pendingLoadedDisc;
+        bool pendingNeedsElev = false;
         {
             std::lock_guard<std::mutex> lk(hiMdMutex);
             uiStatus = hiMdPendingUiStatus;
@@ -1378,7 +1390,10 @@ void Studio::pollHiMdJobProgress() {
             hiMdPendingStatus.reset();
             pendingLoadedDisc = std::move(hiMdPendingLoadedDisc);
             hiMdPendingLoadedDisc.reset();
+            pendingNeedsElev = hiMdPendingNeedsElevation;
+            hiMdPendingNeedsElevation = false;
         }
+        hiMdNeedsElevation = !hiMdLastOk && pendingNeedsElev;
         if (afterStatus.has_value()) {
             cachedHiMdStatus = afterStatus;
         }
@@ -1410,7 +1425,7 @@ void Studio::pollHiMdJobProgress() {
     }
 }
 
-void Studio::refreshRecordWorkspace(bool scanDevices) {
+void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt) {
     const bool busy =
         netMdBusy.load(std::memory_order_acquire) || hiMdBusy.load(std::memory_order_acquire);
     if (scanDevices && !busy) {
@@ -1486,11 +1501,15 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
 
     if (scanDevices && !preferredId.empty() && !busy) {
         if (preferredIsHiMd) {
-            startHiMdProbeJob(preferredId);
+            startHiMdProbeJob(preferredId, allowElevationPrompt);
         } else {
             startNetMdProbeJob(preferredId);
         }
         return;
+    }
+    if (!preferredIsHiMd || preferredId.empty() ||
+        (cachedHiMdStatus.has_value() && cachedHiMdStatus->deviceId == preferredId)) {
+        hiMdNeedsElevation = false;
     }
 
     const bool discIsHiMd = carta::isHiMdMedium(session.mdDisc.medium);
@@ -1591,8 +1610,15 @@ void Studio::refreshRecordWorkspace(bool scanDevices) {
                     juce::String(reqMb, reqMb >= 100.0 ? 0 : 1) + " MB) to Hi-MD.";
             }
         } else if (!cachedHiMdDevices.empty()) {
-            snap.badgeText = "Hi-MD found (not probed)";
-            snap.statusText = "Click Refresh to probe USB Hi-MD recorder & FAT16 filesystem.";
+            if (hiMdNeedsElevation) {
+                snap.hiMdNeedsElevation = true;
+                snap.badgeText = "Hi-MD locked (admin required)";
+                snap.statusText = "Administrator privileges required for Hi-MD USB access. Click "
+                                  "'Unlock...' to authorize once for this session.";
+            } else {
+                snap.badgeText = "Hi-MD found (not probed)";
+                snap.statusText = "Click Refresh to probe USB Hi-MD recorder & FAT16 filesystem.";
+            }
         }
     } else if (cachedNetMdPreflight.has_value() && cachedNetMdPreflight->device.deviceId == preferredId) {
         const auto& pre = *cachedNetMdPreflight;
@@ -1708,7 +1734,7 @@ void Studio::triggerRecordProbeFromUi() {
         return;
     }
     if (discWorkspace.selectedRecordDeviceIsHiMd()) {
-        startHiMdProbeJob(selectedId.toStdString());
+        startHiMdProbeJob(selectedId.toStdString(), false);
     } else {
         startNetMdProbeJob(selectedId.toStdString());
     }

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -31,8 +32,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <sddl.h>
 #else
+#include <cerrno>
+#include <csignal>
+#include <poll.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 extern "C" {
@@ -124,8 +134,85 @@ std::string copyPorfforOutputString() {
     return std::string(reinterpret_cast<const char*>(ptr), len);
 }
 
+std::mutex& emitMutex() {
+    static std::mutex m;
+    return m;
+}
+
+#if defined(_WIN32)
+HANDLE gSessionOutPipe = INVALID_HANDLE_VALUE;
+
+bool writeAllWinPipe(HANDLE hPipe, const char* data, DWORD total) {
+    DWORD writtenTotal = 0;
+    while (writtenTotal < total) {
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) {
+            return false;
+        }
+        DWORD chunk = 0;
+        const BOOL ok = WriteFile(hPipe, data + writtenTotal, total - writtenTotal, &chunk, &ov);
+        if (!ok) {
+            if (GetLastError() != ERROR_IO_PENDING) {
+                CloseHandle(ov.hEvent);
+                return false;
+            }
+            if (WaitForSingleObject(ov.hEvent, 10000) != WAIT_OBJECT_0 ||
+                !GetOverlappedResult(hPipe, &ov, &chunk, FALSE)) {
+                CancelIo(hPipe);
+                CloseHandle(ov.hEvent);
+                return false;
+            }
+        }
+        CloseHandle(ov.hEvent);
+        if (chunk == 0) {
+            return false;
+        }
+        writtenTotal += chunk;
+    }
+    return true;
+}
+#else
+int gSessionOutSocketFd = -1;
+bool gHasSessionClientUid = false;
+uid_t gSessionClientUid = 0;
+bool gHasSessionClientGid = false;
+gid_t gSessionClientGid = 0;
+
+bool writeAllPosix(int fd, const char* data, std::size_t len) {
+    std::size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+#endif
+
 void emitJsonLine(const std::string& json) {
-    std::cout << json << "\n" << std::flush;
+    const std::string line = json + "\n";
+    const std::lock_guard<std::mutex> lk(emitMutex());
+#if defined(_WIN32)
+    if (gSessionOutPipe != INVALID_HANDLE_VALUE) {
+        (void)writeAllWinPipe(gSessionOutPipe, line.data(), static_cast<DWORD>(line.size()));
+        return;
+    }
+#else
+    if (gSessionOutSocketFd >= 0) {
+        (void)writeAllPosix(gSessionOutSocketFd, line.data(), line.size());
+        return;
+    }
+#endif
+    std::cout << line << std::flush;
 }
 
 void emitErrorResult(const std::string& msg) {
@@ -297,6 +384,18 @@ int cmdDump(const std::string& deviceId, int trackIndex, const std::string& outP
         emitErrorResult(porfforErrorString("Failed dumping track from Hi-MD device"));
         return 1;
     }
+#if !defined(_WIN32)
+    if (gHasSessionClientUid) {
+        const gid_t targetGid =
+            gHasSessionClientGid ? gSessionClientGid : static_cast<gid_t>(-1);
+        if (::chown(outPath.c_str(), gSessionClientUid, targetGid) != 0) {
+            emitErrorResult("Failed transferring ownership of Hi-MD dump output: " +
+                            std::string(std::strerror(errno)));
+            return 1;
+        }
+        (void)::chmod(outPath.c_str(), 0600);
+    }
+#endif
     const std::string raw = copyPorfforOutputString();
     emitJsonLine("{\"event\":\"result\",\"ok\":true,\"dump\":" +
                  (raw.empty() ? std::string("{}") : raw) + "}");
@@ -584,6 +683,138 @@ int cmdMockSnapshot() {
     return 0;
 }
 
+std::vector<std::string> splitTabTokens(const std::string& line) {
+    std::vector<std::string> tok;
+    std::size_t pos = 0;
+    while (true) {
+        const std::size_t tab = line.find('\t', pos);
+        if (tab == std::string::npos) {
+            tok.push_back(line.substr(pos));
+            break;
+        }
+        tok.push_back(line.substr(pos, tab - pos));
+        pos = tab + 1;
+    }
+    return tok;
+}
+
+bool constantTimeEquals(const std::string& a, const std::string& b) noexcept {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+bool readAndUnlinkTokenFile(const std::string& tokenPath, std::string& outToken,
+                            std::string& error) {
+    outToken.clear();
+    std::string content;
+    {
+        std::ifstream f(tokenPath, std::ios::binary);
+        if (!f) {
+            std::error_code ec;
+            std::filesystem::remove(tokenPath, ec);
+            error = "Failed opening Hi-MD session token file: " + tokenPath;
+            return false;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        content = ss.str();
+    }
+    std::error_code rmEc;
+    std::filesystem::remove(tokenPath, rmEc);
+
+    while (!content.empty() &&
+           (content.back() == '\n' || content.back() == '\r' || content.back() == ' ' ||
+            content.back() == '\t')) {
+        content.pop_back();
+    }
+    while (!content.empty() && (content.front() == ' ' || content.front() == '\t')) {
+        content.erase(content.begin());
+    }
+    if (content.empty()) {
+        error = "Hi-MD session token file was empty.";
+        return false;
+    }
+    outToken = std::move(content);
+    return true;
+}
+
+bool dispatchSessionLine(const std::string& rawLine, bool enableMock) {
+    std::string line = rawLine;
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    if (line.empty()) {
+        return true;
+    }
+    const auto tok = splitTabTokens(line);
+    if (tok.empty() || tok[0].empty()) {
+        return true;
+    }
+    const auto& op = tok[0];
+    if (op == "quit" || op == "exit") {
+        emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        return false;
+    }
+    if (op == "list") {
+        cmdList();
+    } else if (op == "probe" && tok.size() >= 2) {
+        cmdProbe(percentDecode(tok[1]));
+    } else if (op == "upload" && tok.size() >= 8) {
+        cmdUpload(percentDecode(tok[1]), percentDecode(tok[2]), percentDecode(tok[3]),
+                  percentDecode(tok[4]), percentDecode(tok[5]), percentDecode(tok[6]),
+                  tok[7] == "1");
+    } else if (op == "dump" && tok.size() >= 5) {
+        cmdDump(percentDecode(tok[1]), std::atoi(tok[2].c_str()), percentDecode(tok[3]),
+                tok[4] == "1");
+    } else if (op == "rename-disc" && tok.size() >= 4) {
+        cmdRenameDisc(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
+    } else if (op == "rename-track" && tok.size() >= 10) {
+        cmdRenameTrack(percentDecode(tok[1]), std::atoi(tok[2].c_str()), tok[3] == "1",
+                       percentDecode(tok[4]), tok[5] == "1", percentDecode(tok[6]),
+                       tok[7] == "1", percentDecode(tok[8]), tok[9] == "1");
+    } else if (op == "move-track" && tok.size() >= 5) {
+        cmdMoveTrack(percentDecode(tok[1]), std::atoi(tok[2].c_str()), std::atoi(tok[3].c_str()),
+                     tok[4] == "1");
+    } else if (op == "set-groups" && tok.size() >= 4) {
+        cmdSetGroups(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
+    } else if (op == "delete-tracks" && tok.size() >= 4) {
+        cmdDeleteTracks(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
+    } else if (op == "wipe" && tok.size() >= 4) {
+        cmdWipe(percentDecode(tok[1]), tok[2] == "1", tok[3] == "1");
+    } else if (op == "mock-reset" && enableMock) {
+        carta::resetMockHiMdState();
+        emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+    } else if (op == "mock-guard" && enableMock && tok.size() >= 2) {
+        carta::setHiMdSimulateRealHardwareGuardOnMock(tok[1] == "1");
+        emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+    } else if (op == "mock-snapshot" && enableMock) {
+        cmdMockSnapshot();
+    } else if (op == "mock-save-image" && enableMock && tok.size() >= 2) {
+        std::string err;
+        if (!carta::saveMockHiMdImage(percentDecode(tok[1]), err)) {
+            emitErrorResult(err);
+        } else {
+            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        }
+    } else if (op == "mock-load-image" && enableMock && tok.size() >= 2) {
+        std::string err;
+        if (!carta::loadMockHiMdImage(percentDecode(tok[1]), err)) {
+            emitErrorResult(err);
+        } else {
+            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        }
+    } else {
+        emitErrorResult("Unknown or malformed session command: " + op);
+    }
+    return true;
+}
+
 int runSessionLoop(bool enableMock) {
     if (enableMock) {
         carta::setMockHiMdEnabled(true);
@@ -591,85 +822,530 @@ int runSessionLoop(bool enableMock) {
     }
     std::string line;
     while (std::getline(std::cin, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (line.empty()) {
-            continue;
-        }
-        std::vector<std::string> tok;
-        std::size_t pos = 0;
-        while (true) {
-            const std::size_t tab = line.find('\t', pos);
-            if (tab == std::string::npos) {
-                tok.push_back(line.substr(pos));
-                break;
-            }
-            tok.push_back(line.substr(pos, tab - pos));
-            pos = tab + 1;
-        }
-        if (tok.empty() || tok[0].empty()) {
-            continue;
-        }
-        const auto& op = tok[0];
-        if (op == "quit" || op == "exit") {
-            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        if (!dispatchSessionLine(line, enableMock)) {
             break;
-        }
-        if (op == "list") {
-            cmdList();
-        } else if (op == "probe" && tok.size() >= 2) {
-            cmdProbe(percentDecode(tok[1]));
-        } else if (op == "upload" && tok.size() >= 8) {
-            cmdUpload(percentDecode(tok[1]), percentDecode(tok[2]), percentDecode(tok[3]),
-                      percentDecode(tok[4]), percentDecode(tok[5]), percentDecode(tok[6]),
-                      tok[7] == "1");
-        } else if (op == "dump" && tok.size() >= 5) {
-            cmdDump(percentDecode(tok[1]), std::atoi(tok[2].c_str()), percentDecode(tok[3]),
-                    tok[4] == "1");
-        } else if (op == "rename-disc" && tok.size() >= 4) {
-            cmdRenameDisc(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
-        } else if (op == "rename-track" && tok.size() >= 10) {
-            cmdRenameTrack(percentDecode(tok[1]), std::atoi(tok[2].c_str()), tok[3] == "1",
-                           percentDecode(tok[4]), tok[5] == "1", percentDecode(tok[6]),
-                           tok[7] == "1", percentDecode(tok[8]), tok[9] == "1");
-        } else if (op == "move-track" && tok.size() >= 5) {
-            cmdMoveTrack(percentDecode(tok[1]), std::atoi(tok[2].c_str()), std::atoi(tok[3].c_str()),
-                         tok[4] == "1");
-        } else if (op == "set-groups" && tok.size() >= 4) {
-            cmdSetGroups(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
-        } else if (op == "delete-tracks" && tok.size() >= 4) {
-            cmdDeleteTracks(percentDecode(tok[1]), percentDecode(tok[2]), tok[3] == "1");
-        } else if (op == "wipe" && tok.size() >= 4) {
-            cmdWipe(percentDecode(tok[1]), tok[2] == "1", tok[3] == "1");
-        } else if (op == "mock-reset" && enableMock) {
-            carta::resetMockHiMdState();
-            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
-        } else if (op == "mock-guard" && enableMock && tok.size() >= 2) {
-            carta::setHiMdSimulateRealHardwareGuardOnMock(tok[1] == "1");
-            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
-        } else if (op == "mock-snapshot" && enableMock) {
-            cmdMockSnapshot();
-        } else if (op == "mock-save-image" && enableMock && tok.size() >= 2) {
-            std::string err;
-            if (!carta::saveMockHiMdImage(percentDecode(tok[1]), err)) {
-                emitErrorResult(err);
-            } else {
-                emitJsonLine("{\"event\":\"result\",\"ok\":true}");
-            }
-        } else if (op == "mock-load-image" && enableMock && tok.size() >= 2) {
-            std::string err;
-            if (!carta::loadMockHiMdImage(percentDecode(tok[1]), err)) {
-                emitErrorResult(err);
-            } else {
-                emitJsonLine("{\"event\":\"result\",\"ok\":true}");
-            }
-        } else {
-            emitErrorResult("Unknown or malformed session command: " + op);
         }
     }
     return 0;
 }
+
+#if !defined(_WIN32)
+bool isPosixParentAlive(long long parentPid) noexcept {
+    if (parentPid <= 0) {
+        return true;
+    }
+    if (::kill(static_cast<pid_t>(parentPid), 0) == 0) {
+        return true;
+    }
+    return errno != ESRCH;
+}
+
+bool readSocketLinePosix(int fd, std::string& carryBuf, std::string& outLine, long long parentPid,
+                         int maxIdleMs, bool& outParentDied) {
+    outLine.clear();
+    outParentDied = false;
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const std::size_t nl = carryBuf.find('\n');
+        if (nl != std::string::npos) {
+            outLine = carryBuf.substr(0, nl);
+            carryBuf.erase(0, nl + 1);
+            return true;
+        }
+        if (!isPosixParentAlive(parentPid)) {
+            outParentDied = true;
+            return false;
+        }
+        if (maxIdleMs >= 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+            if (elapsed >= maxIdleMs) {
+                return false;
+            }
+        }
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int prc = ::poll(&pfd, 1, 500);
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (prc == 0) {
+            continue;
+        }
+        char chunk[4096];
+        const ssize_t n = ::read(fd, chunk, sizeof(chunk));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            if (!carryBuf.empty()) {
+                outLine.swap(carryBuf);
+                return true;
+            }
+            return false;
+        }
+        carryBuf.append(chunk, static_cast<std::size_t>(n));
+    }
+}
+
+int runSocketSessionLoop(bool enableMock, const std::string& socketPath, bool hasClientUid,
+                         uid_t clientUid, bool hasClientGid, gid_t clientGid,
+                         const std::string& tokenFile, long long parentPid) {
+    std::signal(SIGPIPE, SIG_IGN);
+    if (socketPath.empty()) {
+        emitErrorResult("session --socket requires a non-empty path.");
+        return 1;
+    }
+
+    std::string expectedToken;
+    if (!tokenFile.empty()) {
+        std::string tokErr;
+        if (!readAndUnlinkTokenFile(tokenFile, expectedToken, tokErr)) {
+            emitErrorResult(tokErr);
+            return 1;
+        }
+    }
+
+    sockaddr_un addr{};
+    if (socketPath.size() >= sizeof(addr.sun_path)) {
+        emitErrorResult("Hi-MD socket path exceeds Unix sockaddr_un limit.");
+        return 1;
+    }
+
+    if (enableMock) {
+        carta::setMockHiMdEnabled(true);
+        carta::resetMockHiMdState();
+    }
+
+    (void)::unlink(socketPath.c_str());
+    const int srvFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srvFd < 0) {
+        emitErrorResult("socket() failed for Hi-MD session: " + std::string(std::strerror(errno)));
+        return 1;
+    }
+
+    struct ServerCleanup {
+        int srvFd = -1;
+        int clientFd = -1;
+        std::string socketPath;
+        ~ServerCleanup() {
+            gSessionOutSocketFd = -1;
+            gHasSessionClientUid = false;
+            gHasSessionClientGid = false;
+            if (clientFd >= 0) {
+                ::close(clientFd);
+            }
+            if (srvFd >= 0) {
+                ::close(srvFd);
+            }
+            if (!socketPath.empty()) {
+                ::unlink(socketPath.c_str());
+            }
+        }
+    } cleanup{srvFd, -1, socketPath};
+
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, socketPath.c_str(), socketPath.size() + 1u);
+
+    const mode_t prevMask = ::umask(0177);
+    const int bindRc =
+        ::bind(srvFd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+    const int bindErr = errno;
+    ::umask(prevMask);
+    if (bindRc != 0) {
+        emitErrorResult("bind() failed on Hi-MD socket '" + socketPath +
+                        "': " + std::string(std::strerror(bindErr)));
+        return 1;
+    }
+
+    if (hasClientUid || hasClientGid) {
+        if (::chown(socketPath.c_str(), hasClientUid ? clientUid : static_cast<uid_t>(-1),
+                    hasClientGid ? clientGid : static_cast<gid_t>(-1)) != 0) {
+            emitErrorResult("chown() failed on Hi-MD socket: " + std::string(std::strerror(errno)));
+            return 1;
+        }
+    }
+    (void)::chmod(socketPath.c_str(), 0600);
+
+    if (::listen(srvFd, 2) != 0) {
+        emitErrorResult("listen() failed on Hi-MD socket: " + std::string(std::strerror(errno)));
+        return 1;
+    }
+
+    gHasSessionClientUid = hasClientUid;
+    gSessionClientUid = clientUid;
+    gHasSessionClientGid = hasClientGid;
+    gSessionClientGid = clientGid;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    int authFailures = 0;
+    std::string carryBuf;
+
+    while (cleanup.clientFd < 0) {
+        if (!isPosixParentAlive(parentPid)) {
+            return 0;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            emitErrorResult("Timed out waiting for client connection on Hi-MD socket.");
+            return 1;
+        }
+        struct pollfd pfd{};
+        pfd.fd = srvFd;
+        pfd.events = POLLIN;
+        const int prc = ::poll(&pfd, 1, 500);
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            emitErrorResult("poll() failed accepting Hi-MD socket client.");
+            return 1;
+        }
+        if (prc == 0) {
+            continue;
+        }
+
+        const int cfd = ::accept(srvFd, nullptr, nullptr);
+        if (cfd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            emitErrorResult("accept() failed on Hi-MD socket.");
+            return 1;
+        }
+
+        bool peerAllowed = true;
+        if (hasClientUid) {
+#if defined(__APPLE__)
+            uid_t peerUid = 0;
+            gid_t peerGid = 0;
+            if (::getpeereid(cfd, &peerUid, &peerGid) != 0 ||
+                (peerUid != clientUid && peerUid != 0)) {
+                peerAllowed = false;
+            }
+#elif defined(__linux__)
+            struct ucred cred{};
+            socklen_t credLen = sizeof(cred);
+            if (::getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &credLen) != 0 ||
+                (cred.uid != clientUid && cred.uid != 0)) {
+                peerAllowed = false;
+            }
+#endif
+        }
+        if (!peerAllowed) {
+            const char msg[] =
+                "{\"event\":\"result\",\"ok\":false,\"error\":\"Unauthorized peer UID.\"}\n";
+            (void)writeAllPosix(cfd, msg, sizeof(msg) - 1u);
+            ::close(cfd);
+            if (++authFailures >= 5) {
+                return 1;
+            }
+            continue;
+        }
+
+        carryBuf.clear();
+        if (!expectedToken.empty()) {
+            std::string authLine;
+            bool parentDied = false;
+            if (!readSocketLinePosix(cfd, carryBuf, authLine, parentPid, 5000, parentDied)) {
+                ::close(cfd);
+                if (parentDied) {
+                    return 0;
+                }
+                if (++authFailures >= 5) {
+                    return 1;
+                }
+                continue;
+            }
+            if (!authLine.empty() && authLine.back() == '\r') {
+                authLine.pop_back();
+            }
+            const auto authTok = splitTabTokens(authLine);
+            if (authTok.size() != 2 || authTok[0] != "auth" ||
+                !constantTimeEquals(percentDecode(authTok[1]), expectedToken)) {
+                const char msg[] =
+                    "{\"event\":\"result\",\"ok\":false,\"error\":\"Unauthorized session token.\"}\n";
+                (void)writeAllPosix(cfd, msg, sizeof(msg) - 1u);
+                ::close(cfd);
+                if (++authFailures >= 5) {
+                    return 1;
+                }
+                continue;
+            }
+            gSessionOutSocketFd = cfd;
+            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        }
+
+        cleanup.clientFd = cfd;
+        gSessionOutSocketFd = cfd;
+    }
+
+    std::string rawLine;
+    bool parentDied = false;
+    while (readSocketLinePosix(cleanup.clientFd, carryBuf, rawLine, parentPid, -1, parentDied)) {
+        if (!dispatchSessionLine(rawLine, enableMock)) {
+            break;
+        }
+    }
+    return 0;
+}
+#else
+bool isWinParentAlive(HANDLE hParent) noexcept {
+    if (!hParent) {
+        return true;
+    }
+    return WaitForSingleObject(hParent, 0) == WAIT_TIMEOUT;
+}
+
+bool readPipeLineWin(HANDLE hPipe, std::string& carryBuf, std::string& outLine, HANDLE hParent,
+                     int maxIdleMs, bool& outParentDied) {
+    outLine.clear();
+    outParentDied = false;
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        const std::size_t nl = carryBuf.find('\n');
+        if (nl != std::string::npos) {
+            outLine = carryBuf.substr(0, nl);
+            carryBuf.erase(0, nl + 1);
+            return true;
+        }
+        if (!isWinParentAlive(hParent)) {
+            outParentDied = true;
+            return false;
+        }
+        if (maxIdleMs >= 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+            if (elapsed >= maxIdleMs) {
+                return false;
+            }
+        }
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hPipe, nullptr, 0, nullptr, &avail, nullptr)) {
+            if (!carryBuf.empty()) {
+                outLine.swap(carryBuf);
+                return true;
+            }
+            return false;
+        }
+        if (avail == 0) {
+            Sleep(20);
+            continue;
+        }
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) {
+            return false;
+        }
+        char chunk[4096];
+        DWORD readLen = 0;
+        const BOOL ok = ReadFile(hPipe, chunk, sizeof(chunk), &readLen, &ov);
+        if (!ok) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                while (true) {
+                    const DWORD wr = WaitForSingleObject(ov.hEvent, 250);
+                    if (wr == WAIT_OBJECT_0) {
+                        if (!GetOverlappedResult(hPipe, &ov, &readLen, FALSE)) {
+                            CloseHandle(ov.hEvent);
+                            return false;
+                        }
+                        break;
+                    }
+                    if (!isWinParentAlive(hParent)) {
+                        CancelIo(hPipe);
+                        CloseHandle(ov.hEvent);
+                        outParentDied = true;
+                        return false;
+                    }
+                }
+            } else {
+                CloseHandle(ov.hEvent);
+                if (!carryBuf.empty()) {
+                    outLine.swap(carryBuf);
+                    return true;
+                }
+                return false;
+            }
+        }
+        CloseHandle(ov.hEvent);
+        if (readLen == 0) {
+            if (!carryBuf.empty()) {
+                outLine.swap(carryBuf);
+                return true;
+            }
+            return false;
+        }
+        carryBuf.append(chunk, static_cast<std::size_t>(readLen));
+    }
+}
+
+int runPipeSessionLoop(bool enableMock, const std::string& pipeName, const std::string& tokenFile,
+                       long long parentPid) {
+    if (pipeName.empty()) {
+        emitErrorResult("session --pipe requires a non-empty pipe name.");
+        return 1;
+    }
+
+    std::string expectedToken;
+    if (!tokenFile.empty()) {
+        std::string tokErr;
+        if (!readAndUnlinkTokenFile(tokenFile, expectedToken, tokErr)) {
+            emitErrorResult(tokErr);
+            return 1;
+        }
+    }
+
+    if (enableMock) {
+        carta::setMockHiMdEnabled(true);
+        carta::resetMockHiMdState();
+    }
+
+    const int wideLen = MultiByteToWideChar(CP_UTF8, 0, pipeName.c_str(), -1, nullptr, 0);
+    if (wideLen <= 0) {
+        emitErrorResult("Invalid UTF-8 Hi-MD pipe name.");
+        return 1;
+    }
+    std::vector<wchar_t> widePipe(static_cast<std::size_t>(wideLen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, pipeName.c_str(), -1, widePipe.data(), wideLen);
+
+    PSECURITY_DESCRIPTOR pSd = nullptr;
+    SECURITY_ATTRIBUTES sa{};
+    SECURITY_ATTRIBUTES* pSa = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GRGW;;;SY)(A;;GRGW;;;BA)(A;;GRGW;;;IU)", SDDL_REVISION_1, &pSd, nullptr)) {
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = pSd;
+        sa.bInheritHandle = FALSE;
+        pSa = &sa;
+    }
+
+    HANDLE hPipe = CreateNamedPipeW(
+        widePipe.data(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 65536, 65536, 0, pSa);
+    if (pSd) {
+        LocalFree(pSd);
+    }
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        emitErrorResult("CreateNamedPipeW failed for Hi-MD session (error " +
+                        std::to_string(GetLastError()) + ").");
+        return 1;
+    }
+
+    HANDLE hParent =
+        parentPid > 0 ? OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parentPid)) : nullptr;
+    struct PipeCleanup {
+        HANDLE hPipe = INVALID_HANDLE_VALUE;
+        HANDLE hParent = nullptr;
+        ~PipeCleanup() {
+            gSessionOutPipe = INVALID_HANDLE_VALUE;
+            if (hPipe != INVALID_HANDLE_VALUE) {
+                FlushFileBuffers(hPipe);
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
+            }
+            if (hParent) {
+                CloseHandle(hParent);
+            }
+        }
+    } cleanup{hPipe, hParent};
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    bool authenticated = false;
+    int authFailures = 0;
+    std::string carryBuf;
+
+    while (!authenticated) {
+        if (!isWinParentAlive(hParent)) {
+            return 0;
+        }
+        OVERLAPPED ov{};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent) {
+            return 1;
+        }
+        BOOL connected = ConnectNamedPipe(hPipe, &ov);
+        if (!connected) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_PIPE_CONNECTED) {
+                connected = TRUE;
+            } else if (err == ERROR_IO_PENDING) {
+                while (true) {
+                    const DWORD wr = WaitForSingleObject(ov.hEvent, 250);
+                    if (wr == WAIT_OBJECT_0) {
+                        DWORD dummy = 0;
+                        connected = GetOverlappedResult(hPipe, &ov, &dummy, FALSE);
+                        break;
+                    }
+                    if (!isWinParentAlive(hParent) ||
+                        std::chrono::steady_clock::now() >= deadline) {
+                        CancelIo(hPipe);
+                        CloseHandle(ov.hEvent);
+                        return 0;
+                    }
+                }
+            }
+        }
+        CloseHandle(ov.hEvent);
+        if (!connected) {
+            return 1;
+        }
+
+        carryBuf.clear();
+        if (!expectedToken.empty()) {
+            std::string authLine;
+            bool parentDied = false;
+            if (!readPipeLineWin(hPipe, carryBuf, authLine, hParent, 5000, parentDied)) {
+                DisconnectNamedPipe(hPipe);
+                if (parentDied) {
+                    return 0;
+                }
+                if (++authFailures >= 5) {
+                    return 1;
+                }
+                continue;
+            }
+            if (!authLine.empty() && authLine.back() == '\r') {
+                authLine.pop_back();
+            }
+            const auto authTok = splitTabTokens(authLine);
+            if (authTok.size() != 2 || authTok[0] != "auth" ||
+                !constantTimeEquals(percentDecode(authTok[1]), expectedToken)) {
+                const char msg[] =
+                    "{\"event\":\"result\",\"ok\":false,\"error\":\"Unauthorized session token.\"}\n";
+                (void)writeAllWinPipe(hPipe, msg, static_cast<DWORD>(sizeof(msg) - 1u));
+                FlushFileBuffers(hPipe);
+                DisconnectNamedPipe(hPipe);
+                if (++authFailures >= 5) {
+                    return 1;
+                }
+                continue;
+            }
+            gSessionOutPipe = hPipe;
+            emitJsonLine("{\"event\":\"result\",\"ok\":true}");
+        }
+        gSessionOutPipe = hPipe;
+        authenticated = true;
+    }
+
+    std::string rawLine;
+    bool parentDied = false;
+    while (readPipeLineWin(hPipe, carryBuf, rawLine, hParent, -1, parentDied)) {
+        if (!dispatchSessionLine(rawLine, enableMock)) {
+            break;
+        }
+    }
+    return 0;
+}
+#endif
 
 void printUsage() {
     std::cerr
@@ -689,7 +1365,8 @@ void printUsage() {
         << "  carta-himd delete-tracks <device-id> --tracks <csv> [--confirm-hardware]\n"
         << "  carta-himd wipe <device-id> [--reformat] [--confirm-hardware]\n"
         << "  carta-himd selftest-stack\n"
-        << "  carta-himd session [--mock]\n";
+        << "  carta-himd session [--mock] [--socket <path> | --pipe <name>] [--client-uid <uid>] "
+           "[--client-gid <gid>] [--token-file <path>] [--parent-pid <pid>]\n";
 }
 
 } // namespace
@@ -920,11 +1597,53 @@ int main(int argc, char** argv) {
     }
     if (cmd == "session") {
         bool mock = false;
+        std::string socketPath;
+        std::string pipeName;
+        std::string tokenFile;
+        long long parentPid = 0;
+#if !defined(_WIN32)
+        bool hasClientUid = false;
+        uid_t clientUid = 0;
+        bool hasClientGid = false;
+        gid_t clientGid = 0;
+#endif
         for (int i = 2; i < argc; ++i) {
             if (std::strcmp(argv[i], "--mock") == 0) {
                 mock = true;
+            } else if (std::strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
+                socketPath = argv[++i];
+            } else if (std::strcmp(argv[i], "--pipe") == 0 && i + 1 < argc) {
+                pipeName = argv[++i];
+            } else if (std::strcmp(argv[i], "--token-file") == 0 && i + 1 < argc) {
+                tokenFile = argv[++i];
+            } else if (std::strcmp(argv[i], "--parent-pid") == 0 && i + 1 < argc) {
+                parentPid = std::atoll(argv[++i]);
+            } else if (std::strcmp(argv[i], "--client-uid") == 0 && i + 1 < argc) {
+#if !defined(_WIN32)
+                clientUid = static_cast<uid_t>(std::strtoul(argv[++i], nullptr, 10));
+                hasClientUid = true;
+#else
+                ++i;
+#endif
+            } else if (std::strcmp(argv[i], "--client-gid") == 0 && i + 1 < argc) {
+#if !defined(_WIN32)
+                clientGid = static_cast<gid_t>(std::strtoul(argv[++i], nullptr, 10));
+                hasClientGid = true;
+#else
+                ++i;
+#endif
             }
         }
+#if defined(_WIN32)
+        if (!pipeName.empty()) {
+            return runPipeSessionLoop(mock, pipeName, tokenFile, parentPid);
+        }
+#else
+        if (!socketPath.empty()) {
+            return runSocketSessionLoop(mock, socketPath, hasClientUid, clientUid, hasClientGid,
+                                        clientGid, tokenFile, parentPid);
+        }
+#endif
         return runSessionLoop(mock);
     }
 

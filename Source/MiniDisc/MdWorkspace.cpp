@@ -1579,6 +1579,15 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
     deviceTrackList.updateContent();
     updateTabVisibility();
     deviceTrackList.repaint();
+    if (snapshot.activeDeviceIsHiMd && snapshot.hiMdNeedsElevation) {
+        refreshRecordButton.setButtonText("Unlock...");
+        refreshRecordButton.setTooltip(
+            "Authorize administrator access once for this session to inspect and record Hi-MD");
+    } else {
+        refreshRecordButton.setButtonText("Refresh");
+        refreshRecordButton.setTooltip(
+            "Scan USB for connected NetMD / Hi-MD devices and inspect inserted disc");
+    }
     refreshRecordButton.setEnabled(!recordBusy);
     loadDiscButton.setEnabled(!recordBusy && snapshot.canLoadDisc);
     readDiscTocButton.setEnabled(
@@ -2113,7 +2122,7 @@ void MdWorkspace::layoutDeviceCard(juce::Rectangle<int> area) {
     auto topRow = area.removeFromTop(22);
     deviceCardTitle.setBounds(topRow.removeFromLeft(60));
     topRow.removeFromLeft(4);
-    refreshRecordButton.setBounds(topRow.removeFromRight(62));
+    refreshRecordButton.setBounds(topRow.removeFromRight(68));
     topRow.removeFromRight(4);
     recordDeviceBox.setBounds(topRow);
 

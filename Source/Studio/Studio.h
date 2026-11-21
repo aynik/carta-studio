@@ -993,7 +993,7 @@ class Studio final : public juce::AudioAppComponent,
                              bool confirmHardware, bool showAlerts = true);
     bool applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& error);
     void pollNetMdJobProgress();
-    void refreshRecordWorkspace(bool scanDevices);
+    void refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt = false);
     void triggerRecordProbeFromUi();
     void triggerReadDiscTocFromUi();
     void triggerLoadDiscFromUi();
@@ -1029,6 +1029,7 @@ class Studio final : public juce::AudioAppComponent,
             hiMdPendingAlertBody.clear();
             hiMdPendingStatus.reset();
             hiMdPendingLoadedDisc.reset();
+            hiMdPendingNeedsElevation = false;
         }
         hiMdDonePending.store(false);
         carta::setHiMdProgress(op, initialPhase, 0.0);
@@ -1059,7 +1060,7 @@ class Studio final : public juce::AudioAppComponent,
             });
     }
 
-    void startHiMdProbeJob(const std::string& devId);
+    void startHiMdProbeJob(const std::string& devId, bool allowElevationPrompt = true);
     void startHiMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
     void startHiMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
                             bool confirmHardware, bool showAlerts = true);
@@ -1560,6 +1561,8 @@ class Studio final : public juce::AudioAppComponent,
     juce::String hiMdPendingAlertBody;
     std::optional<carta::HiMdDeviceStatus> hiMdPendingStatus;
     std::optional<carta::MdDisc> hiMdPendingLoadedDisc;
+    bool hiMdNeedsElevation = false;
+    bool hiMdPendingNeedsElevation = false;
     juce::File workspaceSettingsFile;
     carta::WorkspacePreferences lastWorkspacePreferences;
     juce::String discWorkspaceAudioError;

@@ -162,7 +162,7 @@ if(APPLE)
         INSTALL_RPATH "@executable_path/../Frameworks")
 elseif(WIN32)
     target_link_libraries(carta-himd PRIVATE
-        "${CARTA_PORFFOR_HIMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" bcrypt setupapi cfgmgr32 uuid)
+        "${CARTA_PORFFOR_HIMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" bcrypt setupapi cfgmgr32 uuid advapi32)
     if(CARTA_LIBUSB_DLL AND EXISTS "${CARTA_LIBUSB_DLL}")
         add_custom_command(TARGET carta-himd POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -508,6 +508,7 @@ if(BUILD_TESTING)
         PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
     carta_link_porffor_codecs(CartaHiMdBridgeTests)
     if(WIN32)
+        target_link_libraries(CartaHiMdBridgeTests PRIVATE shell32)
         add_custom_command(TARGET CartaHiMdBridgeTests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:carta-himd>" "$<TARGET_FILE_DIR:CartaHiMdBridgeTests>/"
             VERBATIM)

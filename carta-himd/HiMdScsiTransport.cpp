@@ -2014,55 +2014,107 @@ std::unique_ptr<PhysicalHiMdHandle> PhysicalHiMdHandle::open(const std::string& 
 
 #if defined(__APPLE__)
     if (deviceId.rfind("macos:", 0) == 0) {
-        auto macMatches = scanMacHiMdUsbServices();
-        for (auto& m : macMatches) {
-            if (m.id != deviceId) {
+        auto containsInsensitive = [](const std::string& hay, const char* needle) {
+            if (!needle || needle[0] == '\0') {
+                return false;
+            }
+            const std::size_t nLen = std::strlen(needle);
+            if (hay.size() < nLen) {
+                return false;
+            }
+            for (std::size_t i = 0; i + nLen <= hay.size(); ++i) {
+                bool match = true;
+                for (std::size_t j = 0; j < nLen; ++j) {
+                    if (std::tolower(static_cast<unsigned char>(hay[i + j])) !=
+                        std::tolower(static_cast<unsigned char>(needle[j]))) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto isTransientMacReenumError = [&](const std::string& msg) {
+            if (containsInsensitive(msg, "access denied") ||
+                containsInsensitive(msg, "insufficient permissions")) {
+                return false;
+            }
+            return containsInsensitive(msg, "no longer connected") ||
+                   containsInsensitive(msg, "entity not found") ||
+                   containsInsensitive(msg, "resource busy") ||
+                   containsInsensitive(msg, "no such device") ||
+                   containsInsensitive(msg, "pipe error") ||
+                   containsInsensitive(msg, "not found");
+        };
+
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            bool foundMatch = false;
+            error.clear();
+            auto macMatches = scanMacHiMdUsbServices();
+            for (auto& m : macMatches) {
+                if (m.id != deviceId) {
+                    continue;
+                }
+                foundMatch = true;
+                bool didUnmount = false;
+                if (!m.bsdWholeDisk.empty()) {
+                    std::string daErr;
+                    (void)setBsdWholeDiskMountState(m.bsdWholeDisk, false, didUnmount, daErr);
+                }
+                if (m.scsiService != IO_OBJECT_NULL) {
+                    IOCFPlugInInterface** plugIn = nullptr;
+                    SInt32 score = 0;
+                    IOReturn kr = IOCreatePlugInInterfaceForService(
+                        m.scsiService, kIOSCSITaskDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
+                        &plugIn, &score);
+                    if (kr == kIOReturnSuccess && plugIn) {
+                        SCSITaskDeviceInterface** devIf = nullptr;
+                        const HRESULT hr = (*plugIn)->QueryInterface(
+                            plugIn, CFUUIDGetUUIDBytes(kIOSCSITaskDeviceInterfaceID),
+                            reinterpret_cast<LPVOID*>(&devIf));
+                        if (hr == S_OK && devIf) {
+                            kr = (*devIf)->ObtainExclusiveAccess(devIf);
+                            if (kr == kIOReturnSuccess) {
+                                auto impl = std::make_unique<Impl>();
+                                impl->backend =
+                                    std::make_unique<MacScsiTaskBackend>(plugIn, devIf);
+                                return std::make_unique<PhysicalHiMdHandle>(std::move(impl));
+                            }
+                            (*devIf)->Release(devIf);
+                        }
+                        IODestroyPlugInInterface(plugIn);
+                    }
+                }
+                // Path B: fall back to libusb USB Mass Storage BOT
+                auto backend = openLibusbBotBackend(m.vendorId, m.productId, -1, -1, m.locationId,
+                                                    m.bsdWholeDisk, error);
+                if (!backend) {
+                    if (didUnmount) {
+                        bool ignored = false;
+                        std::string remountErr;
+                        (void)setBsdWholeDiskMountState(m.bsdWholeDisk, true, ignored, remountErr);
+                    }
+                    break;
+                }
+                auto impl = std::make_unique<Impl>();
+                impl->backend = std::move(backend);
+                return std::make_unique<PhysicalHiMdHandle>(std::move(impl));
+            }
+            if (attempt < 9 && (!foundMatch || isTransientMacReenumError(error))) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 continue;
             }
-            bool didUnmount = false;
-            if (!m.bsdWholeDisk.empty()) {
-                std::string daErr;
-                (void)setBsdWholeDiskMountState(m.bsdWholeDisk, false, didUnmount, daErr);
+            if (!foundMatch && error.empty()) {
+                error = "Physical Hi-MD device not found: " + deviceId;
             }
-            if (m.scsiService != IO_OBJECT_NULL) {
-                IOCFPlugInInterface** plugIn = nullptr;
-                SInt32 score = 0;
-                IOReturn kr = IOCreatePlugInInterfaceForService(
-                    m.scsiService, kIOSCSITaskDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
-                    &plugIn, &score);
-                if (kr == kIOReturnSuccess && plugIn) {
-                    SCSITaskDeviceInterface** devIf = nullptr;
-                    const HRESULT hr = (*plugIn)->QueryInterface(
-                        plugIn, CFUUIDGetUUIDBytes(kIOSCSITaskDeviceInterfaceID),
-                        reinterpret_cast<LPVOID*>(&devIf));
-                    if (hr == S_OK && devIf) {
-                        kr = (*devIf)->ObtainExclusiveAccess(devIf);
-                        if (kr == kIOReturnSuccess) {
-                            auto impl = std::make_unique<Impl>();
-                            impl->backend = std::make_unique<MacScsiTaskBackend>(plugIn, devIf);
-                            return std::make_unique<PhysicalHiMdHandle>(std::move(impl));
-                        }
-                        (*devIf)->Release(devIf);
-                    }
-                    IODestroyPlugInInterface(plugIn);
-                }
-            }
-            // Path B: fall back to libusb USB Mass Storage BOT
-            auto backend = openLibusbBotBackend(m.vendorId, m.productId, -1, -1, m.locationId,
-                                                m.bsdWholeDisk, error);
-            if (!backend) {
-                if (didUnmount) {
-                    bool ignored = false;
-                    std::string remountErr;
-                    (void)setBsdWholeDiskMountState(m.bsdWholeDisk, true, ignored, remountErr);
-                }
-                return nullptr;
-            }
-            auto impl = std::make_unique<Impl>();
-            impl->backend = std::move(backend);
-            return std::make_unique<PhysicalHiMdHandle>(std::move(impl));
+            return nullptr;
         }
-        error = "Physical Hi-MD device not found: " + deviceId;
+        if (error.empty()) {
+            error = "Physical Hi-MD device not found: " + deviceId;
+        }
         return nullptr;
     }
 #elif defined(__linux__)

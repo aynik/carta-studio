@@ -995,8 +995,75 @@ struct StudioComponentTests {
             check(dock.readDiscTocButton.getButtonText() == "Dump Track..." &&
                       dock.eraseDiscButton.getButtonText() == "Wipe Disc..." &&
                       dock.writeUtocButton.getButtonText() == "Disc Tools..." &&
-                      dock.recordDiscButton.getButtonText() == "Record Hi-MD...",
+                      dock.recordDiscButton.getButtonText() == "Record Hi-MD..." &&
+                      dock.refreshRecordButton.getButtonText() == "Refresh",
                   "Record action buttons adapt labels cleanly for Hi-MD mode");
+
+            {
+                MdWorkspace::RecordUiSnapshot lockedSnap;
+                lockedSnap.hiMdDevices = {
+                    {"macos:054c:0287:02100000", 0x054c, 0x0287, "Sony MZ-RH1", false,
+                     "macos-usb-bot", {}}};
+                lockedSnap.activeDeviceId = "macos:054c:0287:02100000";
+                lockedSnap.activeDeviceIsHiMd = true;
+                lockedSnap.hiMdNeedsElevation = true;
+                lockedSnap.badgeText = "Hi-MD locked (admin required)";
+                lockedSnap.statusText =
+                    "Administrator privileges required for Hi-MD USB access. Click 'Unlock...' "
+                    "to authorize once for this session.";
+                dock.updateRecordSummary(lockedSnap);
+                check(dock.refreshRecordButton.getButtonText() == "Unlock...",
+                      "Locked Hi-MD device switches action button label to Unlock...");
+                for (int w : {780, 1180}) {
+                    const int h = (w == 780) ? 260 : 280;
+                    dock.setSize(w, h);
+                    dock.resized();
+                    check(!rectsOverlap({dock.deviceCardTitle.getBounds(),
+                                         dock.recordDeviceBox.getBounds(),
+                                         dock.refreshRecordButton.getBounds()}) &&
+                              rectsInsideBounds({dock.deviceCardTitle.getBounds(),
+                                                 dock.recordDeviceBox.getBounds(),
+                                                 dock.refreshRecordButton.getBounds()},
+                                                dock.deviceCardBounds),
+                          "Unlock... button and device dropdown fit without overlap at 780px and "
+                          "1180px");
+                }
+            }
+
+            {
+                MdWorkspace::RecordUiSnapshot recSnap2;
+                recSnap2.hiMdDevices = {
+                    {"mock:mz-rh1", 0x054c, 0x0287, "Sony MZ-RH1", true, "mock", {}}};
+                recSnap2.activeDeviceId = "mock:mz-rh1";
+                recSnap2.activeDeviceIsHiMd = true;
+                recSnap2.hasHiMdStatus = true;
+                recSnap2.hiMdStatus.deviceId = "mock:mz-rh1";
+                recSnap2.hiMdStatus.deviceName = "Sony MZ-RH1";
+                recSnap2.hiMdStatus.inquiryVid = "SONY";
+                recSnap2.hiMdStatus.inquiryPid = "MZ-RH1";
+                recSnap2.hiMdStatus.discTitle = "Mock Hi-MD";
+                recSnap2.hiMdStatus.fsTotalBytes = 305000000;
+                recSnap2.hiMdStatus.fsUsedBytes = 12000000;
+                recSnap2.hiMdStatus.fsFreeBytes = 293000000;
+                recSnap2.hiMdStatus.trackCount = 2;
+                recSnap2.hiMdStatus.tracks = {
+                    {0, 1, "Hi-SP Track", "Mock Artist", "Mock Album", "Hi-SP", 256, 125.0},
+                    {1, 2, "PCM Track", "Mock Artist", "Mock Album", "PCM", 1411, 60.0},
+                };
+                recSnap2.badgeText =
+                    juce::String::fromUTF8("Hi-MD USB \xc2\xb7 SONY MZ-RH1 \xc2\xb7 2 trk");
+                recSnap2.statusText = "Hi-MD disc has 2 track(s)";
+                recSnap2.utocSummaryText =
+                    juce::String::fromUTF8("Hi-MD FAT16 \xc2\xb7 2 trk \xc2\xb7 3.1 MB");
+                recSnap2.canLoadDisc = true;
+                recSnap2.canDumpTrack = true;
+                recSnap2.canErase = true;
+                recSnap2.canManageHiMd = true;
+                recSnap2.canRecord = false;
+                dock.updateRecordSummary(recSnap2);
+                check(dock.refreshRecordButton.getButtonText() == "Refresh",
+                      "Unlocked Hi-MD device restores Refresh button label");
+            }
 
             for (int w : {780, 1180}) {
                 const int h = (w == 780) ? 260 : 280;
@@ -1338,9 +1405,13 @@ struct StudioComponentTests {
             check(static_cast<bool>(fullSt["ok"]) &&
                       fullSt["result"]["himd"].isObject() &&
                       !static_cast<bool>(fullSt["result"]["himd"]["active"]) &&
+                      fullSt["result"]["himd"]["elevated"].isBool() &&
+                      fullSt["result"]["himd"]["elevation_required"].isBool() &&
                       static_cast<bool>(hiSt["ok"]) &&
-                      !static_cast<bool>(hiSt["result"]["active"]),
-                  "IPC status['himd'] and himd status succeed when idle");
+                      !static_cast<bool>(hiSt["result"]["active"]) &&
+                      hiSt["result"]["elevated"].isBool() &&
+                      hiSt["result"]["elevation_required"].isBool(),
+                  "IPC status['himd'] and himd status expose idle elevation fields cleanly");
 
             for (const juce::StringArray& unconfirmed :
                  {juce::StringArray{"himd", "record", "usb:054c:0287"},
