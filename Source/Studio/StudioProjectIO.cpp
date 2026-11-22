@@ -2121,6 +2121,9 @@ void Studio::saveProject(std::function<void(bool)> completion, bool saveAs, bool
         }
         return;
     }
+    if (!ipc) {
+        discWorkspace.commitPendingEdits();
+    }
 
     const auto write = [safe = juce::Component::SafePointer<Studio>(this), completion, ipc,
                         noReplace, forcePackage, saveAs](const juce::File& file) {

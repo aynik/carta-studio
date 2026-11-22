@@ -18,7 +18,10 @@
  *   starting around cluster 50 rather than logical cluster 1. `writeNetMdUtoc`
  *   preserves hardware Sector 0 physical cluster bounds and `P-FRA` chain via
  *   either the cached recorded span map or matching on-disc Sector 0 topology,
- *   and preserves raw Sector 3 verbatim via the `0x17` write sector mask.
+ *   writes Shift-JIS Sector 4 to peripheral index 3 on Sony hardware (`mask=0x0F`,
+ *   never overwriting read-only P-TOC at index 4), or index 4 on legacy
+ *   Rainbow Book 5-sector fixtures (`mask=0x17`), omitting Sector 4 (`mask=0x07`)
+ *   when unused.
  * - Threading: Helper calls serialize on an internal bridge mutex; callers on
  *   background workers can poll `getNetMdProgress()` safely.
  */

@@ -301,6 +301,7 @@ void Studio::editSelectedTrackMdFlags() {
 // ============================================================================
 
 void Studio::inspectCurrentUtoc() {
+    discWorkspace.commitPendingEdits();
     carta::UtocDiscState utoc;
     std::string reason;
     if (!carta::compileMdDiscToUtoc(session.mdDisc, utoc, reason)) {
@@ -319,6 +320,7 @@ void Studio::inspectCurrentUtoc() {
 }
 
 void Studio::exportCurrentUtocDialog() {
+    discWorkspace.commitPendingEdits();
     launchStudioChooser(
         "Export UTOC bundle (Sectors 0, 1, 2, 4)",
         juce::File::getSpecialLocation(juce::File::userMusicDirectory).getChildFile("disc.utoc"),
@@ -516,7 +518,8 @@ void Studio::startNetMdReadUtocJob(const std::string& devId, const juce::File& o
             }
 
             if (outFile != juce::File{}) {
-                // Pack Sectors 0, 1, 2, and 4 into the 9408-byte UTOC bundle (Sector 3 omitted).
+                // Pack Sectors 0, 1, 2, and 4 into the 9408-byte UTOC bundle (Sector 3 / P-TOC omitted).
+                const std::size_t sec4Idx = carta::utocSector4IndexIn5SectorDump(rawSectors);
                 std::vector<std::uint8_t> bundle(4 * carta::kUtocSectorBytes, 0);
                 std::memcpy(bundle.data() + 0 * carta::kUtocSectorBytes, rawSectors[0].data(),
                             carta::kUtocSectorBytes);
@@ -524,7 +527,7 @@ void Studio::startNetMdReadUtocJob(const std::string& devId, const juce::File& o
                             carta::kUtocSectorBytes);
                 std::memcpy(bundle.data() + 2 * carta::kUtocSectorBytes, rawSectors[2].data(),
                             carta::kUtocSectorBytes);
-                std::memcpy(bundle.data() + 3 * carta::kUtocSectorBytes, rawSectors[4].data(),
+                std::memcpy(bundle.data() + 3 * carta::kUtocSectorBytes, rawSectors[sec4Idx].data(),
                             carta::kUtocSectorBytes);
 
                 juce::TemporaryFile tmp(outFile);
@@ -707,9 +710,14 @@ void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware, 
 
 void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::string& devId,
                                     bool confirmHardware, bool showAlerts) {
+    const auto prevPreflight =
+        (cachedNetMdPreflight.has_value() && cachedNetMdPreflight->device.deviceId == devId)
+            ? cachedNetMdPreflight
+            : std::optional<carta::NetMdPreflightReport>{};
+
     launchNetMdWorker(
         "write-utoc", devId, "Writing UTOC Sectors 0/1/2/4...",
-        [this, snapCopy = snapshot, devId, confirmHardware, showAlerts](
+        [this, snapCopy = snapshot, devId, confirmHardware, showAlerts, prevPreflight](
             std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
             juce::String& alertBody,
             std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
@@ -727,10 +735,12 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
                 return false;
             }
 
+            const std::size_t sec4Idx = carta::utocSector4IndexIn5SectorDump(committedRaw);
+            const std::size_t preservedIdx = (sec4Idx == 3u) ? 4u : 3u;
             if (snapCopy.mdDisc.loadedDisc.active) {
                 snapCopy.mdDisc.loadedDisc.baselineSector0Hash = committedHash;
-                snapCopy.mdDisc.loadedDisc.rawSector3.assign(committedRaw[3].begin(),
-                                                             committedRaw[3].end());
+                snapCopy.mdDisc.loadedDisc.rawSector3.assign(committedRaw[preservedIdx].begin(),
+                                                             committedRaw[preservedIdx].end());
             }
             {
                 std::lock_guard<std::mutex> lk(netMdMutex);
@@ -740,12 +750,24 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
                 netMdPendingNeedsReload = false;
             }
 
-            afterPreflight = carta::preflightNetMdRecording(snapCopy, snapCopy.mdDisc, devId);
-            if (afterPreflight->deviceConnected) {
-                applyCommittedDiscIdentity(afterPreflight->device,
+            if (prevPreflight.has_value() && prevPreflight->deviceConnected) {
+                auto updatedDev = prevPreflight->device;
+                applyCommittedDiscIdentity(updatedDev,
                                            static_cast<int>(snapCopy.mdDisc.tracks.size()),
                                            snapCopy.mdDisc.halfWidthTitle,
-                                           snapCopy.mdDisc.fullWidthTitle, false, &snapCopy.mdDisc);
+                                           snapCopy.mdDisc.fullWidthTitle, false,
+                                           &snapCopy.mdDisc);
+                afterPreflight = carta::preflightNetMdRecordingWithStatus(
+                    snapCopy, snapCopy.mdDisc, updatedDev);
+            } else {
+                afterPreflight = carta::preflightNetMdRecording(snapCopy, snapCopy.mdDisc, devId);
+                if (afterPreflight->deviceConnected) {
+                    applyCommittedDiscIdentity(afterPreflight->device,
+                                               static_cast<int>(snapCopy.mdDisc.tracks.size()),
+                                               snapCopy.mdDisc.halfWidthTitle,
+                                               snapCopy.mdDisc.fullWidthTitle, false,
+                                               &snapCopy.mdDisc);
+                }
             }
 
             auto* o = new juce::DynamicObject();
@@ -768,9 +790,14 @@ void Studio::startNetMdWriteUtocJob(const carta::Session& snapshot, const std::s
 
 void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
                                  bool confirmHardware, bool showAlerts) {
+    const auto prevPreflight =
+        (cachedNetMdPreflight.has_value() && cachedNetMdPreflight->device.deviceId == devId)
+            ? cachedNetMdPreflight
+            : std::optional<carta::NetMdPreflightReport>{};
+
     launchNetMdWorker(
         "record", devId, "Preparing ATRAC spans...",
-        [this, snapshot = std::move(snapshotIn), devId, confirmHardware, showAlerts](
+        [this, snapshot = std::move(snapshotIn), devId, confirmHardware, showAlerts, prevPreflight](
             std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
             juce::String& alertBody,
             std::optional<carta::NetMdPreflightReport>& afterPreflight) mutable {
@@ -787,10 +814,14 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
             }
 
             if (rec.hasCommittedRawSectors) {
+                const std::size_t sec4Idx =
+                    carta::utocSector4IndexIn5SectorDump(rec.committedRawSectors);
+                const std::size_t preservedIdx = (sec4Idx == 3u) ? 4u : 3u;
                 if (snapshot.mdDisc.loadedDisc.active) {
                     snapshot.mdDisc.loadedDisc.baselineSector0Hash = rec.committedSector0Hash;
                     snapshot.mdDisc.loadedDisc.rawSector3.assign(
-                        rec.committedRawSectors[3].begin(), rec.committedRawSectors[3].end());
+                        rec.committedRawSectors[preservedIdx].begin(),
+                        rec.committedRawSectors[preservedIdx].end());
                 }
                 std::lock_guard<std::mutex> lk(netMdMutex);
                 netMdPendingCommittedRawSectors = rec.committedRawSectors;
@@ -799,12 +830,24 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
                 netMdPendingNeedsReload = rec.needsReloadToFinishUpload;
             }
 
-            afterPreflight = carta::preflightNetMdRecording(snapshot, snapshot.mdDisc, devId);
-            if (afterPreflight->deviceConnected && !rec.needsReloadToFinishUpload) {
-                applyCommittedDiscIdentity(afterPreflight->device,
+            if (!rec.needsReloadToFinishUpload && prevPreflight.has_value() &&
+                prevPreflight->deviceConnected) {
+                auto updatedDev = prevPreflight->device;
+                applyCommittedDiscIdentity(updatedDev,
                                            static_cast<int>(snapshot.mdDisc.tracks.size()),
                                            snapshot.mdDisc.halfWidthTitle,
                                            snapshot.mdDisc.fullWidthTitle, false, &snapshot.mdDisc);
+                afterPreflight = carta::preflightNetMdRecordingWithStatus(
+                    snapshot, snapshot.mdDisc, updatedDev);
+            } else {
+                afterPreflight = carta::preflightNetMdRecording(snapshot, snapshot.mdDisc, devId);
+                if (afterPreflight->deviceConnected && !rec.needsReloadToFinishUpload) {
+                    applyCommittedDiscIdentity(afterPreflight->device,
+                                               static_cast<int>(snapshot.mdDisc.tracks.size()),
+                                               snapshot.mdDisc.halfWidthTitle,
+                                               snapshot.mdDisc.fullWidthTitle, false,
+                                               &snapshot.mdDisc);
+                }
             }
 
             auto* o = new juce::DynamicObject();
@@ -897,15 +940,18 @@ void Studio::pollNetMdJobProgress() {
                 {
                     const juce::ScopedLock guard(lock);
                     if (session.mdDisc.loadedDisc.active) {
+                        const std::size_t sec4Idx =
+                            carta::utocSector4IndexIn5SectorDump(committedRaw);
+                        const std::size_t preservedIdx = (sec4Idx == 3u) ? 4u : 3u;
                         session.mdDisc.loadedDisc.baselineSector0Hash = committedHash;
-                        session.mdDisc.loadedDisc.rawSector3.assign(committedRaw[3].begin(),
-                                                                    committedRaw[3].end());
+                        session.mdDisc.loadedDisc.rawSector3.assign(
+                            committedRaw[preservedIdx].begin(), committedRaw[preservedIdx].end());
                         carta::UtocDiscState parsedCommitted{};
                         std::string parseErr;
                         if (carta::parseUtocSectors(
                                 committedRaw[0].data(), committedRaw[1].data(),
-                                committedRaw[2].data(), committedRaw[4].data(), parsedCommitted,
-                                parseErr) &&
+                                committedRaw[2].data(), committedRaw[sec4Idx].data(),
+                                parsedCommitted, parseErr) &&
                             parsedCommitted.hasSector0) {
                             session.mdDisc.loadedDisc.initialFreeRanges.clear();
                             std::uint8_t slot = parsedCommitted.trackMap[0];
@@ -1956,6 +2002,7 @@ void Studio::triggerEraseDiscFromUi() {
 }
 
 void Studio::triggerRecordWriteUtocFromUi() {
+    discWorkspace.commitPendingEdits();
     if (netMdBusy.load() || hiMdBusy.load()) {
         status.setText("Wait for the current MiniDisc operation to finish.",
                        juce::dontSendNotification);
@@ -2000,6 +2047,7 @@ void Studio::triggerRecordWriteUtocFromUi() {
 }
 
 void Studio::triggerRecordStartFromUi() {
+    discWorkspace.commitPendingEdits();
     if (netMdBusy.load() || hiMdBusy.load()) {
         status.setText("Wait for the current MiniDisc operation to finish.",
                        juce::dontSendNotification);

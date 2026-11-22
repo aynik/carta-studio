@@ -5,16 +5,23 @@
  * Sector & Slot Architecture:
  * - Each raw UTOC sector is `kUtocSectorBytes` (2,352 bytes): 48-byte header
  *   (`0x00..0x2F`), 256-entry slot pointer table (`0x30..0x12F`), and 256 8-byte
- *   slots (`0x130..0x92F`, where slot 0 is null terminator and slots 1..255 are
- *   allocatable).
+ *   slots (`0x130..0x92F`, where slots `1..255` form the allocatable free pool
+ *   headed at `0x2F`).
  * - Sector 0: Audio fragment DAG (`trackMap[0]` = P-FRA free-area pointer,
  *   `trackMap[1..N]` = first fragment slot per track) using 24-bit packed
  *   `(cluster:14, sector:6, group:4)` addresses (32 sectors/cluster, 11 sound
- *   groups/sector = 352 units/cluster).
+ *   groups/sector = 352 units/cluster); slot 0 is the null terminator.
  * - Sector 1: Half-width ASCII / JIS X 0201 Kana titles and Sony group syntax
  *   (`0;discTitle//1-3;groupTitle//`) in 7-byte linked `UtocTitleCell` chains.
+ *   Slot 0 (`0x130..0x137`) stores the first 7 bytes of the disc header/title
+ *   and chains any overflow through `cells[0].link` into slots `1..255`;
+ *   `halfTitleMap[0]` is `0`, while `halfTitleMap[1..N] == 0` denotes an
+ *   untitled track.
  * - Sector 2: Recording timestamps for disc header (`map[0]`) and tracks.
- * - Sector 4: Full-width Shift-JIS (CP932) title chains (`０；...／／`).
+ * - Sector 4: Full-width Shift-JIS (CP932) title chains (`０；...／／`), using
+ *   the same Slot 0 disc-title + `map[1..N]` track-title layout. On Sony NetMD
+ *   hardware peripheral reads/writes, Sector 4 occupies peripheral index 3
+ *   while read-only P-TOC (`"MINI"`) occupies index 4.
  *
  * Invariants & Threading:
  * - Pure stateless serialization/deserialization; safe to invoke concurrently on
@@ -244,13 +251,25 @@ std::vector<UtocGroupEntry> parseUtocGroups(const std::string& rawHalfTitle,
 // Binary Sector Codec & Authoring Conversion
 // ============================================================================
 
-/**
- * Parses provided non-null 2,352-byte UTOC sectors (0, 1, 2, 4) into `out`.
+/** Parses provided non-null 2,352-byte UTOC sectors (0, 1, 2, 4) into `out`.
  * Requires at least one non-null sector pointer. Resets `out` and populates `error` on failure.
  */
 bool parseUtocSectors(const std::uint8_t* sector0, const std::uint8_t* sector1,
                       const std::uint8_t* sector2, const std::uint8_t* sector4, UtocDiscState& out,
                       std::string& error);
+
+/** Returns true if a 2,352-byte sector is a MiniDisc P-TOC sector ("MINI" at 0x18..0x1B). */
+bool isPtocSector(const std::uint8_t* sector2352) noexcept;
+
+/**
+ * Returns the index (3 or 4) of UTOC Sector 4 (full-width Shift-JIS titles) inside a 5-sector
+ * peripheral dump. Sony NetMD hardware places Sector 4 at index 3 and P-TOC ("MINI") at index 4;
+ * legacy Rainbow Book 5-sector files place Sector 3 at index 3 and Sector 4 at index 4.
+ */
+inline std::size_t utocSector4IndexIn5SectorDump(
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors) noexcept {
+    return isPtocSector(rawSectors[4].data()) ? 3u : 4u;
+}
 
 /** Serializes `state` into four 2,352-byte UTOC binary sectors (0, 1, 2, 4). */
 bool compileUtocSectors(const UtocDiscState& state,

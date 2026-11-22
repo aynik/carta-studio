@@ -774,6 +774,7 @@ MdWorkspace::MdWorkspace()
     addChildComponent(inspectUtocButton);
     inspectUtocButton.setTooltip("View raw UTOC fragment chain, title cells, and timestamps");
     inspectUtocButton.onClick = [this] {
+        commitPendingEdits();
         if (onInspectUtoc) {
             onInspectUtoc();
         }
@@ -782,6 +783,7 @@ MdWorkspace::MdWorkspace()
     addChildComponent(importUtocButton);
     importUtocButton.setTooltip("Import UTOC Sector 0/1/2/4 bundle or raw binary");
     importUtocButton.onClick = [this] {
+        commitPendingEdits();
         if (onImportUtoc) {
             onImportUtoc();
         }
@@ -790,6 +792,7 @@ MdWorkspace::MdWorkspace()
     addChildComponent(exportUtocButton);
     exportUtocButton.setTooltip("Export compiled UTOC sectors");
     exportUtocButton.onClick = [this] {
+        commitPendingEdits();
         if (onExportUtoc) {
             onExportUtoc();
         }
@@ -804,6 +807,7 @@ MdWorkspace::MdWorkspace()
     recordDeviceBox.setTooltip("Select connected NetMD or Hi-MD USB recorder");
     recordDeviceBox.onChange = [this] {
         if (!syncingControls && onRecordPreflight) {
+            commitPendingEdits();
             onRecordPreflight();
         }
     };
@@ -812,6 +816,7 @@ MdWorkspace::MdWorkspace()
     refreshRecordButton.setTooltip(
         "Scan USB for connected NetMD / Hi-MD devices and inspect inserted disc");
     refreshRecordButton.onClick = [this] {
+        commitPendingEdits();
         if (onRefreshRecord) {
             onRefreshRecord();
         }
@@ -831,6 +836,7 @@ MdWorkspace::MdWorkspace()
     loadDiscButton.setTooltip(
         "Load existing MiniDisc UTOC into editor for non-destructive editing");
     loadDiscButton.onClick = [this] {
+        commitPendingEdits();
         if (onLoadDisc) {
             onLoadDisc();
         }
@@ -839,6 +845,7 @@ MdWorkspace::MdWorkspace()
     addChildComponent(readDiscTocButton);
     readDiscTocButton.setTooltip("Read physical UTOC Sectors 0/1/2/4 from the inserted MiniDisc");
     readDiscTocButton.onClick = [this] {
+        commitPendingEdits();
         if (onReadDiscToc) {
             onReadDiscToc();
         }
@@ -848,6 +855,7 @@ MdWorkspace::MdWorkspace()
     eraseDiscButton.setTooltip(
         "Erase all tracks (and switch Hi-MD formatted discs back to standard MD)");
     eraseDiscButton.onClick = [this] {
+        commitPendingEdits();
         if (onEraseDisc) {
             onEraseDisc();
         }
@@ -892,6 +900,7 @@ MdWorkspace::MdWorkspace()
     writeUtocButton.setTooltip(
         "Update UTOC Sectors 0/1/2/4 on hardware without erasing recorded audio");
     writeUtocButton.onClick = [this] {
+        commitPendingEdits();
         if (onRecordWriteUtoc) {
             onRecordWriteUtoc();
         }
@@ -902,6 +911,7 @@ MdWorkspace::MdWorkspace()
         "Sync edited MiniDisc UTOC and upload any new audio spans without erasing preserved "
         "on-disc audio");
     recordDiscButton.onClick = [this] {
+        commitPendingEdits();
         if (onRecordStart) {
             onRecordStart();
         }
@@ -988,8 +998,8 @@ void MdWorkspace::setActiveTab(const juce::String& tab, bool notify) {
                           ? juce::String("record")
                           : juce::String("tracks");
     const bool changed = next != activeTab;
-    if (changed && next != "tracks" && inlineEditingRow >= 0) {
-        commitInlineTrackEdit(true);
+    if (changed && next != "tracks") {
+        commitPendingEdits();
     }
     activeTab = next;
     updateTabVisibility();

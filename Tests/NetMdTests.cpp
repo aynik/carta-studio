@@ -406,13 +406,21 @@ int main() {
             }
         }
 
-        // Parse committed UTOC Sectors 0/1/2/4 and validate full MD semantics.
+        // Parse committed UTOC Sectors 0/1/2/4 and validate full MD semantics (Sony P-TOC intact at [4], SJIS at [3]).
+        REQUIRE(carta::isPtocSector(snap.committedUtoc[4].data()) &&
+                    carta::utocSector4IndexIn5SectorDump(snap.committedUtoc) == 3u,
+                "Sony P-TOC at index 4 must remain intact and Sector 4 Shift-JIS must reside at index 3");
         carta::UtocDiscState parsed{};
-        REQUIRE(carta::parseUtocSectors(snap.committedUtoc[0].data(), snap.committedUtoc[1].data(),
-                                        snap.committedUtoc[2].data(), snap.committedUtoc[4].data(),
-                                        parsed, err),
+        REQUIRE(carta::parseUtocSectors(
+                    snap.committedUtoc[0].data(), snap.committedUtoc[1].data(),
+                    snap.committedUtoc[2].data(), snap.committedUtoc[3].data(), parsed, err),
                 "parseUtocSectors failed: " + err);
         REQUIRE(parsed.trackCount == 3, "Expected 3 UTOC tracks");
+        REQUIRE(parsed.halfTitleMap[0] == 0 && parsed.halfTitleCells[0].bytes[0] != 0 &&
+                    parsed.fullTitleMap[0] == 0 && parsed.fullTitleCells[0].bytes[0] != 0 &&
+                    snap.committedUtoc[0][0x23] == 0x17u &&
+                    snap.committedUtoc[3][0x2B] == 0x02u,
+                "Committed UTOC must encode HW & FW disc titles in Slot 0 with usedSectors=0x17");
 
         const auto budget = carta::computeUtocBudget(parsed, "md80");
         REQUIRE(budget.sharedFragmentCount >= 1, "Expected shared UTOC fragment for p1");
@@ -483,15 +491,22 @@ int main() {
                     readRt.groups.size() == 1 && readRt.groups[0].halfWidthTitle == "Side A",
                 "readNetMdDiscUtoc must match recorded disc state");
 
-        // Verify probeNetMdDevice reports the on-disc uploaded spans cleanly via NetMD AVC.
+        // Verify probeNetMdDevice reads DRAM UTOC (not stale SRAM) and reports all 3 tracks + disc title immediately.
         carta::NetMdDeviceStatus probedAfterRec{};
         REQUIRE(carta::probeNetMdDevice("mock:mz-n920", probedAfterRec, err),
                 "probeNetMdDevice after record failed: " + err);
-        REQUIRE(probedAfterRec.tracks.size() == 2 && probedAfterRec.tracks[0].codec == "SP" &&
-                    probedAfterRec.tracks[1].codec == "LP2" &&
-                    !probedAfterRec.tracks[0].title.empty() &&
+        REQUIRE(probedAfterRec.trackCount == 3 && probedAfterRec.tracks.size() == 3 &&
+                    probedAfterRec.discTitle == "CARTA MD" &&
+                    probedAfterRec.fullWidthTitle ==
+                        "\xE3\x82\xAB\xE3\x83\xAB\xE3\x82\xBF\xE7\x9B\xA4" &&
+                    probedAfterRec.tracks[0].title == "TRK ONE" &&
+                    probedAfterRec.tracks[0].codec == "SP" &&
+                    probedAfterRec.tracks[1].title == "SHARED S1" &&
+                    probedAfterRec.tracks[1].codec == "SP" &&
+                    probedAfterRec.tracks[2].title == "LP2 FINALE" &&
+                    probedAfterRec.tracks[2].codec == "LP2" &&
                     probedAfterRec.tracks[0].durationSeconds > 0,
-                "probeNetMdDevice must return uploaded tracks with titles, codecs, and durations");
+                "probeNetMdDevice must return DRAM UTOC tracks and disc title without eject/reinsert");
 
         // Compare streaming encodeAtracNetMdWire against container extraction for all NetMD modes.
         for (const std::string& mode : {"sp-stereo", "sp-mono", "lp2", "lp4"}) {
@@ -617,7 +632,16 @@ int main() {
             st.sec0aPadding[14] = allocF({610, 0, 0}, {610, 31, 10}, 0); // P-DFA
 
             auto setHw = [&](std::size_t idx, const std::string& txt) {
-                const std::uint8_t slot = static_cast<std::uint8_t>(idx + 1);
+                if (idx == 0) {
+                    st.halfTitleCells[0].bytes.fill(0);
+                    for (std::size_t j = 0; j < 7 && j < txt.size(); ++j) {
+                        st.halfTitleCells[0].bytes[j] = static_cast<std::uint8_t>(txt[j]);
+                    }
+                    st.halfTitleCells[0].link = 0;
+                    st.halfTitleMap[0] = 0;
+                    return;
+                }
+                const std::uint8_t slot = static_cast<std::uint8_t>(idx);
                 st.halfTitleCells[slot].bytes.fill(0);
                 for (std::size_t j = 0; j < 7 && j < txt.size(); ++j) {
                     st.halfTitleCells[slot].bytes[j] = static_cast<std::uint8_t>(txt[j]);
@@ -628,7 +652,7 @@ int main() {
             setHw(0, "ORIG MD");
             setHw(1, "OrigT1");
             setHw(2, "OrigT2");
-            st.nextFreeHalfTitleSlot = 4;
+            st.nextFreeHalfTitleSlot = 3;
 
             std::string compErr;
             return carta::compileUtocSectors(st, outRaw[0], outRaw[1], outRaw[2], outRaw[4], compErr);
@@ -889,7 +913,16 @@ int main() {
             st50.trackMap[0] = allocFrag50({100, 0, 0}, {2251, 31, 10}, 0);
 
             auto setHw50 = [&](std::size_t idx, const std::string& txt) {
-                const std::uint8_t slot = static_cast<std::uint8_t>(idx + 1);
+                if (idx == 0) {
+                    st50.halfTitleCells[0].bytes.fill(0);
+                    for (std::size_t j = 0; j < 7 && j < txt.size(); ++j) {
+                        st50.halfTitleCells[0].bytes[j] = static_cast<std::uint8_t>(txt[j]);
+                    }
+                    st50.halfTitleCells[0].link = 0;
+                    st50.halfTitleMap[0] = 0;
+                    return;
+                }
+                const std::uint8_t slot = static_cast<std::uint8_t>(idx);
                 st50.halfTitleCells[slot].bytes.fill(0);
                 for (std::size_t j = 0; j < 7 && j < txt.size(); ++j) {
                     st50.halfTitleCells[slot].bytes[j] = static_cast<std::uint8_t>(txt[j]);
@@ -901,7 +934,7 @@ int main() {
             for (int t = 0; t < 50; ++t) {
                 setHw50(static_cast<std::size_t>(t + 1), "T" + std::to_string(t + 1));
             }
-            st50.nextFreeHalfTitleSlot = 52;
+            st50.nextFreeHalfTitleSlot = 51;
 
             std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw50{};
             std::string compErr50;
@@ -914,8 +947,10 @@ int main() {
             carta::NetMdDeviceStatus largeProbe{};
             REQUIRE(carta::probeNetMdDevice("mock:mz-n920", largeProbe, mockErr),
                     "probeNetMdDevice 50-track failed: " + mockErr);
-            REQUIRE(largeProbe.trackCount == 50 && largeProbe.tracks.empty(),
-                    "probeNetMdDevice must skip per-track AVC polling when trackCount > 40");
+            REQUIRE(largeProbe.trackCount == 50 && largeProbe.tracks.size() == 50 &&
+                        largeProbe.discTitle == "50TRKMD" && largeProbe.tracks[0].title == "T1" &&
+                        largeProbe.tracks[49].title == "T50",
+                    "DRAM-backed probeNetMdDevice must populate 50-track metadata without AVC limit");
 
             carta::MdDisc largeLoaded{};
             carta::NetMdDeviceStatus largeLoadedStatus{};
@@ -980,10 +1015,10 @@ int main() {
             if (withPdfa) {
                 st.sec0aPadding[14] = allocF({610, 0, 0}, {610, 31, 10}, 0);
             }
-            st.halfTitleCells[1].bytes = {'R', 'A', 'W', 0, 0, 0, 0};
-            st.halfTitleCells[1].link = 0;
-            st.halfTitleMap[0] = 1;
-            st.nextFreeHalfTitleSlot = 2;
+            st.halfTitleCells[0].bytes = {'R', 'A', 'W', 0, 0, 0, 0};
+            st.halfTitleCells[0].link = 0;
+            st.halfTitleMap[0] = 0;
+            st.nextFreeHalfTitleSlot = 1;
 
             std::string compErr;
             return carta::compileUtocSectors(st, outRaw[0], outRaw[1], outRaw[2], outRaw[4],
@@ -1179,9 +1214,9 @@ int main() {
             impState.trackMap[1] = allocImp({50, 0, 0}, {60, 31, 10}, spStereoMode);
             impState.trackMap[2] = allocImp({70, 0, 0}, {80, 31, 10}, spStereoMode);
             impState.trackMap[0] = allocImp({121, 0, 0}, {2401, 31, 10}, 0);
-            impState.halfTitleCells[1].bytes = {'I', 'M', 'P', 0, 0, 0, 0};
-            impState.halfTitleMap[0] = 1;
-            impState.nextFreeHalfTitleSlot = 2;
+            impState.halfTitleCells[0].bytes = {'I', 'M', 'P', 0, 0, 0, 0};
+            impState.halfTitleMap[0] = 0;
+            impState.nextFreeHalfTitleSlot = 1;
             std::array<std::uint8_t, carta::kUtocSectorBytes> is0{}, is1{}, is2{}, is4{};
             std::string impCompErr;
             REQUIRE(carta::compileUtocSectors(impState, is0, is1, is2, is4, impCompErr),
@@ -1344,6 +1379,58 @@ int main() {
                     gapParsed.fragments[gapParsed.trackMap[1]].start.toLinearGroup() !=
                         gapParsed.fragments[gapParsed.trackMap[2]].start.toLinearGroup(),
                 "3D forced-gap UTOC tracks must reference separate physical spans: " + err);
+    }
+
+    // 3E. Full-width-only disc title + Write UTOC Only title updates reflected immediately via DRAM probe
+    {
+        std::string err;
+        REQUIRE(carta::resetNetMdTestMockSession(err),
+                "Failed resetting mock session for 3E FW disc title test: " + err);
+
+        carta::MdDisc fwDisc;
+        fwDisc.medium = carta::MdMedium::md80;
+        fwDisc.defaultCodec = carta::MdCodecMode::spStereo;
+        fwDisc.halfWidthTitle = "Long Disc Title";
+        fwDisc.fullWidthTitle = "\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88\xE7\x9B\xA4"; // テスト盤
+        carta::MdTrack fwTrk;
+        fwTrk.id = carta::makeMdTrackId();
+        fwTrk.halfWidthTitle = "Track One";
+        fwTrk.fullWidthTitle = {}; // Deliberately empty per-track FW title!
+        fwTrk.parts = {{0, kSegLen}};
+        fwDisc.tracks = {fwTrk};
+
+        carta::NetMdRecordResult fwRec{};
+        REQUIRE(carta::recordNetMdDisc(session, fwDisc, "mock:mz-n920", false, fwRec, err),
+                "3E recordNetMdDisc failed: " + err);
+        TestMockSnapshot fwSnap{};
+        REQUIRE(fetchMockSnapshot(fwSnap, err), "fetchMockSnapshot 3E failed: " + err);
+        REQUIRE(carta::isPtocSector(fwSnap.committedUtoc[4].data()) &&
+                    fwSnap.committedUtoc[0][0x23] == 0x17u &&
+                    fwSnap.committedUtoc[3][0x2B] == 0x02u &&
+                    fwSnap.committedUtoc[3][0x30] == 0x00u &&
+                    fwSnap.committedUtoc[3][0x130] != 0x00u,
+                "3E full-width-only disc title must set usedSectors=0x17, write Slot 0 in index 3, and preserve P-TOC in index 4");
+
+        carta::NetMdDeviceStatus fwProbe{};
+        REQUIRE(carta::probeNetMdDevice("mock:mz-n920", fwProbe, err),
+                "3E probeNetMdDevice failed: " + err);
+        REQUIRE(fwProbe.discTitle == "Long Disc Title" &&
+                    fwProbe.fullWidthTitle == fwDisc.fullWidthTitle &&
+                    fwProbe.tracks.size() == 1 && fwProbe.tracks[0].fullWidthTitle.empty(),
+                "3E probeNetMdDevice must return HW+FW disc titles and empty track FW title");
+
+        // Update only disc title via writeNetMdUtoc and verify immediate reflection without eject/reinsert
+        fwDisc.halfWidthTitle = "Updated Title";
+        fwDisc.fullWidthTitle = "\xE6\x9B\xB4\xE6\x96\xB0\xE7\x9B\xA4"; // 更新盤
+        carta::UtocBudget fwBudget{};
+        REQUIRE(carta::writeNetMdUtoc(fwDisc, "mock:mz-n920", false, fwBudget, err),
+                "3E writeNetMdUtoc title update failed: " + err);
+        carta::NetMdDeviceStatus fwUpdatedProbe{};
+        REQUIRE(carta::probeNetMdDevice("mock:mz-n920", fwUpdatedProbe, err),
+                "3E probeNetMdDevice after Write UTOC failed: " + err);
+        REQUIRE(fwUpdatedProbe.discTitle == "Updated Title" &&
+                    fwUpdatedProbe.fullWidthTitle == fwDisc.fullWidthTitle,
+                "3E Write UTOC Only title edits must reflect immediately in probeNetMdDevice");
     }
 
     REQUIRE(carta::setNetMdTestMockSessionEnabled(false, mockErr),

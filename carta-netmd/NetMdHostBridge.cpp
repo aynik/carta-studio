@@ -29,6 +29,8 @@
 #else
 #include <iconv.h>
 #if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #include <stdlib.h>
 #else
 #include <sys/random.h>
@@ -384,6 +386,51 @@ struct MockDeviceState {
         return "lp4";
     }
 
+    static bool isMockPtocSector(const std::array<std::uint8_t, kUtocSectorBytes>& sec) noexcept {
+        return sec[0x18] == 'M' && sec[0x19] == 'I' && sec[0x1A] == 'N' && sec[0x1B] == 'I';
+    }
+
+    std::size_t mockSector4Index() const noexcept {
+        return isMockPtocSector(utocCache[4]) ? 3u : 4u;
+    }
+
+    static std::string readMockDiscTitle(const std::array<std::uint8_t, kUtocSectorBytes>& sec) {
+        if (sec[0x130] == 0) {
+            return {};
+        }
+        std::vector<std::uint8_t> raw;
+        bool hitNul = false;
+        for (int j = 0; j < 7; ++j) {
+            const std::uint8_t b = sec[0x130 + static_cast<std::size_t>(j)];
+            if (b == 0) {
+                hitNul = true;
+                break;
+            }
+            raw.push_back(b);
+        }
+        if (!hitNul) {
+            std::uint8_t slot = sec[0x137];
+            std::array<bool, 256> seen{};
+            while (slot != 0 && !seen[slot]) {
+                seen[slot] = true;
+                const std::uint8_t* cell = sec.data() + 0x130 + static_cast<std::size_t>(slot) * 8u;
+                bool done = false;
+                for (int j = 0; j < 7; ++j) {
+                    if (cell[j] == 0) {
+                        done = true;
+                        break;
+                    }
+                    raw.push_back(cell[j]);
+                }
+                if (done) {
+                    break;
+                }
+                slot = cell[7];
+            }
+        }
+        return cp932ToUtf8Lossy(raw);
+    }
+
     static std::string readMockTitleChain(const std::array<std::uint8_t, kUtocSectorBytes>& sec,
                                           int slotIndex) {
         std::uint8_t slot = sec[0x30 + static_cast<std::size_t>(slotIndex)];
@@ -406,23 +453,113 @@ struct MockDeviceState {
         return cp932ToUtf8Lossy(raw);
     }
 
+    static void initMockEmptyTitleSector(std::array<std::uint8_t, kUtocSectorBytes>& sec,
+                                         std::uint8_t charCode) noexcept {
+        sec.fill(0);
+        sec[0x2B] = charCode;
+        sec[0x2F] = 1;
+        for (int i = 1; i < 255; ++i) {
+            sec[0x130 + static_cast<std::size_t>(i) * 8u + 7u] = static_cast<std::uint8_t>(i + 1);
+        }
+        sec[0x130 + 255u * 8u + 7u] = 0;
+    }
+
+    static bool writeMockTitleToSector(std::array<std::uint8_t, kUtocSectorBytes>& sec,
+                                       int slotIndex, const std::vector<std::uint8_t>& rawBytes) {
+        auto freeChain = [&](std::uint8_t head) {
+            std::array<bool, 256> seen{};
+            std::uint8_t s = head;
+            while (s != 0 && !seen[s]) {
+                seen[s] = true;
+                std::uint8_t* cell = sec.data() + 0x130 + static_cast<std::size_t>(s) * 8u;
+                const std::uint8_t next = cell[7];
+                std::fill(cell, cell + 7, 0);
+                cell[7] = sec[0x2F];
+                sec[0x2F] = s;
+                s = next;
+            }
+        };
+        auto allocChain = [&](const std::uint8_t* bytes, std::size_t len,
+                              std::uint8_t& outHead) -> bool {
+            outHead = 0;
+            if (len == 0) {
+                return true;
+            }
+            const std::size_t needed = (len + 6u) / 7u;
+            std::vector<std::uint8_t> allocated;
+            allocated.reserve(needed);
+            for (std::size_t k = 0; k < needed; ++k) {
+                std::uint8_t s = sec[0x2F];
+                if (s == 0) {
+                    return false;
+                }
+                std::uint8_t* cell = sec.data() + 0x130 + static_cast<std::size_t>(s) * 8u;
+                sec[0x2F] = cell[7];
+                std::fill(cell, cell + 8, 0);
+                allocated.push_back(s);
+            }
+            for (std::size_t k = 0; k < allocated.size(); ++k) {
+                std::uint8_t* cell =
+                    sec.data() + 0x130 + static_cast<std::size_t>(allocated[k]) * 8u;
+                const std::size_t off = k * 7u;
+                for (std::size_t j = 0; j < 7u && off + j < len; ++j) {
+                    cell[j] = bytes[off + j];
+                }
+                cell[7] = (k + 1u < allocated.size()) ? allocated[k + 1u] : 0;
+            }
+            outHead = allocated.front();
+            return true;
+        };
+
+        if (slotIndex == 0) {
+            if (sec[0x137] != 0) {
+                freeChain(sec[0x137]);
+            }
+            std::fill(sec.begin() + 0x130, sec.begin() + 0x138, 0);
+            if (rawBytes.empty()) {
+                return true;
+            }
+            const std::size_t headLen = std::min<std::size_t>(7u, rawBytes.size());
+            std::copy_n(rawBytes.begin(), headLen, sec.begin() + 0x130);
+            if (rawBytes.size() <= 7u) {
+                return true;
+            }
+            return allocChain(rawBytes.data() + 7u, rawBytes.size() - 7u, sec[0x137]);
+        }
+
+        if (slotIndex < 1 || slotIndex >= 256) {
+            return false;
+        }
+        const std::uint8_t oldHead = sec[0x30 + static_cast<std::size_t>(slotIndex)];
+        if (oldHead != 0) {
+            freeChain(oldHead);
+            sec[0x30 + static_cast<std::size_t>(slotIndex)] = 0;
+        }
+        if (rawBytes.empty()) {
+            return true;
+        }
+        return allocChain(rawBytes.data(), rawBytes.size(),
+                          sec[0x30 + static_cast<std::size_t>(slotIndex)]);
+    }
+
     void syncMockTracksFromUtocCache() {
         const auto& sec0 = utocCache[0];
         const int nTracks = std::min<int>(sec0[0x1F], 255);
+        const std::size_t sec4Idx = mockSector4Index();
 
         const auto prevTracks = std::move(uploadedTracks);
         uploadedTracks.clear();
         uploadedTracks.reserve(static_cast<std::size_t>(nTracks));
 
-        discTitleHalf = readMockTitleChain(utocCache[1], 0);
-        discTitleFull = readMockTitleChain(utocCache[4], 0);
+        discTitleHalf = readMockDiscTitle(utocCache[1]);
+        discTitleFull = readMockDiscTitle(utocCache[sec4Idx]);
 
         std::uint16_t maxEndCluster = 49;
         for (int t = 1; t <= nTracks; ++t) {
             NetMdMockUploadedTrack trk;
             trk.trackIndex = t - 1;
             trk.halfWidthTitle = readMockTitleChain(utocCache[1], t);
-            trk.fullWidthTitle = readMockTitleChain(utocCache[4], t);
+            trk.fullWidthTitle = readMockTitleChain(utocCache[sec4Idx], t);
             std::uint8_t slot = sec0[0x30 + static_cast<std::size_t>(t)];
             std::array<bool, 256> seen{};
             std::int64_t totalUnits = 0;
@@ -596,6 +733,23 @@ struct MockDeviceState {
         sec0[0x1E] = uploadedTracks.empty() ? 0u : 1u;
         const std::size_t nTracks = std::min<std::size_t>(uploadedTracks.size(), 254u);
         sec0[0x1F] = static_cast<std::uint8_t>(nTracks);
+        sec0[0x23] = 0x07u;
+
+        initMockEmptyTitleSector(utocCache[1], 0x00u);
+        initMockEmptyTitleSector(utocCache[3], 0xFFu);
+        auto& ptoc = utocCache[4];
+        ptoc[0x0C] = 0xFFu;
+        ptoc[0x0D] = 0xCAu;
+        ptoc[0x0E] = 0x00u;
+        ptoc[0x0F] = 0x11u;
+        ptoc[0x18] = 'M';
+        ptoc[0x19] = 'I';
+        ptoc[0x1A] = 'N';
+        ptoc[0x1B] = 'I';
+        ptoc[0x20] = 0x09u;
+        ptoc[0x21] = 0x7Cu;
+        ptoc[0x2C] = 0x00u;
+        ptoc[0x2D] = 0x32u;
 
         std::array<std::uint8_t, 256> links{};
         for (std::uint8_t i = 1; i < 255; ++i) {
@@ -793,6 +947,9 @@ struct UsbOpenHandle {
     std::uint16_t vendorId = 0;
     std::uint16_t productId = 0;
     bool hadIoError = false;
+#if defined(__APPLE__)
+    IOPMAssertionID sleepAssertionId = kIOPMNullAssertionID;
+#endif
 };
 
 std::map<int, UsbOpenHandle> g_handles;
@@ -1417,11 +1574,14 @@ bool handleMockVendorControlOut(const std::uint8_t* data, int len) {
             }
         }
         const std::string titleUtf8 = cp932ToUtf8Lossy(raw);
+        const std::size_t sec4Idx = g_mock.mockSector4Index();
         if (subObj == 0x1801) {
             if (data[8] != 0) {
                 g_mock.discTitleFull = titleUtf8;
+                MockDeviceState::writeMockTitleToSector(g_mock.utocCache[sec4Idx], 0, raw);
             } else {
                 g_mock.discTitleHalf = titleUtf8;
+                MockDeviceState::writeMockTitleToSector(g_mock.utocCache[1], 0, raw);
             }
         } else {
             const bool isFull = (subObj == 0x1803);
@@ -1429,10 +1589,25 @@ bool handleMockVendorControlOut(const std::uint8_t* data, int len) {
             if (slot < g_mock.uploadedTracks.size()) {
                 if (isFull) {
                     g_mock.uploadedTracks[slot].fullWidthTitle = titleUtf8;
+                    MockDeviceState::writeMockTitleToSector(
+                        g_mock.utocCache[sec4Idx], static_cast<int>(slot) + 1, raw);
                 } else {
                     g_mock.uploadedTracks[slot].halfWidthTitle = titleUtf8;
+                    MockDeviceState::writeMockTitleToSector(
+                        g_mock.utocCache[1], static_cast<int>(slot) + 1, raw);
                 }
             }
+        }
+        const auto& fwSec = g_mock.utocCache[sec4Idx];
+        bool anyFw = fwSec[0x130] != 0;
+        for (std::size_t i = 1; i < 256 && !anyFw; ++i) {
+            anyFw = fwSec[0x30 + i] != 0;
+        }
+        g_mock.utocCache[sec4Idx][0x2B] = anyFw ? 0x02u : 0xFFu;
+        if (anyFw) {
+            g_mock.utocCache[0][0x23] |= 0x10u;
+        } else {
+            g_mock.utocCache[0][0x23] = static_cast<std::uint8_t>(g_mock.utocCache[0][0x23] & ~0x10u);
         }
         std::vector<std::uint8_t> r(data, data + 21);
         r[0] = 0x09;
@@ -2497,6 +2672,15 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_open(const char* device_id) {
     entry.interfaceNumber = 0;
     entry.vendorId = static_cast<std::uint16_t>(vid);
     entry.productId = static_cast<std::uint16_t>(pid);
+#if defined(__APPLE__)
+    IOPMAssertionID assertionId = kIOPMNullAssertionID;
+    if (IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,
+                                    kIOPMAssertionLevelOn,
+                                    CFSTR("Carta Studio NetMD USB transfer"),
+                                    &assertionId) == kIOReturnSuccess) {
+        entry.sleepAssertionId = assertionId;
+    }
+#endif
     carta::g_handles[h] = entry;
     return h;
 }
@@ -2510,6 +2694,12 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_close(int handle) {
     if (it->second.isMock) {
         carta::g_mock.open = false;
     } else {
+#if defined(__APPLE__)
+        if (it->second.sleepAssertionId != kIOPMNullAssertionID) {
+            IOPMAssertionRelease(it->second.sleepAssertionId);
+            it->second.sleepAssertionId = kIOPMNullAssertionID;
+        }
+#endif
         if (it->second.usbHandle) {
             if (it->second.hadIoError) {
                 (void)libusb_reset_device(it->second.usbHandle);

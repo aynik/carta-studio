@@ -545,12 +545,39 @@ std::vector<std::uint8_t> readCellChain(const std::array<UtocTitleCell, kUtocSlo
     return bytes;
 }
 
+std::vector<std::uint8_t> readDiscTitleChain(const std::array<UtocTitleCell, kUtocSlots>& cells,
+                                             std::uint8_t legacyMapSlot0) {
+    if (cells[0].bytes[0] != 0) {
+        std::vector<std::uint8_t> bytes;
+        bool hitNul = false;
+        for (std::size_t i = 0; i < 7; ++i) {
+            if (cells[0].bytes[i] == 0) {
+                hitNul = true;
+                break;
+            }
+            bytes.push_back(cells[0].bytes[i]);
+        }
+        if (!hitNul && cells[0].link != 0) {
+            const auto tail = readCellChain(cells, cells[0].link);
+            bytes.insert(bytes.end(), tail.begin(), tail.end());
+        }
+        return bytes;
+    }
+    if (legacyMapSlot0 != 0) {
+        return readCellChain(cells, legacyMapSlot0);
+    }
+    return {};
+}
+
 std::string readHalfWidthTitleSlot(const UtocDiscState& state, int slotIndex) {
     if (!state.hasSector1) {
         return {};
     }
-    const auto bytes = readCellChain(state.halfTitleCells,
-                                     state.halfTitleMap[static_cast<std::size_t>(slotIndex)]);
+    const auto bytes =
+        (slotIndex == 0)
+            ? readDiscTitleChain(state.halfTitleCells, state.halfTitleMap[0])
+            : readCellChain(state.halfTitleCells,
+                            state.halfTitleMap[static_cast<std::size_t>(slotIndex)]);
     return decodeHalfWidthBytes(bytes.data(), bytes.size());
 }
 
@@ -558,8 +585,11 @@ std::string readFullWidthTitleSlot(const UtocDiscState& state, int slotIndex) {
     if (!state.hasSector4) {
         return {};
     }
-    const auto bytes = readCellChain(state.fullTitleCells,
-                                     state.fullTitleMap[static_cast<std::size_t>(slotIndex)]);
+    const auto bytes =
+        (slotIndex == 0)
+            ? readDiscTitleChain(state.fullTitleCells, state.fullTitleMap[0])
+            : readCellChain(state.fullTitleCells,
+                            state.fullTitleMap[static_cast<std::size_t>(slotIndex)]);
     return decodeFullWidthShiftJis(bytes.data(), bytes.size());
 }
 
@@ -593,6 +623,25 @@ bool allocateTitleCells(std::array<UtocTitleCell, kUtocSlots>& cells, std::uint8
     }
     outStartSlot = slots.front();
     return true;
+}
+
+bool allocateDiscTitleCells(std::array<UtocTitleCell, kUtocSlots>& cells, std::uint8_t& nextFree,
+                            const std::vector<std::uint8_t>& bytes, std::uint8_t& outMapSlot0,
+                            std::string& error) {
+    outMapSlot0 = 0;
+    cells[0] = {};
+    if (bytes.empty()) {
+        return true;
+    }
+    const std::size_t headCount = std::min<std::size_t>(7, bytes.size());
+    for (std::size_t j = 0; j < headCount; ++j) {
+        cells[0].bytes[j] = bytes[j];
+    }
+    if (bytes.size() <= 7) {
+        return true;
+    }
+    std::vector<std::uint8_t> tail(bytes.begin() + 7, bytes.end());
+    return allocateTitleCells(cells, nextFree, tail, cells[0].link, error);
 }
 
 void initFreeCellPool(std::array<UtocTitleCell, kUtocSlots>& cells, std::uint8_t& nextFree) {
@@ -970,6 +1019,11 @@ std::vector<UtocGroupEntry> parseUtocGroups(const std::string& rawHalfTitle,
 // Binary Sector Parser & Compiler
 // ============================================================================
 
+bool isPtocSector(const std::uint8_t* sector2352) noexcept {
+    return sector2352 != nullptr && sector2352[0x18] == 'M' && sector2352[0x19] == 'I' &&
+           sector2352[0x1A] == 'N' && sector2352[0x1B] == 'I';
+}
+
 bool parseUtocSectors(const std::uint8_t* sector0, const std::uint8_t* sector1,
                       const std::uint8_t* sector2, const std::uint8_t* sector4, UtocDiscState& out,
                       std::string& error) {
@@ -1156,14 +1210,23 @@ UtocBudget computeUtocBudget(const UtocDiscState& state, const std::string& medi
     auto countChainCells = [&](const std::array<std::uint8_t, kUtocSlots>& map,
                                const std::array<UtocTitleCell, kUtocSlots>& cells) {
         std::set<int> used;
-        for (int idx = 0; idx <= budget.usedTracks; ++idx) {
-            std::uint8_t slot = map[static_cast<std::size_t>(idx)];
+        auto walkChain = [&](std::uint8_t slot) {
             std::set<std::uint8_t> guard;
             while (slot != 0 && !guard.count(slot)) {
                 guard.insert(slot);
                 used.insert(slot);
                 slot = cells[slot].link;
             }
+        };
+        // Disc title head resides in dedicated Slot 0 and only consumes pool slots 1..255 on
+        // continuation overflow via cells[0].link (with legacy fallback to map[0]).
+        if (cells[0].bytes[0] != 0) {
+            walkChain(cells[0].link);
+        } else if (map[0] != 0) {
+            walkChain(map[0]);
+        }
+        for (int idx = 1; idx <= budget.usedTracks; ++idx) {
+            walkChain(map[static_cast<std::size_t>(idx)]);
         }
         return static_cast<int>(used.size());
     };
@@ -1443,8 +1506,8 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         discFwHeader = disc.fullWidthTitle;
     }
 
-    if (!allocateTitleCells(out.halfTitleCells, out.nextFreeHalfTitleSlot, discHwEncoded,
-                            out.halfTitleMap[0], error)) {
+    if (!allocateDiscTitleCells(out.halfTitleCells, out.nextFreeHalfTitleSlot, discHwEncoded,
+                                out.halfTitleMap[0], error)) {
         error = "UTOC Sector 1 half-width title cells exceeded 255 slots.";
         return false;
     }
@@ -1454,8 +1517,8 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
         if (!error.empty()) {
             return false;
         }
-        if (!allocateTitleCells(out.fullTitleCells, out.nextFreeFullTitleSlot, fwBytes,
-                                out.fullTitleMap[0], error)) {
+        if (!allocateDiscTitleCells(out.fullTitleCells, out.nextFreeFullTitleSlot, fwBytes,
+                                    out.fullTitleMap[0], error)) {
             error = "UTOC Sector 4 full-width title cells exceeded 255 slots.";
             return false;
         }
@@ -1524,6 +1587,7 @@ bool compileMdDiscToUtoc(const MdDisc& disc, UtocDiscState& out, std::string& er
             }
         }
     }
+    out.sec4Padding[0x2B] = out.hasSector4 ? 0x02u : 0xFFu;
 
     // 3. Sector 2 timestamps (disc header in map[0], tracks in map[1..N]).
     int nextTsSlot = 1;
@@ -1804,9 +1868,12 @@ bool loadMdDiscFromDeviceUtoc(
     error.clear();
     out = {};
 
+    const std::size_t sec4Idx = utocSector4IndexIn5SectorDump(rawSectors);
+    const std::size_t preservedIdx = (sec4Idx == 3u) ? 4u : 3u;
+
     UtocDiscState state{};
     if (!parseUtocSectors(rawSectors[0].data(), rawSectors[1].data(), rawSectors[2].data(),
-                          rawSectors[4].data(), state, error)) {
+                          rawSectors[sec4Idx].data(), state, error)) {
         return false;
     }
     if (!state.hasSector0) {
@@ -1828,11 +1895,12 @@ bool loadMdDiscFromDeviceUtoc(
     out.loadedDisc.deviceSignature = state.deviceSignature;
     out.loadedDisc.initialFreeRanges = readPhysRangeChain(state, state.trackMap[0]);
     out.loadedDisc.defectiveRanges = readPhysRangeChain(state, state.sec0aPadding[14]);
-    out.loadedDisc.rawSector3.assign(rawSectors[3].begin(), rawSectors[3].end());
+    out.loadedDisc.rawSector3.assign(rawSectors[preservedIdx].begin(),
+                                     rawSectors[preservedIdx].end());
     out.importedUtocSectors[0].assign(rawSectors[0].begin(), rawSectors[0].end());
     out.importedUtocSectors[1].assign(rawSectors[1].begin(), rawSectors[1].end());
     out.importedUtocSectors[2].assign(rawSectors[2].begin(), rawSectors[2].end());
-    out.importedUtocSectors[3].assign(rawSectors[4].begin(), rawSectors[4].end());
+    out.importedUtocSectors[3].assign(rawSectors[sec4Idx].begin(), rawSectors[sec4Idx].end());
 
     struct RawFragInterval {
         std::int64_t startLin = 0;
@@ -2070,6 +2138,20 @@ std::string formatUtocInspectionReport(const UtocDiscState& state, const std::st
         if (!discTs.empty()) {
             ss << "  Disc TS: @" << discTs;
         }
+    }
+    ss << "\n";
+
+    std::string discHw;
+    std::string discFw;
+    const auto groups = parseUtocGroups(readHalfWidthTitleSlot(state, 0),
+                                        readFullWidthTitleSlot(state, 0), b.usedTracks, discHw,
+                                        discFw);
+    ss << "Disc Title: [" << (discHw.empty() ? "(untitled)" : discHw) << "]";
+    if (!discFw.empty()) {
+        ss << " / FW[" << discFw << "]";
+    }
+    if (!groups.empty()) {
+        ss << "  Groups: " << groups.size();
     }
     ss << "\n";
 

@@ -15,8 +15,10 @@
  * - Cluster `50.0.0` preservation: Sony hardware locates uploaded audio near
  *   cluster 50 instead of logical cluster 1. `writeNetMdUtoc` preserves
  *   physical Sector 0 cluster ranges and `P-FRA` via cached span mappings or
- *   matching on-disc topology, and passes sector mask `0x17` (sectors 0, 1, 2,
- *   4) so device Sector 3 remains untouched.
+ *   matching on-disc topology, writes Shift-JIS Sector 4 to peripheral index 3
+ *   on Sony hardware (`mask=0x0F`, leaving read-only P-TOC at index 4 untouched)
+ *   or index 4 on legacy Rainbow Book dumps (`mask=0x17`), and omits Sector 4
+ *   (`mask=0x07`) when unused.
  */
 
 #include "MiniDisc/NetMdBridge.h"
@@ -1043,34 +1045,51 @@ bool listNetMdDevicesUnlocked(std::vector<NetMdDeviceEntry>& out, std::string& e
     return true;
 }
 
-bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& out,
-                              std::string& error, bool includeTracks = true) {
-    out = {};
-    error.clear();
-    if (deviceId.empty()) {
-        error = "NetMD device ID is empty";
-        return false;
+void populateDeviceStatusFromMdDisc(const MdDisc& disc, NetMdDeviceStatus& status) {
+    status.trackCount = static_cast<int>(disc.tracks.size());
+    status.discTitle = disc.halfWidthTitle;
+    status.fullWidthTitle = disc.fullWidthTitle;
+    status.tracks.clear();
+    status.tracks.reserve(disc.tracks.size());
+    for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
+        const auto& trk = disc.tracks[i];
+        NetMdDeviceTrack row;
+        row.index = static_cast<int>(i);
+        row.title = trk.halfWidthTitle;
+        row.fullWidthTitle = trk.fullWidthTitle;
+        switch (effectiveTrackCodec(disc, trk)) {
+        case MdCodecMode::spStereo:
+            row.codec = "SP";
+            break;
+        case MdCodecMode::spMono:
+            row.codec = "Mono";
+            break;
+        case MdCodecMode::lp2:
+            row.codec = "LP2";
+            break;
+        case MdCodecMode::lp4:
+            row.codec = "LP4";
+            break;
+        case MdCodecMode::hiSp:
+            row.codec = "Hi-SP";
+            break;
+        case MdCodecMode::hiLp:
+            row.codec = "Hi-LP";
+            break;
+        case MdCodecMode::pcm:
+            row.codec = "PCM";
+            break;
+        }
+        row.durationSeconds = static_cast<int>(std::llround(
+            static_cast<double>(trk.totalSamples()) / static_cast<double>(kMdSampleRate)));
+        status.tracks.push_back(std::move(row));
     }
+}
 
-    std::vector<std::string> cli = {"probe", deviceId};
-    if (!includeTracks) {
-        cli.push_back("--no-tracks");
-    }
-    const std::string sess =
-        "probe\t" + percentEncode(deviceId) + (includeTracks ? "\t1" : "\t0");
-
-    juce::var resObj;
-    if (!invokeNetMdHelperUnlocked(cli, sess, HelperProgressWindow{}, resObj, error)) {
-        return false;
-    }
-    const auto* root = resObj.getDynamicObject();
-    const auto statusVar = root ? root->getProperty("status") : juce::var();
-    const auto* obj = statusVar.getDynamicObject();
+bool parseProbeStatusObject(const juce::DynamicObject* obj, NetMdDeviceStatus& out) {
     if (!obj) {
-        error = "Empty NetMD probe status returned by carta-netmd";
         return false;
     }
-
     out.deviceId = obj->getProperty("deviceId").toString().toStdString();
     out.deviceName = obj->getProperty("deviceName").toString().toStdString();
     out.versionCode = obj->getProperty("versionCode").toString().toStdString();
@@ -1104,6 +1123,120 @@ bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& ou
             out.tracks.push_back(std::move(tr));
         }
     }
+    return true;
+}
+
+bool readDeviceUtocSectorsUnlocked(
+    const std::string& deviceId,
+    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors,
+    UtocDiscState& parsedState, const HelperProgressWindow& win, std::string& error) {
+    juce::TemporaryFile tmp(".utoc.bin");
+    const std::string outPath = tmp.getFile().getFullPathName().toStdString();
+
+    juce::var resObj;
+    if (!invokeNetMdHelperUnlocked({"read-utoc", deviceId, "--out", outPath},
+                                   "read-utoc\t" + percentEncode(deviceId) + "\t" +
+                                       percentEncode(outPath),
+                                   win, resObj, error)) {
+        return false;
+    }
+
+    juce::MemoryBlock data;
+    if (!tmp.getFile().loadFileAsData(data) || data.getSize() != 5 * kUtocSectorBytes) {
+        error = "Unexpected UTOC sector payload length returned by carta-netmd";
+        return false;
+    }
+    const auto* bytes = static_cast<const std::uint8_t*>(data.getData());
+    for (std::size_t s = 0; s < 5; ++s) {
+        std::memcpy(rawSectors[s].data(), bytes + s * kUtocSectorBytes, kUtocSectorBytes);
+    }
+    return parseUtocSectors(rawSectors[0].data(), rawSectors[1].data(), rawSectors[2].data(),
+                            rawSectors[utocSector4IndexIn5SectorDump(rawSectors)].data(),
+                            parsedState, error);
+}
+
+bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& out,
+                              std::string& error, bool includeTracks = true) {
+    out = {};
+    error.clear();
+    if (deviceId.empty()) {
+        error = "NetMD device ID is empty";
+        return false;
+    }
+
+    auto runProbeCli = [&](bool withTracks, NetMdDeviceStatus& dst, std::string& dstErr) -> bool {
+        dst = {};
+        dstErr.clear();
+        std::vector<std::string> cli = {"probe", deviceId};
+        if (!withTracks) {
+            cli.push_back("--no-tracks");
+        }
+        const std::string sess =
+            "probe\t" + percentEncode(deviceId) + (withTracks ? "\t1" : "\t0");
+
+        juce::var resObj;
+        if (!invokeNetMdHelperUnlocked(cli, sess, HelperProgressWindow{}, resObj, dstErr)) {
+            return false;
+        }
+        const auto* root = resObj.getDynamicObject();
+        const auto statusVar = root ? root->getProperty("status") : juce::var();
+        const auto* obj = statusVar.getDynamicObject();
+        if (!parseProbeStatusObject(obj, dst)) {
+            dstErr = "Empty NetMD probe status returned by carta-netmd";
+            return false;
+        }
+        return true;
+    };
+
+    if (!runProbeCli(false, out, error)) {
+        return false;
+    }
+
+    std::string trackSource = "fast";
+    if (includeTracks && out.discPresent && !out.hiMdFormatted) {
+        bool populatedFromDram = false;
+        if (out.supportsForceTocEdit) {
+            std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawSectors{};
+            UtocDiscState deviceUtoc{};
+            std::string utocErr;
+            if (readDeviceUtocSectorsUnlocked(deviceId, rawSectors, deviceUtoc,
+                                              HelperProgressWindow{}, utocErr)) {
+                if (utocHasNonAudioTrack(deviceUtoc)) {
+                    out.hiMdFormatted = true;
+                    out.trackCount = static_cast<int>(deviceUtoc.trackCount);
+                    out.tracks.clear();
+                    populatedFromDram = true;
+                    trackSource = "dram-utoc-nonaudio";
+                } else {
+                    MdDisc decoded{};
+                    std::string decodeErr;
+                    if (mdDiscFromUtoc(deviceUtoc, decoded, decodeErr)) {
+                        populateDeviceStatusFromMdDisc(decoded, out);
+                        if (out.trackCount == 0) {
+                            out.usedSeconds = 0;
+                            out.leftSeconds = out.totalSeconds;
+                        }
+                        populatedFromDram = true;
+                        trackSource = "dram-utoc";
+                    }
+                }
+            }
+            if (!populatedFromDram) {
+                NetMdDeviceStatus fallback{};
+                std::string fallbackErr;
+                if (runProbeCli(true, fallback, fallbackErr)) {
+                    out = std::move(fallback);
+                    trackSource = "avc-fallback";
+                }
+            }
+        } else {
+            if (!runProbeCli(true, out, error)) {
+                return false;
+            }
+            trackSource = "avc";
+        }
+    }
+
     logDiagnostic("probe", out.deviceName + " [" + out.deviceId + "] fw=" + out.versionCode +
                                " spUpload=" + (out.supportsSpUpload ? "1" : "0") +
                                " forceToc=" + (out.supportsForceTocEdit ? "1" : "0") +
@@ -1111,7 +1244,8 @@ bool probeNetMdDeviceUnlocked(const std::string& deviceId, NetMdDeviceStatus& ou
                                " writable=" + (out.writable ? "1" : "0") +
                                " tracks=" + std::to_string(out.trackCount) +
                                " used=" + std::to_string(out.usedSeconds) + "s" +
-                               " left=" + std::to_string(out.leftSeconds) + "s");
+                               " left=" + std::to_string(out.leftSeconds) + "s" +
+                               " src=" + trackSource);
     return true;
 }
 
@@ -1145,34 +1279,6 @@ bool eraseDeviceUnlocked(const std::string& deviceId, bool confirmHardware,
     return invokeNetMdHelperUnlocked(cli, sess, win, resObj, error);
 }
 
-bool readDeviceUtocSectorsUnlocked(
-    const std::string& deviceId,
-    std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& rawSectors,
-    UtocDiscState& parsedState, const HelperProgressWindow& win, std::string& error) {
-    juce::TemporaryFile tmp(".utoc.bin");
-    const std::string outPath = tmp.getFile().getFullPathName().toStdString();
-
-    juce::var resObj;
-    if (!invokeNetMdHelperUnlocked({"read-utoc", deviceId, "--out", outPath},
-                                   "read-utoc\t" + percentEncode(deviceId) + "\t" +
-                                       percentEncode(outPath),
-                                   win, resObj, error)) {
-        return false;
-    }
-
-    juce::MemoryBlock data;
-    if (!tmp.getFile().loadFileAsData(data) || data.getSize() != 5 * kUtocSectorBytes) {
-        error = "Unexpected UTOC sector payload length returned by carta-netmd";
-        return false;
-    }
-    const auto* bytes = static_cast<const std::uint8_t*>(data.getData());
-    for (std::size_t s = 0; s < 5; ++s) {
-        std::memcpy(rawSectors[s].data(), bytes + s * kUtocSectorBytes, kUtocSectorBytes);
-    }
-    return parseUtocSectors(rawSectors[0].data(), rawSectors[1].data(), rawSectors[2].data(),
-                            rawSectors[4].data(), parsedState, error);
-}
-
 bool validatePhysicalUtocClusters(const UtocDiscState& utoc, std::string& error) {
     // Rainbow Book: clusters 0..49 (0x00..0x31) are reserved for lead-in / UTOC.
     // Writing virtual clusters (e.g. kFirstAudioCluster = 1 from Export UTOC)
@@ -1199,24 +1305,35 @@ bool validatePhysicalUtocClusters(const UtocDiscState& utoc, std::string& error)
 
 bool prepareWriteSectorBundle(
     const UtocDiscState& utocState,
-    const std::array<std::uint8_t, kUtocSectorBytes>* preservedSector3,
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>* deviceRawSectors,
     std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>& outRawSectors, int& outSectorMask,
     std::string& outSector0Hash, std::string& error) {
     for (auto& s : outRawSectors) {
         s.fill(0);
     }
+    const bool idx4IsPtoc = (deviceRawSectors != nullptr) && isPtocSector((*deviceRawSectors)[4].data());
+    const std::size_t sec4Idx = idx4IsPtoc ? 3u : 4u;
+    const std::size_t preservedIdx = idx4IsPtoc ? 4u : 3u;
     if (!compileUtocSectors(utocState, outRawSectors[0], outRawSectors[1], outRawSectors[2],
-                            outRawSectors[4], error)) {
+                            outRawSectors[sec4Idx], error)) {
         return false;
     }
     const bool hasFullWidth =
+        utocState.fullTitleCells[0].bytes[0] != 0 ||
         std::any_of(utocState.fullTitleMap.begin(), utocState.fullTitleMap.end(),
                     [](std::uint8_t s) { return s != 0; });
-    outRawSectors[0][0x23] = static_cast<std::uint8_t>(outRawSectors[0][0x23] | 0x07u |
-                                                       (hasFullWidth ? 0x10u : 0x00u));
-    outSectorMask = (hasFullWidth || (outRawSectors[0][0x23] & 0x10u) != 0) ? 23 : 7;
-    if (preservedSector3 != nullptr) {
-        outRawSectors[3] = *preservedSector3;
+    const bool hadFullWidthOnDevice =
+        (deviceRawSectors != nullptr && (((*deviceRawSectors)[0][0x23] & 0x10u) != 0)) ||
+        ((outRawSectors[0][0x23] & 0x10u) != 0);
+    outRawSectors[sec4Idx][0x2B] = hasFullWidth ? 0x02u : 0xFFu;
+    outRawSectors[0][0x23] = static_cast<std::uint8_t>(
+        (outRawSectors[0][0x23] & ~0x10u) | 0x07u | (hasFullWidth ? 0x10u : 0x00u));
+    outSectorMask = 0x07;
+    if (hasFullWidth || hadFullWidthOnDevice) {
+        outSectorMask |= (1 << static_cast<int>(sec4Idx));
+    }
+    if (deviceRawSectors != nullptr) {
+        outRawSectors[preservedIdx] = (*deviceRawSectors)[preservedIdx];
     }
     outSector0Hash = computeUtocSectorSha256Hex(outRawSectors[0].data());
     return true;
@@ -1224,8 +1341,8 @@ bool prepareWriteSectorBundle(
 
 bool writeDeviceUtocSectorsUnlocked(
     const std::string& deviceId, const UtocDiscState& utocState,
-    const std::array<std::uint8_t, kUtocSectorBytes>* preservedSector3, bool confirmHardware,
-    const HelperProgressWindow& win, std::string& error,
+    const std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>* deviceRawSectors,
+    bool confirmHardware, const HelperProgressWindow& win, std::string& error,
     std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5>* outCommittedRaw = nullptr,
     std::string* outCommittedSec0Hash = nullptr) {
     if (!isNetMdMockDeviceId(deviceId) && !validatePhysicalUtocClusters(utocState, error)) {
@@ -1235,7 +1352,7 @@ bool writeDeviceUtocSectorsUnlocked(
     std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> rawBundle{};
     int sectorMask = 7;
     std::string sec0Hash;
-    if (!prepareWriteSectorBundle(utocState, preservedSector3, rawBundle, sectorMask, sec0Hash,
+    if (!prepareWriteSectorBundle(utocState, deviceRawSectors, rawBundle, sectorMask, sec0Hash,
                                   error)) {
         return false;
     }
@@ -1339,6 +1456,7 @@ void copyDeviceHeadersToUtoc(const UtocDiscState& deviceUtoc, UtocDiscState& dst
     dst.sec1Padding = deviceUtoc.sec1Padding;
     dst.sec2Padding = deviceUtoc.sec2Padding;
     dst.sec4Padding = deviceUtoc.sec4Padding;
+    dst.sec4Padding[0x2B] = dst.hasSector4 ? 0x02u : 0xFFu;
 }
 
 // ============================================================================
@@ -2951,45 +3069,7 @@ bool loadNetMdDisc(const std::string& deviceId, MdDisc& outDisc, NetMdDeviceStat
         return false;
     }
     if (outStatus != nullptr) {
-        status.trackCount = static_cast<int>(outDisc.tracks.size());
-        status.discTitle = outDisc.halfWidthTitle;
-        status.fullWidthTitle = outDisc.fullWidthTitle;
-        status.tracks.clear();
-        status.tracks.reserve(outDisc.tracks.size());
-        for (std::size_t i = 0; i < outDisc.tracks.size(); ++i) {
-            const auto& trk = outDisc.tracks[i];
-            NetMdDeviceTrack row;
-            row.index = static_cast<int>(i);
-            row.title = trk.halfWidthTitle;
-            row.fullWidthTitle = trk.fullWidthTitle;
-            switch (effectiveTrackCodec(outDisc, trk)) {
-            case MdCodecMode::spStereo:
-                row.codec = "SP";
-                break;
-            case MdCodecMode::spMono:
-                row.codec = "Mono";
-                break;
-            case MdCodecMode::lp2:
-                row.codec = "LP2";
-                break;
-            case MdCodecMode::lp4:
-                row.codec = "LP4";
-                break;
-            case MdCodecMode::hiSp:
-                row.codec = "Hi-SP";
-                break;
-            case MdCodecMode::hiLp:
-                row.codec = "Hi-LP";
-                break;
-            case MdCodecMode::pcm:
-                row.codec = "PCM";
-                break;
-            }
-            row.durationSeconds =
-                static_cast<int>(std::llround(static_cast<double>(trk.totalSamples()) /
-                                              static_cast<double>(kMdSampleRate)));
-            status.tracks.push_back(std::move(row));
-        }
+        populateDeviceStatusFromMdDisc(outDisc, status);
         *outStatus = status;
     }
     return true;
@@ -3184,7 +3264,7 @@ bool writeNetMdUtoc(
     writeWin.spanProgress = 0.70;
     std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
     std::string committedHash;
-    if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors[3], confirmHardware,
+    if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors, confirmHardware,
                                         writeWin, error, &committedRaw, &committedHash)) {
         logDiagnostic("utoc", "writeNetMdUtoc commit FAIL: " + error);
         return false;
@@ -3426,7 +3506,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         writeWin.spanProgress = 0.11;
         std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
         std::string committedHash;
-        if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &rawSectors[3], confirmHardware,
+        if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &rawSectors, confirmHardware,
                                             writeWin, error, &committedRaw, &committedHash)) {
             logDiagnostic("utoc", "record Path1 writeDeviceUtoc FAIL: " + error);
             return false;
@@ -3490,7 +3570,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         writeWin.spanProgress = 0.52;
         std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
         std::string committedHash;
-        if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors[3],
+        if (!writeDeviceUtocSectorsUnlocked(resolvedId, logicalUtoc, &rawSectors,
                                             confirmHardware, writeWin, error, &committedRaw,
                                             &committedHash)) {
             return false;
@@ -3557,7 +3637,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
         reclaimWin.spanProgress = 0.56;
         std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
         std::string committedHash;
-        if (!writeDeviceUtocSectorsUnlocked(resolvedId, reclaimUtoc, &rawSectors[3],
+        if (!writeDeviceUtocSectorsUnlocked(resolvedId, reclaimUtoc, &rawSectors,
                                             confirmHardware, reclaimWin, error, &committedRaw,
                                             &committedHash)) {
             return false;
@@ -3685,7 +3765,7 @@ bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::stri
     writeWin.spanProgress = 0.11;
     std::array<std::array<std::uint8_t, kUtocSectorBytes>, 5> committedRaw{};
     std::string committedHash;
-    if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &postSectors[3], confirmHardware,
+    if (!writeDeviceUtocSectorsUnlocked(resolvedId, finalUtoc, &postSectors, confirmHardware,
                                         writeWin, error, &committedRaw, &committedHash)) {
         logDiagnostic("utoc", "record Path2 writeDeviceUtoc FAIL: " + error);
         return false;

@@ -4662,7 +4662,9 @@ struct Studio::IpcRouter {
                 s0 = bytes;
                 s1 = bytes + sectorBytes;
                 s2 = bytes + sectorBytes * 2;
-                s4 = bytes + sectorBytes * 4;
+                const std::uint8_t* slot3 = bytes + sectorBytes * 3;
+                const std::uint8_t* slot4 = bytes + sectorBytes * 4;
+                s4 = carta::isPtocSector(slot4) ? slot3 : slot4;
             } else {
                 return ipcReply(
                     false,

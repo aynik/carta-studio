@@ -777,6 +777,48 @@ struct StudioComponentTests {
         check(dock.inlineEditingRow == -1 && !dock.inlineTrackTitleEditor.isVisible() &&
                   md.session.mdDisc.tracks[0].halfWidthTitle == "Inline Three",
               "Escape cancels pending inline title edit without altering committed title");
+
+        // Uncommitted discTitleEditor text commits before tab switches or guarded modals activate.
+        md.netMdScannedOnce = true;
+        md.hiMdScannedOnce = true;
+        md.cachedNetMdDevices = {{"mock:mz-n920", 0x054c, 0x0188, 0, 0, "Sony MZ-N920", true}};
+        md.refreshRecordWorkspace(false);
+
+        dock.discTitleEditor.setText("Tab Commit Title", juce::dontSendNotification);
+        dock.setActiveTab("record", true);
+        check(md.session.mdDisc.halfWidthTitle == "Tab Commit Title",
+              "Switching Disc Workspace tab commits pending discTitleEditor text");
+
+        dock.discTitleEditor.setText("Inspect Commit Title", juce::dontSendNotification);
+        md.inspectCurrentUtoc();
+        check(md.savePromptActive && md.session.mdDisc.halfWidthTitle == "Inspect Commit Title",
+              "inspectCurrentUtoc commits pending discTitleEditor text before modal guard");
+        if (auto* modal = juce::Component::getCurrentlyModalComponent()) {
+            modal->exitModalState(2);
+            for (int j = 0; j < 100 && md.savePromptActive; ++j)
+                juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+        }
+        check(!md.savePromptActive, "UTOC inspect modal dismissed cleanly");
+
+        dock.discTitleEditor.setText("Write Commit Title", juce::dontSendNotification);
+        md.triggerRecordWriteUtocFromUi();
+        check(md.savePromptActive && md.session.mdDisc.halfWidthTitle == "Write Commit Title",
+              "triggerRecordWriteUtocFromUi commits pending discTitleEditor text before modal guard");
+        if (auto* modal = juce::Component::getCurrentlyModalComponent()) {
+            modal->exitModalState(2);
+            for (int j = 0; j < 100 && md.savePromptActive; ++j)
+                juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+        }
+        check(!md.savePromptActive, "Write UTOC modal dismissed cleanly");
+
+        md.cachedNetMdDevices.clear();
+        md.netMdScannedOnce = false;
+        md.hiMdScannedOnce = false;
+        check(static_cast<bool>(md.ipcCommand({"disc", "title", "LAYOUT DISC"})["ok"]),
+              "Restore original disc title after uncommitted-edit checks");
+        dock.setActiveTab("tracks", true);
+        md.refreshRecordWorkspace(false);
+
         md.setSize(1180, 760);
         md.resized();
         check(md.visibleMdRibbonHeight() == 24,

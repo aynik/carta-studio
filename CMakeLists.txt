@@ -117,7 +117,9 @@ endif()
 add_dependencies(carta-netmd CartaPorfforNetMd)
 if(APPLE)
     target_link_libraries(carta-netmd PRIVATE iconv
-        "${CARTA_PORFFOR_NETMD_LINK}" "${CARTA_LIBUSB_LIBRARY}" "-Wl,-export_dynamic")
+        "${CARTA_PORFFOR_NETMD_LINK}" "${CARTA_LIBUSB_LIBRARY}"
+        "-framework IOKit" "-framework CoreFoundation"
+        "-Wl,-export_dynamic")
     set_target_properties(carta-netmd PROPERTIES
         BUILD_RPATH "${CARTA_PORFFOR_LIB_DIR};${CARTA_LIBUSB_LIBDIR};@executable_path/../Frameworks"
         INSTALL_RPATH "@executable_path/../Frameworks")

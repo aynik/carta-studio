@@ -165,6 +165,16 @@ void testDiscRoundtripAndZeroCopyReuse(const char* dumpDir) {
     carta::UtocDiscState utoc;
     std::string err;
     check(carta::compileMdDiscToUtoc(disc, utoc, err), "compile MdDisc to UTOC: " + err);
+    check(utoc.halfTitleMap[0] == 0 && utoc.halfTitleCells[0].bytes[0] != 0 &&
+              utoc.halfTitleCells[0].link != 0,
+          "compiled disc half-width title uses Slot 0 with continuation link");
+    check(utoc.fullTitleMap[0] == 0 && utoc.fullTitleCells[0].bytes[0] != 0 &&
+              utoc.fullTitleCells[0].link != 0 && utoc.sec4Padding[0x2B] == 0x02u,
+          "compiled disc full-width title uses Slot 0 and sets Sector 4 charcode 0x02");
+    const auto inspectReport = carta::formatUtocInspectionReport(utoc, "md80");
+    check(inspectReport.find("Night Session") != std::string::npos &&
+              inspectReport.find(disc.fullWidthTitle) != std::string::npos,
+          "formatUtocInspectionReport includes half-width and full-width disc titles");
     const auto budget = carta::computeUtocBudget(utoc, "md80");
     check(budget.fits(), "compiled disc fits within MD80 budget");
     check(budget.usedTracks == 3, "budget tracks == 3");
@@ -816,6 +826,119 @@ void testPlayOrderAliasUtocAndRoundtrip() {
           "mdDiscFromUtoc reconstructs 24-way shared audioId across aliased music tracks");
 }
 
+void testDiscTitleSlotZeroAndPtocMapping() {
+    std::string err;
+
+    // 1. Short (<=7B) & long (>7B) disc titles in Slot 0, plus untitled track never inheriting Slot 0.
+    for (const std::string& hwTitle : {std::string("SHORT"), std::string("Longer Disc Title 01")}) {
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        disc.halfWidthTitle = hwTitle;
+        disc.fullWidthTitle = "\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88\xE7\x9B\xA4"; // テスト盤 (8 SJIS bytes)
+        disc.tracks = {
+            {"t1", "Track One", "", {}, false, false, false, "", {{0, 44100 * 5}}},
+            {"t2", "", "", {}, false, false, false, "", {{44100 * 5, 44100 * 10}}},
+        };
+
+        carta::UtocDiscState utoc{};
+        check(carta::compileMdDiscToUtoc(disc, utoc, err),
+              "compile disc title Slot 0 test: " + err);
+        check(utoc.halfTitleMap[0] == 0 && utoc.halfTitleCells[0].bytes[0] != 0,
+              "half-width disc title placed in Slot 0 with map[0]==0");
+        check(utoc.fullTitleMap[0] == 0 && utoc.fullTitleCells[0].bytes[0] != 0 &&
+                  utoc.sec4Padding[0x2B] == 0x02u,
+              "full-width-only disc title placed in Sector 4 Slot 0 with map[0]==0");
+        check(utoc.halfTitleMap[2] == 0 && utoc.fullTitleMap[2] == 0,
+              "untitled track keeps map[2]==0");
+
+        std::array<std::uint8_t, carta::kUtocSectorBytes> s0{}, s1{}, s2{}, s4{};
+        check(carta::compileUtocSectors(utoc, s0, s1, s2, s4, err), "compile sectors");
+        carta::UtocDiscState parsed{};
+        check(carta::parseUtocSectors(s0.data(), s1.data(), s2.data(), s4.data(), parsed, err),
+              "parse sectors");
+        carta::MdDisc rt{};
+        check(carta::mdDiscFromUtoc(parsed, rt, err), "mdDiscFromUtoc Slot 0 roundtrip");
+        check(rt.halfWidthTitle == hwTitle && rt.fullWidthTitle == disc.fullWidthTitle,
+              "Slot 0 HW+FW disc titles roundtrip cleanly");
+        check(rt.tracks[0].halfWidthTitle == "Track One" && rt.tracks[1].halfWidthTitle.empty() &&
+                  rt.tracks[1].fullWidthTitle.empty(),
+              "untitled track remains empty and never inherits Slot 0 disc title");
+    }
+
+    // 2. Legacy map[0] read fallback when Slot 0 is empty.
+    {
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        disc.tracks = {{"t1", "", "", {}, false, false, false, "", {{0, 44100 * 5}}}};
+        carta::UtocDiscState utoc{};
+        check(carta::compileMdDiscToUtoc(disc, utoc, err), "compile legacy base");
+        const std::string legacyTitle = "LEGACY";
+        utoc.halfTitleCells[0] = {};
+        utoc.halfTitleMap[0] = 1;
+        for (std::size_t i = 0; i < legacyTitle.size(); ++i) {
+            utoc.halfTitleCells[1].bytes[i] = static_cast<std::uint8_t>(legacyTitle[i]);
+        }
+        utoc.halfTitleCells[1].link = 0;
+        utoc.halfTitleMap[1] = 0;
+
+        carta::MdDisc rt{};
+        check(carta::mdDiscFromUtoc(utoc, rt, err), "mdDiscFromUtoc legacy map[0]");
+        check(rt.halfWidthTitle == "LEGACY" && rt.tracks[0].halfWidthTitle.empty(),
+              "legacy map[0] disc title decodes while untitled track stays empty");
+    }
+
+    // 3. Sony P-TOC 5-sector dump: index 3 = Sector 4 (SJIS), index 4 = P-TOC ("MINI").
+    {
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        disc.halfWidthTitle = "Sony PTOC MD";
+        disc.fullWidthTitle = "\xE3\x82\xAB\xE3\x83\xAB\xE3\x82\xBF\xE7\x9B\xA4";
+        disc.tracks = {{"t1", "First", "\xE7\xAC\xAC\xE4\xB8\x80\xE6\x9B\xB2", {}, false, false,
+                        false, "", {{0, 44100 * 5}}}};
+
+        carta::UtocDiscState utoc{};
+        check(carta::compileMdDiscToUtoc(disc, utoc, err), "compile Sony PTOC test");
+        for (int s = 1; s < carta::kUtocMaxFragments; ++s) {
+            // Convert virtual start cluster 1 to physical cluster 50 cleanly for loadMdDiscFromDeviceUtoc.
+            if (utoc.fragments[static_cast<std::size_t>(s)].isValid()) {
+                utoc.fragments[static_cast<std::size_t>(s)].start.cluster += 49;
+                utoc.fragments[static_cast<std::size_t>(s)].end.cluster += 49;
+            }
+        }
+        std::array<std::array<std::uint8_t, carta::kUtocSectorBytes>, 5> raw{};
+        check(carta::compileUtocSectors(utoc, raw[0], raw[1], raw[2], raw[3], err),
+              "compile Sony peripheral sectors 0..3");
+        raw[0][0x23] = 0x17u;
+        raw[4][0x0C] = 0xFFu;
+        raw[4][0x0D] = 0xCAu;
+        raw[4][0x18] = 'M';
+        raw[4][0x19] = 'I';
+        raw[4][0x1A] = 'N';
+        raw[4][0x1B] = 'I';
+
+        check(carta::isPtocSector(raw[4].data()) && !carta::isPtocSector(raw[3].data()) &&
+                  carta::utocSector4IndexIn5SectorDump(raw) == 3u,
+              "isPtocSector detects Sony P-TOC at index 4 and locates Sector 4 at index 3");
+
+        carta::MdDisc loaded{};
+        check(carta::loadMdDiscFromDeviceUtoc(raw, "sony:test", loaded, err),
+              "loadMdDiscFromDeviceUtoc on Sony P-TOC layout: " + err);
+        check(loaded.halfWidthTitle == disc.halfWidthTitle &&
+                  loaded.fullWidthTitle == disc.fullWidthTitle &&
+                  loaded.tracks.size() == 1 &&
+                  loaded.tracks[0].fullWidthTitle == disc.tracks[0].fullWidthTitle,
+              "Sony P-TOC dump decodes full-width disc & track titles from index 3");
+        check(loaded.loadedDisc.rawSector3 ==
+                      std::vector<std::uint8_t>(raw[4].begin(), raw[4].end()) &&
+                  loaded.importedUtocSectors[3] ==
+                      std::vector<std::uint8_t>(raw[3].begin(), raw[3].end()),
+              "Sony P-TOC dump preserves P-TOC separately and captures Sector 4 in importedUtocSectors[3]");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -832,6 +955,7 @@ int main(int argc, char** argv) {
     testOverflowLimits();
     testComplexLoadedDisc240TracksAndReclaim();
     testPlayOrderAliasUtocAndRoundtrip();
+    testDiscTitleSlotZeroAndPtocMapping();
     if (gFailures == 0) {
         std::cout << "UtocTests passed.\n";
         return 0;
