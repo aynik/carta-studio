@@ -4180,7 +4180,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
         const auto inner = bounds.reduced(1);
         std::int64_t cursorBytes = 0;
         bool drewHiMdRows = false;
-        int newSegIdx = 0;
         for (const auto& br : audioBankRows) {
             if (br.isReclaimed || br.hiMdBytes <= 0) {
                 continue;
@@ -4214,23 +4213,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                 g.setColour(wellBg.withAlpha(0.85f));
                 g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
             }
-            if (br.isOnDisc) {
-                if (segRect.getWidth() >= 54) {
-                    g.setColour(juce::Colours::white);
-                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                    g.drawText("ON-DISC", segRect.reduced(3, 0), juce::Justification::centred,
-                               true);
-                }
-            } else {
-                ++newSegIdx;
-                if (segRect.getWidth() >= 48) {
-                    g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
-                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                    g.drawText("A" + juce::String(newSegIdx) + " " +
-                                   carta::md_ui::codecShortLabel(br.codec),
-                               segRect.reduced(3, 0), juce::Justification::centred, true);
-                }
-            }
         }
         if (!drewHiMdRows) {
             for (std::size_t i = 0; i < physicalPlan.spans.size(); ++i) {
@@ -4263,13 +4245,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                 if (x2 < inner.getRight()) {
                     g.setColour(wellBg.withAlpha(0.85f));
                     g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
-                }
-                if (segRect.getWidth() >= 48) {
-                    g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
-                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                    g.drawText("A" + juce::String(static_cast<int>(i + 1)) + " " +
-                                   carta::md_ui::codecShortLabel(codec),
-                               segRect.reduced(3, 0), juce::Justification::centred, true);
                 }
             }
         }
@@ -4352,12 +4327,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                     g.setColour(wellBg.withAlpha(0.85f));
                     g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
                 }
-                if (onDiscRect.getWidth() >= 54) {
-                    g.setColour(juce::Colours::white);
-                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                    g.drawText("ON-DISC", onDiscRect.reduced(3, 0), juce::Justification::centred,
-                               true);
-                }
             }
         } else {
             const int x1 = inner.getX();
@@ -4378,11 +4347,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                 g.setColour(wellBg.withAlpha(0.85f));
                 g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
             }
-            if (onDiscRect.getWidth() >= 54) {
-                g.setColour(juce::Colours::white);
-                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                g.drawText("ON-DISC", onDiscRect.reduced(3, 0), juce::Justification::centred, true);
-            }
         }
         cursorClu = physicalPlan.onDiscClusters;
     }
@@ -4392,12 +4356,10 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
             : (discState.loadedDisc.active ? 0 : physicalPlan.usedClusters);
     if (totalNewUnits > 0 && newCluBudget > 0) {
         double newUnitCursor = 0.0;
-        int newSegIdx = 0;
         for (const auto& br : audioBankRows) {
             if (br.isOnDisc || br.isReclaimed || br.unitCount <= 0) {
                 continue;
             }
-            ++newSegIdx;
             const double startCluD =
                 static_cast<double>(cursorClu) +
                 (newUnitCursor / static_cast<double>(totalNewUnits)) *
@@ -4429,13 +4391,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
             if (x2 < inner.getRight()) {
                 g.setColour(wellBg.withAlpha(0.85f));
                 g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
-            }
-            if (segRect.getWidth() >= 48) {
-                g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
-                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                g.drawText("A" + juce::String(newSegIdx) + " " +
-                               carta::md_ui::codecShortLabel(br.codec),
-                           segRect.reduced(3, 0), juce::Justification::centred, true);
             }
         }
     } else {
@@ -4469,13 +4424,6 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
             if (x2 < inner.getRight()) {
                 g.setColour(wellBg.withAlpha(0.85f));
                 g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
-            }
-            if (segRect.getWidth() >= 48) {
-                g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
-                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                g.drawText("A" + juce::String(static_cast<int>(i + 1)) + " " +
-                               carta::md_ui::codecShortLabel(sp.codec),
-                           segRect.reduced(3, 0), juce::Justification::centred, true);
             }
         }
     }
