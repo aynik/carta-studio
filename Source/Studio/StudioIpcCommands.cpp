@@ -83,6 +83,9 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
         so->setProperty("unit_count", sp.unitCount);
         so->setProperty("start_cluster", static_cast<int>(sp.startCluster));
         so->setProperty("cluster_count", sp.clusterCount);
+        if (sp.slices.size() > 1) {
+            so->setProperty("slice_count", static_cast<int>(sp.slices.size()));
+        }
         spanArr.add(juce::var(so));
     }
 
@@ -153,6 +156,7 @@ juce::var buildMdDiscStatusJson(const carta::MdDisc& d) {
         to->setProperty("write_protected", tr.writeProtected);
         to->setProperty("scms", tr.scmsCopyProtected);
         to->setProperty("emphasis", tr.emphasis);
+        to->setProperty("force_gap_before", tr.forceGapBefore);
         to->setProperty("timestamp", juce::String::fromUTF8(tr.timestamp.c_str()));
         to->setProperty("total_samples", static_cast<juce::int64>(tr.totalSamples()));
 
@@ -391,7 +395,7 @@ juce::var handleSchemaCommand(const juce::StringArray& args) {
              "disc auto-track on|off", "disc title HALF [FULL]", "disc title-forms HALF FULL",
              "disc timestamp [ISO|clear]", "disc sync clips|layer1|markers",
              "disc track add|add-selection|remove|move|duplicate|alias|alias-audio|detach|range|"
-             "split|merge|rename|title-forms|metadata|flags",
+             "split|merge|rename|title-forms|metadata|flags|gap",
              "disc group set|clear", "disc focus TRACK_INDEX",
              "disc preview [TRACK_INDEX | from TRACK_INDEX]"}));
     domains->setProperty(
@@ -803,7 +807,7 @@ struct Studio::IpcRouter {
             actionLabel = "Set MD track metadata";
             return carta::validateMdDisc(d, mdErr) || fail(mdErr);
         }
-        if (args[2] == "flags" && (args.size() == 8 || args.size() == 9)) {
+        if (args[2] == "flags" && (args.size() >= 8 && args.size() <= 10)) {
             juce::int64 idx = 0;
             if (!parseNonNegativeIpcInt(args[3], idx) ||
                 idx >= static_cast<juce::int64>(d.tracks.size())) {
@@ -868,7 +872,7 @@ struct Studio::IpcRouter {
                 !parseBoolOpt(args[7], nextTr.emphasis, mdErr, "Emphasis")) {
                 return fail(mdErr);
             }
-            if (args.size() == 9 && args[8] != "keep") {
+            if (args.size() >= 9 && args[8] != "keep") {
                 if (args[8] == "clear") {
                     nextTr.timestamp.clear();
                 } else {
@@ -879,6 +883,10 @@ struct Studio::IpcRouter {
                     nextTr.timestamp = args[8].toStdString();
                 }
             }
+            if (args.size() == 10 &&
+                !parseBoolOpt(args[9], nextTr.forceGapBefore, mdErr, "Force gap")) {
+                return fail(mdErr);
+            }
             if (nextTr == d.tracks[static_cast<size_t>(idx)]) {
                 return fail("MD track flags are unchanged.");
             }
@@ -887,6 +895,33 @@ struct Studio::IpcRouter {
             preferredTrackId = juce::String::fromUTF8(nextTr.id.c_str());
             actionLabel = "Update MD track flags";
             return carta::validateMdDisc(d, mdErr) || fail(mdErr);
+        }
+        if (args[2] == "gap" && args.size() == 5) {
+            juce::int64 idx = 0;
+            if (!parseNonNegativeIpcInt(args[3], idx) ||
+                idx >= static_cast<juce::int64>(d.tracks.size())) {
+                return fail("MD track index out of range.");
+            }
+            const auto& cur = d.tracks[static_cast<size_t>(idx)];
+            const auto mode = args[4].trim().toLowerCase();
+            bool nextGap = cur.forceGapBefore;
+            if (mode == "on" || mode == "true" || mode == "1") {
+                nextGap = true;
+            } else if (mode == "off" || mode == "false" || mode == "0") {
+                nextGap = false;
+            } else if (mode == "toggle") {
+                nextGap = !cur.forceGapBefore;
+            } else {
+                return fail("Track gap setting must be on, off, or toggle.");
+            }
+            if (nextGap == cur.forceGapBefore) {
+                return fail("MD track gap setting is unchanged.");
+            }
+            preferredTrackId = juce::String::fromUTF8(cur.id.c_str());
+            actionLabel = nextGap ? "Force gapped break before track"
+                                  : "Clear forced gap before track";
+            return carta::setMdTrackForceGap(d, static_cast<int>(idx), nextGap, mdErr) ||
+                   fail(mdErr);
         }
         return fail("Unknown or invalid ipc disc track command.");
     }

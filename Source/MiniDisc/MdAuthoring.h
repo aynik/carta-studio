@@ -184,6 +184,7 @@ struct MdTrack {
     std::string artist{};
     std::string album{};
     std::string audioId{};
+    bool forceGapBefore = false;
 
     std::int64_t totalSamples() const noexcept {
         std::int64_t total = 0;
@@ -206,9 +207,10 @@ struct MdTrack {
     bool operator==(const MdTrack& o) const noexcept {
         return id == o.id && halfWidthTitle == o.halfWidthTitle &&
                fullWidthTitle == o.fullWidthTitle && artist == o.artist && album == o.album &&
-               audioId == o.audioId && codecOverride == o.codecOverride &&
-               writeProtected == o.writeProtected && scmsCopyProtected == o.scmsCopyProtected &&
-               emphasis == o.emphasis && timestamp == o.timestamp && parts == o.parts;
+               audioId == o.audioId && forceGapBefore == o.forceGapBefore &&
+               codecOverride == o.codecOverride && writeProtected == o.writeProtected &&
+               scmsCopyProtected == o.scmsCopyProtected && emphasis == o.emphasis &&
+               timestamp == o.timestamp && parts == o.parts;
     }
     bool operator!=(const MdTrack& o) const noexcept { return !(*this == o); }
 };
@@ -252,6 +254,17 @@ struct MdDisc {
     bool operator!=(const MdDisc& o) const noexcept { return !(*this == o); }
 };
 
+/** One contiguous timeline audio slice included inside a coalesced physical upload span. */
+struct MdSpanSlice {
+    std::int64_t startSample = 0; // aligned to mdFrameQuantumSamples(codec)
+    std::int64_t endSample = 0;   // aligned to mdFrameQuantumSamples(codec)
+
+    bool operator==(const MdSpanSlice& o) const noexcept {
+        return startSample == o.startSample && endSample == o.endSample;
+    }
+    bool operator!=(const MdSpanSlice& o) const noexcept { return !(*this == o); }
+};
+
 /** One contiguous codec-aligned physical audio upload on disc. */
 struct MdPhysicalSpan {
     MdCodecMode codec = MdCodecMode::spStereo;
@@ -260,6 +273,20 @@ struct MdPhysicalSpan {
     int unitCount = 0;
     std::uint16_t startCluster = kMdFirstAudioCluster;
     int clusterCount = 0;
+    std::vector<MdSpanSlice> slices;
+
+    std::int64_t totalSamples() const noexcept {
+        if (!slices.empty()) {
+            std::int64_t total = 0;
+            for (const auto& sl : slices) {
+                if (sl.endSample > sl.startSample) {
+                    total += (sl.endSample - sl.startSample);
+                }
+            }
+            return total;
+        }
+        return endSample > startSample ? (endSample - startSample) : 0;
+    }
 };
 
 /** Physical placement of a single MdPart inside a coalesced upload span or on-disc region. */
@@ -487,6 +514,16 @@ bool trimMdPartEdge(MdDisc& disc, int trackIndex0, int partIndex0, bool rightEdg
 /** Slides a part preserving duration within `[0, maxSample]`; leaves `disc` unchanged on error. */
 bool slideMdPartRange(MdDisc& disc, int trackIndex0, int partIndex0, std::int64_t newStartSample,
                       std::int64_t maxSample, std::string& error);
+
+/** Slides a local part preserving duration without leaving uncovered gaps beside adjacent local
+ * neighbors; delegates on-disc parts to `slideMdPartRange`. */
+bool slideMdPartRangeContiguous(MdDisc& disc, int trackIndex0, int partIndex0,
+                                std::int64_t newStartSample, std::int64_t maxSample,
+                                std::string& error);
+
+/** Sets or clears `forceGapBefore` on `trackIndex0` (and aliases); leaves `disc` unchanged on
+ * error. */
+bool setMdTrackForceGap(MdDisc& disc, int trackIndex0, bool forceGapBefore, std::string& error);
 
 /** Assigns a named group over inclusive 1-based `[startTrack1, endTrack1]`, trimming overlaps;
  * leaves `disc` unchanged on error. */

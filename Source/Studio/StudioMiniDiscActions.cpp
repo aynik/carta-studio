@@ -268,11 +268,12 @@ void Studio::editSelectedTrackMdFlags() {
          {"scms", "SCMS restricted (on/off)", track.scmsCopyProtected ? "on" : "off"},
          {"emph", "Emphasis (on/off)", track.emphasis ? "on" : "off"},
          {"ts", "Timestamp (YYYY-MM-DD HH:MM:SS or empty)",
-          juce::String::fromUTF8(track.timestamp.c_str())}},
+          juce::String::fromUTF8(track.timestamp.c_str())},
+         {"gap", "Force gapped encode before track (on/off)", track.forceGapBefore ? "on" : "off"}},
         "Apply",
         [safe = juce::Component::SafePointer<Studio>(this), revision, idx0, onDiscTrack,
          codecVal](bool accepted, const juce::StringArray& values) {
-            if (safe == nullptr || !accepted || values.size() != 5) {
+            if (safe == nullptr || !accepted || values.size() != 6) {
                 return;
             }
             const auto c = values[0].trim();
@@ -280,6 +281,7 @@ void Studio::editSelectedTrackMdFlags() {
             const auto scms = values[2].trim();
             const auto emph = values[3].trim();
             const auto ts = values[4].trim();
+            const auto gap = values[5].trim();
             const juce::String codecArg =
                 (onDiscTrack && c == codecVal) ? juce::String("keep")
                 : c.isEmpty()                  ? juce::String("clear")
@@ -288,7 +290,8 @@ void Studio::editSelectedTrackMdFlags() {
                                            wp.isEmpty() ? juce::String("keep") : wp,
                                            scms.isEmpty() ? juce::String("keep") : scms,
                                            emph.isEmpty() ? juce::String("keep") : emph,
-                                           ts.isEmpty() ? juce::String("clear") : ts},
+                                           ts.isEmpty() ? juce::String("clear") : ts,
+                                           gap.isEmpty() ? juce::String("keep") : gap},
                                           revision);
         });
 }

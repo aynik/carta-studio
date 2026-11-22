@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <map>
 #include <set>
 #include <utility>
@@ -96,7 +97,10 @@ juce::String formatMegabytes(std::int64_t bytes) {
         return juce::String((bytes + 1023LL) / 1024LL) + " KB";
     }
     const double mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
-    return juce::String(mb, mb >= 100.0 ? 0 : 1) + " MB";
+    if (mb >= 100.0) {
+        return juce::String(static_cast<juce::int64>(std::llround(mb))) + " MB";
+    }
+    return juce::String(mb, 1) + " MB";
 }
 
 bool resolveSelectedOrPlayheadRange(const carta::TimeSelection& sel, juce::int64 playhead,
@@ -1202,6 +1206,7 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         }
         row.maxSharedRefs = row.aliasRefCount;
         row.onDisc = carta::mdTrackUsesOnDiscAudio(discState, t);
+        row.forceGapBefore = t.forceGapBefore;
         for (const std::size_t pi : placementsByTrack[i]) {
             row.maxSharedRefs = std::max(row.maxSharedRefs, placementRefCounts[pi]);
         }
@@ -1227,6 +1232,13 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         pr.totalSamples = tr.totalSamples;
         pr.sharesPhysicalSpan = tr.sharesPhysicalSpan;
         pr.onDisc = tr.onDisc;
+        pr.forceGapBefore = tr.forceGapBefore;
+        if (i > 0) {
+            const auto& prevTr = trackRows[i - 1];
+            pr.gappedBefore = tr.forceGapBefore ||
+                              (tr.effectiveCodec != prevTr.effectiveCodec) ||
+                              (tr.onDisc != prevTr.onDisc);
+        }
         int odMinClu = 0;
         int odMaxClu = 0;
         bool hasOd = false;
@@ -1283,7 +1295,8 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         planRows.push_back(std::move(pr));
     }
 
-    // Build inverse Audio Bank table (physical on-disc regions + new local spans -> tracks).
+    // Build inverse Audio Bank table: on-disc regions first, then 1 row per unique local Audio Pool
+    // item identically across Standard MD (NetMD) and Hi-MD.
     audioBankRows.clear();
     if (discState.loadedDisc.active) {
         for (std::size_t ri = 0; ri < discState.loadedDisc.regions.size(); ++ri) {
@@ -1294,22 +1307,56 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
             row.codec = reg.codec;
             row.startCluster = reg.physStart.cluster;
             row.endCluster = reg.physEnd.cluster;
-            row.clusterCount = std::max(1, row.endCluster - row.startCluster + 1);
+            row.clusterCount =
+                isHiMd ? 0 : std::max(1, row.endCluster - row.startCluster + 1);
+            row.unitCount = reg.unitCount;
             row.timelineStartSample = reg.timelineStartSample;
             row.timelineEndSample = reg.timelineEndSample;
+            row.hiMdBytes =
+                isHiMd ? carta::estimateHiMdTrackBytes(
+                             reg.codec,
+                             std::max<std::int64_t>(0, reg.timelineEndSample -
+                                                           reg.timelineStartSample))
+                       : 0;
 
             std::set<int> uniqTracks;
-            for (const auto& place : physicalPlan.placements) {
-                if (place.isOnDisc && place.onDiscRegionIndex == static_cast<int>(ri)) {
-                    ++row.totalPartRefs;
-                    if (place.trackIndex >= 0 &&
-                        place.trackIndex < static_cast<int>(trackRows.size())) {
-                        uniqTracks.insert(place.trackIndex);
+            if (isHiMd) {
+                for (std::size_t ti = 0; ti < discState.tracks.size(); ++ti) {
+                    for (const auto& part : discState.tracks[ti].parts) {
+                        if (carta::findMdOnDiscRegionForPart(discState.loadedDisc, part) ==
+                            static_cast<int>(ri)) {
+                            ++row.totalPartRefs;
+                            uniqTracks.insert(static_cast<int>(ti));
+                        }
+                    }
+                }
+            } else {
+                for (const auto& place : physicalPlan.placements) {
+                    if (place.isOnDisc && place.onDiscRegionIndex == static_cast<int>(ri)) {
+                        ++row.totalPartRefs;
+                        if (place.trackIndex >= 0 &&
+                            place.trackIndex < static_cast<int>(trackRows.size())) {
+                            uniqTracks.insert(place.trackIndex);
+                        }
                     }
                 }
             }
             row.referencingTrackIndices0.assign(uniqTracks.begin(), uniqTracks.end());
             row.isReclaimed = row.referencingTrackIndices0.empty();
+
+            if (!row.referencingTrackIndices0.empty()) {
+                const int firstTrIdx = row.referencingTrackIndices0.front();
+                const auto& firstTr = trackRows[static_cast<std::size_t>(firstTrIdx)];
+                row.audioId = firstTr.audioId;
+                row.uniqueAudioSlot = uniqueSlotByAudioKey[row.audioId.toStdString()];
+                row.forceGapBefore = firstTr.forceGapBefore;
+                if (firstTrIdx > 0) {
+                    const auto& prevTr = trackRows[static_cast<std::size_t>(firstTrIdx - 1)];
+                    row.gappedBefore = firstTr.forceGapBefore ||
+                                       (firstTr.effectiveCodec != prevTr.effectiveCodec) ||
+                                       (firstTr.onDisc != prevTr.onDisc);
+                }
+            }
 
             for (const auto& clipEntry : audioBankClipEntries) {
                 if (clipEntry.onDiscRegionIndex == static_cast<int>(ri) &&
@@ -1328,54 +1375,128 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
             audioBankRows.push_back(std::move(row));
         }
     }
-    for (std::size_t si = 0; si < physicalPlan.spans.size(); ++si) {
-        const auto& sp = physicalPlan.spans[si];
-        AudioBankRow row;
-        row.isOnDisc = false;
-        row.spanIndex = static_cast<int>(si);
-        row.codec = sp.codec;
-        row.startCluster = sp.startCluster;
-        row.endCluster = sp.startCluster + std::max(0, sp.clusterCount - 1);
-        row.clusterCount = sp.clusterCount;
-        row.timelineStartSample = sp.startSample;
-        row.timelineEndSample = sp.endSample;
 
-        std::set<int> uniqTracks;
-        for (const auto& place : physicalPlan.placements) {
-            if (!place.isOnDisc && place.spanIndex == static_cast<int>(si)) {
-                ++row.totalPartRefs;
-                if (place.trackIndex >= 0 &&
-                    place.trackIndex < static_cast<int>(trackRows.size())) {
-                    uniqTracks.insert(place.trackIndex);
+    std::set<std::string> seenLocalAudioKeys;
+    for (std::size_t ti = 0; ti < discState.tracks.size(); ++ti) {
+        const auto& rawTr = discState.tracks[ti];
+        const auto& trMeta = trackRows[ti];
+        const std::string key = trMeta.audioId.toStdString();
+
+        bool hasLocalPart = !discState.loadedDisc.active || !trMeta.onDisc;
+        std::int64_t localMinS = std::numeric_limits<std::int64_t>::max();
+        std::int64_t localMaxE = 0;
+        std::int64_t localTotalSamples = 0;
+        int minCluster = 0;
+        int maxCluster = 0;
+        int localUnitSum = 0;
+        int firstSpanIdx = -1;
+
+        if (isHiMd) {
+            for (const auto& part : rawTr.parts) {
+                const bool pOnDisc =
+                    discState.loadedDisc.active &&
+                    carta::findMdOnDiscRegionForPart(discState.loadedDisc, part) >= 0;
+                if (!pOnDisc) {
+                    hasLocalPart = true;
+                    localMinS = std::min(localMinS, part.startSample);
+                    localMaxE = std::max(localMaxE, part.endSample);
+                    localTotalSamples += part.durationSamples();
+                }
+            }
+        } else {
+            for (const std::size_t pi : placementsByTrack[ti]) {
+                const auto& place = physicalPlan.placements[pi];
+                if (!place.isOnDisc) {
+                    hasLocalPart = true;
+                    const int sc = place.startAddr.cluster;
+                    const int ec = place.endAddr.cluster;
+                    if (minCluster == 0 || sc < minCluster) {
+                        minCluster = sc;
+                    }
+                    maxCluster = std::max(maxCluster, ec);
+                    localUnitSum += place.unitCount;
+                    if (firstSpanIdx < 0) {
+                        firstSpanIdx = place.spanIndex;
+                    }
+                    if (place.partIndex >= 0 &&
+                        place.partIndex < static_cast<int>(rawTr.parts.size())) {
+                        const auto& pt = rawTr.parts[static_cast<std::size_t>(place.partIndex)];
+                        localMinS = std::min(localMinS, pt.startSample);
+                        localMaxE = std::max(localMaxE, pt.endSample);
+                        localTotalSamples += pt.durationSamples();
+                    }
                 }
             }
         }
-        row.referencingTrackIndices0.assign(uniqTracks.begin(), uniqTracks.end());
 
+        if (!hasLocalPart || !seenLocalAudioKeys.insert(key).second) {
+            continue;
+        }
+        if (localMinS == std::numeric_limits<std::int64_t>::max() && !rawTr.parts.empty()) {
+            localMinS = rawTr.parts.front().startSample;
+            localMaxE = rawTr.parts.back().endSample;
+            localTotalSamples = rawTr.totalSamples();
+        }
+
+        AudioBankRow row;
+        row.isOnDisc = false;
+        row.spanIndex = firstSpanIdx;
+        row.audioId = trMeta.audioId;
+        row.uniqueAudioSlot = uniqueSlotByAudioKey[key];
+        row.codec = trMeta.effectiveCodec;
+        row.startCluster = minCluster;
+        row.endCluster = maxCluster;
+        row.unitCount = localUnitSum;
+        row.clusterCount =
+            isHiMd ? 0
+                   : (localUnitSum > 0
+                          ? std::max(1, (localUnitSum + carta::kMdUnitsPerCluster - 1) /
+                                            carta::kMdUnitsPerCluster)
+                          : 0);
+        row.timelineStartSample = localMinS;
+        row.timelineEndSample = localMaxE;
+        row.hiMdBytes = isHiMd ? carta::estimateHiMdTrackBytes(row.codec, localTotalSamples) : 0;
+        row.forceGapBefore = trMeta.forceGapBefore;
+        if (ti > 0) {
+            const auto& prevMeta = trackRows[ti - 1];
+            row.gappedBefore = trMeta.forceGapBefore ||
+                               (trMeta.effectiveCodec != prevMeta.effectiveCodec) ||
+                               (trMeta.onDisc != prevMeta.onDisc);
+        }
+
+        for (std::size_t k = 0; k < trackRows.size(); ++k) {
+            if (trackRows[k].audioId == trMeta.audioId) {
+                row.referencingTrackIndices0.push_back(static_cast<int>(k));
+                row.totalPartRefs += trackRows[k].partCount;
+            }
+        }
+
+        std::int64_t bestOverlap = 0;
         for (const auto& clipEntry : audioBankClipEntries) {
-            if (!clipEntry.isOnDisc && clipEntry.startSample < sp.endSample &&
-                sp.startSample < clipEntry.endSample && clipEntry.label.isNotEmpty()) {
+            if (clipEntry.isOnDisc || clipEntry.label.isEmpty()) {
+                continue;
+            }
+            if (clipEntry.startSample == row.timelineStartSample &&
+                clipEntry.endSample == row.timelineEndSample) {
                 row.label = clipEntry.label;
                 break;
             }
-        }
-        if (row.label.isEmpty() && !row.referencingTrackIndices0.empty()) {
-            row.label =
-                trackRows[static_cast<std::size_t>(row.referencingTrackIndices0.front())].title;
+            const auto ov = std::min<std::int64_t>(clipEntry.endSample, row.timelineEndSample) -
+                            std::max<std::int64_t>(clipEntry.startSample, row.timelineStartSample);
+            if (ov > bestOverlap) {
+                bestOverlap = ov;
+                row.label = clipEntry.label;
+            }
         }
         if (row.label.isEmpty()) {
-            row.label = "New Span #" + juce::String(static_cast<int>(si + 1));
+            row.label = trMeta.title;
         }
-        row.hiMdBytes =
-            isHiMd ? carta::estimateHiMdTrackBytes(sp.codec, sp.endSample - sp.startSample) : 0;
-        if (!row.referencingTrackIndices0.empty()) {
-            const auto& firstTr =
-                trackRows[static_cast<std::size_t>(row.referencingTrackIndices0.front())];
-            row.audioId = firstTr.audioId;
-            row.uniqueAudioSlot = uniqueSlotByAudioKey[firstTr.audioId.toStdString()];
+        if (row.label.isEmpty()) {
+            row.label = "Audio Pool #" + juce::String(row.uniqueAudioSlot);
         }
         audioBankRows.push_back(std::move(row));
     }
+
     std::sort(audioBankRows.begin(), audioBankRows.end(),
               [](const AudioBankRow& a, const AudioBankRow& b) {
                   if (a.isOnDisc != b.isOnDisc) {
@@ -1815,7 +1936,7 @@ void MdWorkspace::paint(juce::Graphics& g) {
             g.drawText(
                 planViewMode == "bank"
                     ? "Load a disc or import timeline audio to view physical Audio Bank regions."
-                    : "Add MiniDisc tracks (Tracks & UTOC -> Tracks from Clips) to plan recording.",
+                    : "Add MiniDisc tracks (Play Order -> Tracks from Clips) to plan recording.",
                 planList.getBounds().reduced(8, 0), juce::Justification::centred, true);
         }
         if (recordBusy || recordUiState.progress.active) {
@@ -2145,9 +2266,9 @@ void MdWorkspace::updateTabVisibility() {
     previewTrackButton.setVisible(isTracks);
     previewFromButton.setVisible(isTracks);
     reviewWavButton.setVisible(isTracks);
-    inspectUtocButton.setVisible(isRecord);
-    importUtocButton.setVisible(isRecord);
-    exportUtocButton.setVisible(isRecord);
+    inspectUtocButton.setVisible(isRecord && !isHiMd);
+    importUtocButton.setVisible(isRecord && !isHiMd);
+    exportUtocButton.setVisible(isRecord && !isHiMd);
     inspectUtocButton.setEnabled(!isHiMd);
     importUtocButton.setEnabled(!isHiMd);
     exportUtocButton.setEnabled(!isHiMd);
@@ -3128,6 +3249,9 @@ void MdWorkspace::showTrackContextMenu(int row) {
     menu.addItem(10, "Move Track to Position...", trackRows.size() > 1);
     menu.addItem(8, "Merge with Next Track",
                  !isAliased && row + 1 < static_cast<int>(trackRows.size()));
+    menu.addItem(15, "Force Gapped Break Before Track",
+                 row > 0 && !trackRows[static_cast<std::size_t>(row)].onDisc,
+                 trackRows[static_cast<std::size_t>(row)].forceGapBefore);
     menu.addItem(5, "Remove Track");
     {
         menu.addSeparator();
@@ -3207,6 +3331,10 @@ void MdWorkspace::showTrackContextMenu(int row) {
                 safe->promptMoveTrackToPosition(row);
             } else if (choice == 8 && safe->onCommand) {
                 safe->onCommand({"disc", "track", "merge", juce::String(row)}, safe->revision);
+            } else if (choice == 15 && safe->onCommand) {
+                const bool forced = safe->trackRows[static_cast<std::size_t>(row)].forceGapBefore;
+                safe->onCommand({"disc", "track", "gap", juce::String(row), forced ? "off" : "on"},
+                                safe->revision);
             } else if (choice == 5) {
                 safe->triggerRemoveSelectedTracks();
             } else if (choice == 6) {
@@ -3547,6 +3675,9 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
     if (tr.partCount > 1) {
         attrs.add("FRAG " + juce::String(tr.partCount));
     }
+    if (tr.forceGapBefore) {
+        attrs.add("GAP");
+    }
     const auto attrText = attrs.joinIntoString(" ");
     const int attrWidth =
         attrText.isNotEmpty() ? std::min(120, static_cast<int>(attrText.length()) * 7 + 12) : 0;
@@ -3737,6 +3868,9 @@ juce::String MdWorkspace::tooltipForTrackRow(int row) const {
     if (tr.partCount > 1) {
         tip += juce::String::fromUTF8(" \xc2\xb7 ") + juce::String(tr.partCount) +
                " physical fragments";
+    }
+    if (tr.forceGapBefore) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Forced gapped break before track");
     }
     tip += juce::String::fromUTF8(" \xc2\xb7 Double-click to edit title in place");
     return tip;
@@ -4045,42 +4179,98 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
     if (isHiMd) {
         const auto inner = bounds.reduced(1);
         std::int64_t cursorBytes = 0;
-        for (std::size_t i = 0; i < physicalPlan.spans.size(); ++i) {
-            const auto& sp = physicalPlan.spans[i];
-            const auto codec = sp.codec;
-            const auto trackBytes =
-                carta::estimateHiMdTrackBytes(codec, sp.endSample - sp.startSample);
-            if (trackBytes <= 0) {
+        bool drewHiMdRows = false;
+        int newSegIdx = 0;
+        for (const auto& br : audioBankRows) {
+            if (br.isReclaimed || br.hiMdBytes <= 0) {
                 continue;
             }
+            drewHiMdRows = true;
             const int x1 = inner.getX() +
                            static_cast<int>(std::llround((static_cast<double>(cursorBytes) /
                                                           static_cast<double>(hiMdCap)) *
                                                          inner.getWidth()));
-            cursorBytes += trackBytes;
+            cursorBytes += br.hiMdBytes;
             const int x2Raw = inner.getX() +
                               static_cast<int>(std::llround((static_cast<double>(cursorBytes) /
-                                                             static_cast<double>(hiMdCap)) *
-                                                            inner.getWidth()));
+                                                              static_cast<double>(hiMdCap)) *
+                                                             inner.getWidth()));
             const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
             if (x1 >= inner.getRight()) {
                 break;
             }
             const auto segRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
             const auto col =
-                over ? juce::Colour(0xffdc2626) : carta::md_ui::codecColour(codec, dark);
-            g.setColour(col.withAlpha(dark ? 0.72f : 0.65f));
+                over ? juce::Colour(0xffdc2626)
+                     : (br.isOnDisc ? (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2))
+                                    : carta::md_ui::codecColour(br.codec, dark));
+            g.setColour(col.withAlpha(br.isOnDisc ? 0.75f : (dark ? 0.72f : 0.65f)));
             g.fillRect(segRect);
+            if (x1 > inner.getX() && br.gappedBefore) {
+                g.setColour(dark ? juce::Colour(0xfff59e0b) : juce::Colour(0xffb45309));
+                g.fillRect(x1 - 1, inner.getY(), 2, inner.getHeight());
+            }
             if (x2 < inner.getRight()) {
                 g.setColour(wellBg.withAlpha(0.85f));
                 g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
             }
-            if (segRect.getWidth() >= 48) {
-                g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
-                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-                g.drawText("A" + juce::String(static_cast<int>(i + 1)) + " " +
-                               carta::md_ui::codecShortLabel(codec),
-                           segRect.reduced(3, 0), juce::Justification::centred, true);
+            if (br.isOnDisc) {
+                if (segRect.getWidth() >= 54) {
+                    g.setColour(juce::Colours::white);
+                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                    g.drawText("ON-DISC", segRect.reduced(3, 0), juce::Justification::centred,
+                               true);
+                }
+            } else {
+                ++newSegIdx;
+                if (segRect.getWidth() >= 48) {
+                    g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
+                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                    g.drawText("A" + juce::String(newSegIdx) + " " +
+                                   carta::md_ui::codecShortLabel(br.codec),
+                               segRect.reduced(3, 0), juce::Justification::centred, true);
+                }
+            }
+        }
+        if (!drewHiMdRows) {
+            for (std::size_t i = 0; i < physicalPlan.spans.size(); ++i) {
+                const auto& sp = physicalPlan.spans[i];
+                const auto codec = sp.codec;
+                const auto trackBytes =
+                    carta::estimateHiMdTrackBytes(codec, sp.endSample - sp.startSample);
+                if (trackBytes <= 0) {
+                    continue;
+                }
+                const int x1 = inner.getX() +
+                               static_cast<int>(std::llround((static_cast<double>(cursorBytes) /
+                                                              static_cast<double>(hiMdCap)) *
+                                                             inner.getWidth()));
+                cursorBytes += trackBytes;
+                const int x2Raw = inner.getX() +
+                                  static_cast<int>(std::llround((static_cast<double>(cursorBytes) /
+                                                                  static_cast<double>(hiMdCap)) *
+                                                                inner.getWidth()));
+                const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
+                if (x1 >= inner.getRight()) {
+                    break;
+                }
+                const auto segRect =
+                    juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
+                const auto col =
+                    over ? juce::Colour(0xffdc2626) : carta::md_ui::codecColour(codec, dark);
+                g.setColour(col.withAlpha(dark ? 0.72f : 0.65f));
+                g.fillRect(segRect);
+                if (x2 < inner.getRight()) {
+                    g.setColour(wellBg.withAlpha(0.85f));
+                    g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+                }
+                if (segRect.getWidth() >= 48) {
+                    g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
+                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                    g.drawText("A" + juce::String(static_cast<int>(i + 1)) + " " +
+                                   carta::md_ui::codecShortLabel(codec),
+                               segRect.reduced(3, 0), juce::Justification::centred, true);
+                }
             }
         }
         g.setColour(over ? juce::Colour(0xffdc2626) : border);
@@ -4114,68 +4304,179 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                                                 : carta::mdTotalClusters(discState.medium));
     const auto inner = bounds.reduced(1);
     int cursorClu = 0;
-    if (discState.loadedDisc.active && physicalPlan.onDiscClusters > 0) {
-        const int x1 = inner.getX();
-        const int x2 = std::min(
-            inner.getRight(),
-            std::max(x1 + 3,
-                     inner.getX() + static_cast<int>(std::llround(
-                                        (static_cast<double>(physicalPlan.onDiscClusters) /
-                                         static_cast<double>(totalClu)) *
-                                        inner.getWidth()))));
-        const auto onDiscRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
-        g.setColour((over ? juce::Colour(0xffdc2626)
-                          : (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2)))
-                        .withAlpha(0.75f));
-        g.fillRect(onDiscRect);
-        if (x2 < inner.getRight()) {
-            g.setColour(wellBg.withAlpha(0.85f));
-            g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+    std::int64_t totalOnDiscUnits = 0;
+    std::int64_t totalNewUnits = 0;
+    for (const auto& br : audioBankRows) {
+        if (br.isReclaimed || br.unitCount <= 0) {
+            continue;
         }
-        if (onDiscRect.getWidth() >= 54) {
-            g.setColour(juce::Colours::white);
-            g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-            g.drawText("ON-DISC", onDiscRect.reduced(3, 0), juce::Justification::centred, true);
+        if (br.isOnDisc) {
+            totalOnDiscUnits += br.unitCount;
+        } else {
+            totalNewUnits += br.unitCount;
+        }
+    }
+    if (discState.loadedDisc.active && physicalPlan.onDiscClusters > 0) {
+        if (totalOnDiscUnits > 0) {
+            double unitCursor = 0.0;
+            for (const auto& br : audioBankRows) {
+                if (!br.isOnDisc || br.isReclaimed || br.unitCount <= 0) {
+                    continue;
+                }
+                const double startCluD = (unitCursor / static_cast<double>(totalOnDiscUnits)) *
+                                         static_cast<double>(physicalPlan.onDiscClusters);
+                unitCursor += static_cast<double>(br.unitCount);
+                const double endCluD = (unitCursor / static_cast<double>(totalOnDiscUnits)) *
+                                       static_cast<double>(physicalPlan.onDiscClusters);
+                const int x1 = inner.getX() +
+                               static_cast<int>(std::llround(
+                                   (startCluD / static_cast<double>(totalClu)) * inner.getWidth()));
+                const int x2Raw = inner.getX() +
+                                  static_cast<int>(std::llround(
+                                      (endCluD / static_cast<double>(totalClu)) * inner.getWidth()));
+                const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
+                if (x1 >= inner.getRight()) {
+                    break;
+                }
+                const auto onDiscRect =
+                    juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
+                g.setColour((over ? juce::Colour(0xffdc2626)
+                                  : (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2)))
+                                .withAlpha(0.75f));
+                g.fillRect(onDiscRect);
+                if (x1 > inner.getX() && br.gappedBefore) {
+                    g.setColour(dark ? juce::Colour(0xfff59e0b) : juce::Colour(0xffb45309));
+                    g.fillRect(x1 - 1, inner.getY(), 2, inner.getHeight());
+                }
+                if (x2 < inner.getRight()) {
+                    g.setColour(wellBg.withAlpha(0.85f));
+                    g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+                }
+                if (onDiscRect.getWidth() >= 54) {
+                    g.setColour(juce::Colours::white);
+                    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                    g.drawText("ON-DISC", onDiscRect.reduced(3, 0), juce::Justification::centred,
+                               true);
+                }
+            }
+        } else {
+            const int x1 = inner.getX();
+            const int x2 = std::min(
+                inner.getRight(),
+                std::max(x1 + 3,
+                         inner.getX() + static_cast<int>(std::llround(
+                                            (static_cast<double>(physicalPlan.onDiscClusters) /
+                                             static_cast<double>(totalClu)) *
+                                            inner.getWidth()))));
+            const auto onDiscRect =
+                juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
+            g.setColour((over ? juce::Colour(0xffdc2626)
+                              : (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2)))
+                            .withAlpha(0.75f));
+            g.fillRect(onDiscRect);
+            if (x2 < inner.getRight()) {
+                g.setColour(wellBg.withAlpha(0.85f));
+                g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+            }
+            if (onDiscRect.getWidth() >= 54) {
+                g.setColour(juce::Colours::white);
+                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                g.drawText("ON-DISC", onDiscRect.reduced(3, 0), juce::Justification::centred, true);
+            }
         }
         cursorClu = physicalPlan.onDiscClusters;
     }
-    for (std::size_t i = 0; i < physicalPlan.spans.size(); ++i) {
-        const auto& sp = physicalPlan.spans[i];
-        if (sp.clusterCount <= 0) {
-            continue;
+    const int newCluBudget =
+        physicalPlan.newUploadClusters > 0
+            ? physicalPlan.newUploadClusters
+            : (discState.loadedDisc.active ? 0 : physicalPlan.usedClusters);
+    if (totalNewUnits > 0 && newCluBudget > 0) {
+        double newUnitCursor = 0.0;
+        int newSegIdx = 0;
+        for (const auto& br : audioBankRows) {
+            if (br.isOnDisc || br.isReclaimed || br.unitCount <= 0) {
+                continue;
+            }
+            ++newSegIdx;
+            const double startCluD =
+                static_cast<double>(cursorClu) +
+                (newUnitCursor / static_cast<double>(totalNewUnits)) *
+                    static_cast<double>(newCluBudget);
+            newUnitCursor += static_cast<double>(br.unitCount);
+            const double endCluD =
+                static_cast<double>(cursorClu) +
+                (newUnitCursor / static_cast<double>(totalNewUnits)) *
+                    static_cast<double>(newCluBudget);
+            const int x1 = inner.getX() +
+                           static_cast<int>(std::llround(
+                               (startCluD / static_cast<double>(totalClu)) * inner.getWidth()));
+            const int x2Raw = inner.getX() +
+                              static_cast<int>(std::llround(
+                                  (endCluD / static_cast<double>(totalClu)) * inner.getWidth()));
+            const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
+            if (x1 >= inner.getRight()) {
+                break;
+            }
+            const auto segRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
+            const auto col =
+                over ? juce::Colour(0xffdc2626) : carta::md_ui::codecColour(br.codec, dark);
+            g.setColour(col.withAlpha(dark ? 0.72f : 0.65f));
+            g.fillRect(segRect);
+            if (x1 > inner.getX() && br.gappedBefore) {
+                g.setColour(dark ? juce::Colour(0xfff59e0b) : juce::Colour(0xffb45309));
+                g.fillRect(x1 - 1, inner.getY(), 2, inner.getHeight());
+            }
+            if (x2 < inner.getRight()) {
+                g.setColour(wellBg.withAlpha(0.85f));
+                g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+            }
+            if (segRect.getWidth() >= 48) {
+                g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
+                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                g.drawText("A" + juce::String(newSegIdx) + " " +
+                               carta::md_ui::codecShortLabel(br.codec),
+                           segRect.reduced(3, 0), juce::Justification::centred, true);
+            }
         }
-        const int startClu = discState.loadedDisc.active
-                                 ? cursorClu
-                                 : std::max<int>(0, sp.startCluster - carta::kMdFirstAudioCluster);
-        cursorClu += sp.clusterCount;
-        const int x1 = inner.getX() +
-                       static_cast<int>(std::llround((static_cast<double>(startClu) /
-                                                      static_cast<double>(totalClu)) *
-                                                     inner.getWidth()));
-        const int x2Raw =
-            inner.getX() +
-            static_cast<int>(std::llround(
-                (static_cast<double>(startClu + sp.clusterCount) / static_cast<double>(totalClu)) *
-                inner.getWidth()));
-        const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
-        if (x1 >= inner.getRight()) {
-            break;
-        }
-        const auto segRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
-        const auto col =
-            over ? juce::Colour(0xffdc2626) : carta::md_ui::codecColour(sp.codec, dark);
-        g.setColour(col.withAlpha(dark ? 0.72f : 0.65f));
-        g.fillRect(segRect);
-        if (x2 < inner.getRight()) {
-            g.setColour(wellBg.withAlpha(0.85f));
-            g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
-        }
-        if (segRect.getWidth() >= 48) {
-            g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
-            g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
-            g.drawText("S" + juce::String(static_cast<int>(i + 1)) + " " +
-                           carta::md_ui::codecShortLabel(sp.codec),
-                       segRect.reduced(3, 0), juce::Justification::centred, true);
+    } else {
+        for (std::size_t i = 0; i < physicalPlan.spans.size(); ++i) {
+            const auto& sp = physicalPlan.spans[i];
+            if (sp.clusterCount <= 0) {
+                continue;
+            }
+            const int startClu = discState.loadedDisc.active
+                                     ? cursorClu
+                                     : std::max<int>(0, sp.startCluster - carta::kMdFirstAudioCluster);
+            cursorClu += sp.clusterCount;
+            const int x1 = inner.getX() +
+                           static_cast<int>(std::llround((static_cast<double>(startClu) /
+                                                          static_cast<double>(totalClu)) *
+                                                         inner.getWidth()));
+            const int x2Raw = inner.getX() +
+                              static_cast<int>(std::llround(
+                                  (static_cast<double>(startClu + sp.clusterCount) /
+                                   static_cast<double>(totalClu)) *
+                                  inner.getWidth()));
+            const int x2 = std::min(inner.getRight(), std::max(x1 + 3, x2Raw));
+            if (x1 >= inner.getRight()) {
+                break;
+            }
+            const auto segRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
+            const auto col =
+                over ? juce::Colour(0xffdc2626) : carta::md_ui::codecColour(sp.codec, dark);
+            g.setColour(col.withAlpha(dark ? 0.72f : 0.65f));
+            g.fillRect(segRect);
+            if (x2 < inner.getRight()) {
+                g.setColour(wellBg.withAlpha(0.85f));
+                g.fillRect(x2 - 1, inner.getY(), 1, inner.getHeight());
+            }
+            if (segRect.getWidth() >= 48) {
+                g.setColour(dark ? juce::Colour(0xfff5f5f5) : juce::Colour(0xffffffff));
+                g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+                g.drawText("A" + juce::String(static_cast<int>(i + 1)) + " " +
+                               carta::md_ui::codecShortLabel(sp.codec),
+                           segRect.reduced(3, 0), juce::Justification::centred, true);
+            }
         }
     }
 
@@ -4186,20 +4487,15 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
         (static_cast<double>(physicalPlan.usedClusters) * 100.0) / static_cast<double>(totalClu)));
     const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
     const auto capText =
-        discState.loadedDisc.active
-            ? (juce::String(physicalPlan.usedClusters) + "/" + juce::String(totalClu) +
-               " clusters (" + juce::String(pct) + "%)" + dot +
-               juce::String(physicalPlan.onDiscClusters) + " on-disc + " +
-               juce::String(physicalPlan.newUploadClusters) + " new" +
-               (physicalPlan.reclaimedClusters > 0
-                    ? (dot + "reclaim " + juce::String(physicalPlan.reclaimedClusters))
-                    : juce::String()))
-            : (juce::String(physicalPlan.usedClusters) + "/" + juce::String(totalClu) +
-               " clusters (" + juce::String(pct) + "%)" +
-               (physicalPlan.spans.empty()
-                    ? juce::String()
-                    : (dot + juce::String(static_cast<int>(physicalPlan.spans.size())) +
-                       " physical upload(s)")));
+        juce::String(physicalPlan.usedClusters) + "/" + juce::String(totalClu) +
+        " clusters (" + juce::String(pct) + "%)" +
+        (discState.tracks.empty()
+             ? juce::String()
+             : (dot + juce::String(physicalPlan.uniqueAudioTrackCount) + " uniq / " +
+                juce::String(physicalPlan.playOrderTrackCount) + " trk")) +
+        ((discState.loadedDisc.active && physicalPlan.reclaimedClusters > 0)
+             ? (dot + "reclaim " + juce::String(physicalPlan.reclaimedClusters))
+             : juce::String());
     g.setColour(textPrimary);
     g.setFont(juce::FontOptions(10.2f, juce::Font::bold));
     const int labelW =
@@ -4297,6 +4593,8 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
                height, juce::Justification::centredRight, false);
 
     juce::String physText;
+    const auto midDot = juce::String::fromUTF8(" \xc2\xb7 ");
+    const juce::String gapPrefix = pr.forceGapBefore ? ("GAP" + midDot) : juce::String();
     const juce::String sharedTag =
         pr.spanRefCount > 1 ? (" (x" + juce::String(pr.spanRefCount) + ")") : juce::String();
     if (carta::isHiMdMedium(discState.medium)) {
@@ -4306,34 +4604,28 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
                                                                               : juce::String())) +
             formatMegabytes(estBytes);
         if (pr.aliasRefCount > 1) {
-            physText = "Alias -> Pool #" + juce::String(pr.uniqueAudioSlot) + " (" + baseStr +
-                       ") x" + juce::String(pr.aliasRefCount);
+            physText = gapPrefix + "Alias -> Pool #" + juce::String(pr.uniqueAudioSlot) + " (" +
+                       baseStr + ") x" + juce::String(pr.aliasRefCount);
         } else {
-            physText = "Pool #" + juce::String(pr.uniqueAudioSlot) + " · " + baseStr;
+            physText = gapPrefix + "Pool #" + juce::String(pr.uniqueAudioSlot) + midDot + baseStr;
         }
     } else if (pr.partHopsText.isNotEmpty()) {
         const juce::String tagPrefix =
             (pr.onDisc && pr.primarySpanIndex >= 0)
                 ? "MIX "
                 : (pr.onDisc ? "DISC " : (discState.loadedDisc.active ? "NEW " : ""));
-        physText = tagPrefix + pr.partHopsText + sharedTag;
-    } else if (pr.onDisc && pr.primarySpanIndex < 0) {
+        physText = gapPrefix + tagPrefix + pr.partHopsText + sharedTag;
+    } else if (pr.onDisc || pr.primarySpanIndex >= 0) {
         const auto range = compactClusterLabel(pr.spanClusterStart, pr.spanClusterEnd);
-        physText = "ON-DISC " + range +
-                   (pr.sharesPhysicalSpan ? (" x" + juce::String(pr.spanRefCount)) : "");
-    } else if (pr.primarySpanIndex >= 0) {
-        const auto range = compactClusterLabel(pr.spanClusterStart, pr.spanClusterEnd);
-        const juce::String prefix =
-            pr.onDisc ? "ON-DISC + NEW #"
-                      : (discState.loadedDisc.active ? "NEW Span #" : "Span #");
-        if (pr.sharesPhysicalSpan) {
-            physText = "Alias -> Span #" + juce::String(pr.primarySpanIndex + 1) + " (" + range +
-                       ") x" + juce::String(pr.spanRefCount);
-        } else if (pr.spanRefCount > 1) {
-            physText = prefix + juce::String(pr.primarySpanIndex + 1) + " (" + range + ") x" +
-                       juce::String(pr.spanRefCount);
+        const juce::String tagPrefix =
+            pr.onDisc ? "DISC " : (discState.loadedDisc.active ? "NEW " : "");
+        const int refCount = std::max(pr.aliasRefCount, pr.spanRefCount);
+        if (pr.aliasRefCount > 1 || pr.sharesPhysicalSpan) {
+            physText = gapPrefix + "Alias -> Pool #" + juce::String(pr.uniqueAudioSlot) + " (" +
+                       tagPrefix + range + ") x" + juce::String(refCount);
         } else {
-            physText = prefix + juce::String(pr.primarySpanIndex + 1) + " " + range;
+            physText = gapPrefix + "Pool #" + juce::String(pr.uniqueAudioSlot) + midDot +
+                       tagPrefix + range;
         }
     } else {
         physText = "(unplanned)";
@@ -4425,8 +4717,10 @@ void MdWorkspace::paintAudioBankRow(int row, juce::Graphics& g, int width, int h
     const auto cluStr =
         carta::isHiMdMedium(discState.medium)
             ? formatMegabytes(br.hiMdBytes)
-            : (compactClusterLabel(br.startCluster, br.endCluster) + " (" +
-               juce::String(br.clusterCount) + " cl)");
+            : (br.startCluster > 0
+                   ? (compactClusterLabel(br.startCluster, br.endCluster) + " (" +
+                      juce::String(br.clusterCount) + " cl)")
+                   : juce::String("(unplanned)"));
     g.setColour(textMuted);
     g.setFont(juce::FontOptions(10.4f));
     g.drawText(cluStr, width - refsW - cluW - 12, 0, cluW, height,
@@ -4485,6 +4779,11 @@ juce::String MdWorkspace::tooltipForAudioBankRow(int row) const {
     if (br.timelineEndSample > br.timelineStartSample) {
         tip += juce::String::fromUTF8(" \xc2\xb7 ") +
                carta::md_ui::formatClock(br.timelineEndSample - br.timelineStartSample);
+    }
+    if (br.forceGapBefore) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Forced gapped break before");
+    } else if (br.gappedBefore) {
+        tip += juce::String::fromUTF8(" \xc2\xb7 Gapped break before (codec/on-disc boundary)");
     }
     if (br.isReclaimed) {
         tip += juce::String::fromUTF8(" \xc2\xb7 Unreferenced — reclaims ") +

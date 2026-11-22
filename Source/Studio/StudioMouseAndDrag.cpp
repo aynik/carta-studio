@@ -53,6 +53,7 @@ constexpr int renameTrack = 7;
 constexpr int removeTrack = 8;
 constexpr int syncFromClips = 9;
 constexpr int makeUnique = 10;
+constexpr int toggleForceGap = 11;
 } // namespace MdRibbonMenuId
 
 } // namespace
@@ -258,6 +259,22 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
                  canMerge);
     menu.addItem(MdRibbonMenuId::duplicateShared, "Insert Play Order Alias", hasTrack);
     menu.addItem(MdRibbonMenuId::makeUnique, "Make Unique (Detach Alias)", isAliased);
+    const int gapTargetIdx =
+        (info.gesture == MdRibbonGesture::sharedSplit && info.rightTrackIndex >= 0 &&
+         info.rightTrackIndex < static_cast<int>(session.mdDisc.tracks.size()))
+            ? info.rightTrackIndex
+            : ((hasTrack && info.trackIndex > 0) ? info.trackIndex : -1);
+    const bool canToggleForceGap =
+        gapTargetIdx >= 0 &&
+        !carta::mdTrackUsesOnDiscAudio(
+            session.mdDisc, session.mdDisc.tracks[static_cast<size_t>(gapTargetIdx)]);
+    const bool currentlyForcedGap =
+        canToggleForceGap &&
+        session.mdDisc.tracks[static_cast<size_t>(gapTargetIdx)].forceGapBefore;
+    if (canToggleForceGap) {
+        menu.addItem(MdRibbonMenuId::toggleForceGap, "Force Gapped Break Here", true,
+                     currentlyForcedGap);
+    }
     menu.addSeparator();
     menu.addItem(MdRibbonMenuId::auditionTrack, "Audition Track", hasTrack);
     menu.addItem(MdRibbonMenuId::auditionFromHere, "Audition from Here", hasTrack);
@@ -274,7 +291,8 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), revision, trackIdx, trackId,
-         mergeLeftIdx, clickSample, playheadSample, stackedCandidates](int result) {
+         mergeLeftIdx, gapTargetIdx, currentlyForcedGap, clickSample, playheadSample,
+         stackedCandidates](int result) {
             if (safe == nullptr || result == 0) {
                 return;
             }
@@ -356,6 +374,14 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
             case MdRibbonMenuId::syncFromClips:
                 if (safe->discWorkspace.onCommand) {
                     safe->discWorkspace.onCommand({"disc", "sync", "clips"}, revision);
+                }
+                break;
+            case MdRibbonMenuId::toggleForceGap:
+                if (gapTargetIdx >= 0 && safe->discWorkspace.onCommand) {
+                    safe->discWorkspace.onCommand(
+                        {"disc", "track", "gap", juce::String(gapTargetIdx),
+                         currentlyForcedGap ? "off" : "on"},
+                        revision);
                 }
                 break;
             default:
@@ -484,8 +510,8 @@ void Studio::updateDraggedMdRibbon(const juce::ModifierKeys& mods) {
                 juce::int64{0}, maxStart);
         }
         if (mdDragGesture == MdRibbonGesture::slideBody) {
-            ok = carta::slideMdPartRange(nextDisc, mdDragTrack0, mdDragPart0, newStart,
-                                         mdDragMaxSample, mdErr);
+            ok = carta::slideMdPartRangeContiguous(nextDisc, mdDragTrack0, mdDragPart0, newStart,
+                                                   mdDragMaxSample, mdErr);
             if (ok) {
                 summary = "MD track moved to [" + juce::String(newStart) + ", " +
                           juce::String(newStart + len) + ")";
@@ -753,11 +779,25 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
                 const auto draggedKey = carta::effectiveMdAudioId(
                     mdDragBeforeDisc.tracks[static_cast<size_t>(mdDragTrack0)]);
                 auto& parts = snapSession.mdDisc.tracks[static_cast<size_t>(mdDragTrack0)].parts;
+                const auto removedStart = parts[static_cast<size_t>(mdDragPart0)].startSample;
+                const auto removedEnd = parts[static_cast<size_t>(mdDragPart0)].endSample;
                 parts.erase(parts.begin() + mdDragPart0);
                 for (size_t ti = 0; ti < snapSession.mdDisc.tracks.size(); ++ti) {
-                    if (static_cast<int>(ti) != mdDragTrack0 &&
-                        carta::effectiveMdAudioId(snapSession.mdDisc.tracks[ti]) == draggedKey) {
+                    const auto key = carta::effectiveMdAudioId(snapSession.mdDisc.tracks[ti]);
+                    if (static_cast<int>(ti) != mdDragTrack0 && key == draggedKey) {
                         snapSession.mdDisc.tracks[ti].parts.clear();
+                    } else if (mdDragGesture == MdRibbonGesture::slideBody && key != draggedKey) {
+                        for (auto& op : snapSession.mdDisc.tracks[ti].parts) {
+                            const bool opOnDisc =
+                                mdDragBeforeDisc.loadedDisc.active &&
+                                carta::findMdOnDiscRegionForPart(mdDragBeforeDisc.loadedDisc, op) >=
+                                    0;
+                            if (!opOnDisc && op.endSample == removedStart) {
+                                op.endSample = op.startSample;
+                            } else if (!opOnDisc && op.startSample == removedEnd) {
+                                op.startSample = op.endSample;
+                            }
+                        }
                     }
                 }
             }

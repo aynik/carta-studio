@@ -27,6 +27,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <tuple>
@@ -168,6 +169,8 @@ struct RawPartRef {
     std::int64_t rawEnd = 0;
     std::int64_t qStart = 0;
     std::int64_t qEnd = 0;
+    std::string audioKey;
+    bool forceGapBefore = false;
 };
 
 std::int64_t snapToOnDiscRegionGrid(const MdOnDiscRegion& r, std::int64_t sample) noexcept {
@@ -525,6 +528,23 @@ bool mdTrackUsesOnDiscAudio(const MdDisc& disc, const MdTrack& track) noexcept {
     return false;
 }
 
+namespace {
+
+bool rangeOverlapsLoadedRegion(const MdLoadedDiscState& loaded, std::int64_t start,
+                               std::int64_t end) noexcept {
+    if (!loaded.active || end <= start) {
+        return false;
+    }
+    for (const auto& r : loaded.regions) {
+        if (start < r.timelineEndSample && end > r.timelineStartSample) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 int countWholeFreeClusters(const std::vector<MdPhysRange>& ranges) noexcept {
     int total = 0;
     for (const auto& r : ranges) {
@@ -696,7 +716,7 @@ bool validateMdDisc(const MdDisc& disc, std::string& error) {
             const auto& canonical = *it->second;
             if (tr.halfWidthTitle != canonical.halfWidthTitle ||
                 tr.fullWidthTitle != canonical.fullWidthTitle || tr.artist != canonical.artist ||
-                tr.album != canonical.album ||
+                tr.album != canonical.album || tr.forceGapBefore != canonical.forceGapBefore ||
                 trCodec != effectiveTrackCodec(disc, canonical) ||
                 tr.writeProtected != canonical.writeProtected ||
                 tr.scmsCopyProtected != canonical.scmsCopyProtected ||
@@ -912,7 +932,9 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
                 r.rawEnd = part.endSample;
                 r.qStart = (part.startSample / q) * q;
                 r.qEnd = ((part.endSample + q - 1) / q) * q;
-                localRefs.push_back(r);
+                r.audioKey = effectiveMdAudioId(tr);
+                r.forceGapBefore = (p == 0 && tr.forceGapBefore);
+                localRefs.push_back(std::move(r));
 
                 const int partUnits = static_cast<int>(((r.qEnd - r.qStart) / q) * upq);
                 out.uncoalescedClusters +=
@@ -949,8 +971,17 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
         }
     }
 
-    // Group new local refs by codec and sort by outward-aligned interval [qStart, qEnd).
+    // Group new local refs by codec and sort by outward-aligned interval [qStart, qEnd), breaking
+    // on `forceGapBefore`, then concatenate consecutive same-codec slices in Play Order across
+    // local tracks (keeping gapped breaks across codec changes, forced gaps, or on-disc tracks).
     if (!localRefs.empty()) {
+        std::vector<bool> trackUsesOnDisc(disc.tracks.size(), false);
+        if (disc.loadedDisc.active) {
+            for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
+                trackUsesOnDisc[t] = mdTrackUsesOnDiscAudio(disc, disc.tracks[t]);
+            }
+        }
+
         std::map<std::pair<int, int>, std::size_t> placementIndexByTrackPart;
         std::size_t idx = 0;
         for (std::size_t t = 0; t < disc.tracks.size(); ++t) {
@@ -965,52 +996,141 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
             byCodec[r.codec].push_back(r);
         }
 
-        struct PendingSpan {
-            MdCodecMode codec;
+        struct TimelineSlice {
+            MdCodecMode codec = MdCodecMode::spStereo;
             std::int64_t startSample = 0;
             std::int64_t endSample = 0;
             int earliestTrackIndex = 0;
             int earliestPartIndex = 0;
+            int lastTrackIndex = 0;
+            bool startsForcedGap = false;
             std::vector<RawPartRef> members;
         };
-        std::vector<PendingSpan> pendingSpans;
+        std::vector<TimelineSlice> timelineSlices;
 
         for (auto& [codec, list] : byCodec) {
-            std::sort(list.begin(), list.end(), [](const RawPartRef& a, const RawPartRef& b) {
-                return std::tie(a.qStart, a.qEnd, a.trackIndex, a.partIndex) <
-                       std::tie(b.qStart, b.qEnd, b.trackIndex, b.partIndex);
-            });
+            const std::int64_t q = mdFrameQuantumSamples(codec);
+            std::set<std::int64_t> forcedBoundaries;
             for (const auto& r : list) {
-                if (pendingSpans.empty() || pendingSpans.back().codec != codec ||
-                    r.qStart > pendingSpans.back().endSample) {
-                    PendingSpan s;
-                    s.codec = codec;
-                    s.startSample = r.qStart;
-                    s.endSample = r.qEnd;
-                    s.earliestTrackIndex = r.trackIndex;
-                    s.earliestPartIndex = r.partIndex;
-                    s.members.push_back(r);
-                    pendingSpans.push_back(std::move(s));
-                } else {
-                    auto& s = pendingSpans.back();
-                    s.endSample = std::max(s.endSample, r.qEnd);
-                    if (std::tie(r.trackIndex, r.partIndex) <
-                        std::tie(s.earliestTrackIndex, s.earliestPartIndex)) {
-                        s.earliestTrackIndex = r.trackIndex;
-                        s.earliestPartIndex = r.partIndex;
+                if (r.forceGapBefore) {
+                    forcedBoundaries.insert(r.rawStart);
+                }
+            }
+            for (const std::int64_t bSample : forcedBoundaries) {
+                bool hasLeft = false;
+                bool hasRight = false;
+                bool hasStraddler = false;
+                std::int64_t minEndQ = 0;
+                std::int64_t maxStartQ = std::numeric_limits<std::int64_t>::max();
+                for (const auto& r : list) {
+                    if (r.rawEnd == bSample) {
+                        hasLeft = true;
+                        minEndQ = std::max(minEndQ, r.qStart + q);
+                    } else if (r.rawStart == bSample) {
+                        hasRight = true;
+                        maxStartQ = std::min(maxStartQ, r.qEnd - q);
+                    } else if (r.rawStart < bSample && bSample < r.rawEnd) {
+                        hasStraddler = true;
                     }
-                    s.members.push_back(r);
+                }
+                if (hasLeft && hasRight && !hasStraddler && minEndQ <= maxStartQ) {
+                    const std::int64_t splitQ =
+                        std::clamp(((bSample + q / 2) / q) * q, minEndQ, maxStartQ);
+                    for (auto& r : list) {
+                        if (r.rawEnd == bSample) {
+                            r.qEnd = splitQ;
+                        } else if (r.rawStart == bSample) {
+                            r.qStart = splitQ;
+                        }
+                    }
+                }
+            }
+
+            std::sort(list.begin(), list.end(), [](const RawPartRef& a, const RawPartRef& b) {
+                const bool aGap = a.forceGapBefore;
+                const bool bGap = b.forceGapBefore;
+                return std::tie(a.qStart, a.qEnd, bGap, a.trackIndex, a.partIndex) <
+                       std::tie(b.qStart, b.qEnd, aGap, b.trackIndex, b.partIndex);
+            });
+
+            std::set<std::string> currentSliceAudioKeys;
+            for (const auto& r : list) {
+                const bool breakForced =
+                    !timelineSlices.empty() && timelineSlices.back().codec == codec &&
+                    r.forceGapBefore && r.qStart >= timelineSlices.back().endSample &&
+                    !currentSliceAudioKeys.count(r.audioKey);
+                if (timelineSlices.empty() || timelineSlices.back().codec != codec ||
+                    r.qStart > timelineSlices.back().endSample || breakForced) {
+                    TimelineSlice sl;
+                    sl.codec = codec;
+                    sl.startSample = r.qStart;
+                    sl.endSample = r.qEnd;
+                    sl.earliestTrackIndex = r.trackIndex;
+                    sl.earliestPartIndex = r.partIndex;
+                    sl.lastTrackIndex = r.trackIndex;
+                    sl.startsForcedGap = breakForced || r.forceGapBefore;
+                    sl.members.push_back(r);
+                    timelineSlices.push_back(std::move(sl));
+                    currentSliceAudioKeys.clear();
+                    currentSliceAudioKeys.insert(r.audioKey);
+                } else {
+                    auto& sl = timelineSlices.back();
+                    sl.endSample = std::max(sl.endSample, r.qEnd);
+                    if (std::tie(r.trackIndex, r.partIndex) <
+                        std::tie(sl.earliestTrackIndex, sl.earliestPartIndex)) {
+                        sl.earliestTrackIndex = r.trackIndex;
+                        sl.earliestPartIndex = r.partIndex;
+                    }
+                    sl.lastTrackIndex = std::max(sl.lastTrackIndex, r.trackIndex);
+                    if (r.qStart == sl.startSample && r.forceGapBefore) {
+                        sl.startsForcedGap = true;
+                    }
+                    sl.members.push_back(r);
+                    currentSliceAudioKeys.insert(r.audioKey);
                 }
             }
         }
 
-        // Order physical spans in track presentation order so sequential discs read sequentially
-        // on cluster map.
-        std::sort(pendingSpans.begin(), pendingSpans.end(),
-                  [](const PendingSpan& a, const PendingSpan& b) {
+        // Order timeline slices in track presentation order and concatenate consecutive same-codec
+        // non-gapped local runs into single gapless upload spans.
+        std::sort(timelineSlices.begin(), timelineSlices.end(),
+                  [](const TimelineSlice& a, const TimelineSlice& b) {
                       return std::tie(a.earliestTrackIndex, a.earliestPartIndex, a.startSample) <
                              std::tie(b.earliestTrackIndex, b.earliestPartIndex, b.startSample);
                   });
+
+        struct PendingSpan {
+            MdCodecMode codec = MdCodecMode::spStereo;
+            int lastTrackIndex = 0;
+            std::vector<TimelineSlice> slices;
+        };
+        std::vector<PendingSpan> pendingSpans;
+        for (auto& sl : timelineSlices) {
+            bool canConcat = !pendingSpans.empty() && pendingSpans.back().codec == sl.codec &&
+                             !sl.startsForcedGap &&
+                             sl.earliestTrackIndex <= pendingSpans.back().lastTrackIndex + 1;
+            if (canConcat && disc.loadedDisc.active) {
+                for (int ti = pendingSpans.back().lastTrackIndex + 1; ti < sl.earliestTrackIndex;
+                     ++ti) {
+                    if (ti >= 0 && ti < static_cast<int>(trackUsesOnDisc.size()) &&
+                        trackUsesOnDisc[static_cast<std::size_t>(ti)]) {
+                        canConcat = false;
+                        break;
+                    }
+                }
+            }
+            if (!canConcat) {
+                PendingSpan ps;
+                ps.codec = sl.codec;
+                ps.lastTrackIndex = sl.lastTrackIndex;
+                ps.slices.push_back(std::move(sl));
+                pendingSpans.push_back(std::move(ps));
+            } else {
+                auto& ps = pendingSpans.back();
+                ps.lastTrackIndex = std::max(ps.lastTrackIndex, sl.lastTrackIndex);
+                ps.slices.push_back(std::move(sl));
+            }
+        }
 
         std::uint16_t nextCluster =
             disc.loadedDisc.active
@@ -1021,81 +1141,88 @@ bool planMdPhysicalAudio(const MdDisc& disc, MdPhysicalPlan& out, std::string& e
             const auto& ps = pendingSpans[sIdx];
             const std::int64_t q = mdFrameQuantumSamples(ps.codec);
             const int upq = mdUnitsPerQuantum(ps.codec);
-            const int totalQuanta = static_cast<int>((ps.endSample - ps.startSample) / q);
-            const int spanUnits = totalQuanta * upq;
-            const int spanClusters = (spanUnits + kMdUnitsPerCluster - 1) / kMdUnitsPerCluster;
-
-            // Collect internal abutting boundary sample positions (where one part's exact rawEnd
-            // equals another part's exact rawStart within the same coalesced span) so split points
-            // land cleanly on one Sound Group boundary with zero gap and zero duplicated 11.6 ms
-            // frame.
-            std::set<std::int64_t> rawStarts;
-            std::set<std::int64_t> rawEnds;
-            std::set<std::int64_t> exactSplits;
-            for (const auto& m : ps.members) {
-                rawStarts.insert(m.rawStart);
-                rawEnds.insert(m.rawEnd);
-            }
-            for (const auto e : rawEnds) {
-                if (rawStarts.count(e)) {
-                    exactSplits.insert(e);
-                }
-            }
-
-            MdPhysicalSpan span;
-            span.codec = ps.codec;
-            span.startSample = ps.startSample;
-            span.endSample = ps.endSample;
-            span.unitCount = spanUnits;
-            span.startCluster = nextCluster;
-            span.clusterCount = spanClusters;
-            out.spans.push_back(span);
-
-            out.uniquePhysicalSamples += (ps.endSample - ps.startSample);
-            out.newUploadClusters += spanClusters;
-            out.usedClusters += spanClusters;
-
             const std::int64_t spanBaseLinearUnit =
                 static_cast<std::int64_t>(nextCluster) * kMdUnitsPerCluster;
 
-            for (const auto& m : ps.members) {
-                int startQuanta = 0;
-                if (exactSplits.count(m.rawStart)) {
-                    startQuanta = static_cast<int>((m.rawStart - ps.startSample + q / 2) / q);
-                    startQuanta = std::clamp(startQuanta, 0, std::max(0, totalQuanta - 1));
-                } else {
-                    startQuanta = static_cast<int>((m.rawStart - ps.startSample) / q);
+            MdPhysicalSpan span;
+            span.codec = ps.codec;
+            span.startSample = ps.slices.front().startSample;
+            span.endSample = ps.slices.back().endSample;
+            span.startCluster = nextCluster;
+            span.slices.reserve(ps.slices.size());
+
+            int sliceUnitOffset = 0;
+            for (const auto& sl : ps.slices) {
+                span.slices.push_back({sl.startSample, sl.endSample});
+                const int slQuanta = static_cast<int>((sl.endSample - sl.startSample) / q);
+
+                // Collect internal abutting boundary sample positions within this timeline slice
+                // so split points land cleanly on one Sound Group boundary with zero gap and zero
+                // duplicated 11.6 ms frame.
+                std::set<std::int64_t> rawStarts;
+                std::set<std::int64_t> rawEnds;
+                std::set<std::int64_t> exactSplits;
+                for (const auto& m : sl.members) {
+                    rawStarts.insert(m.rawStart);
+                    rawEnds.insert(m.rawEnd);
+                }
+                for (const auto e : rawEnds) {
+                    if (rawStarts.count(e)) {
+                        exactSplits.insert(e);
+                    }
                 }
 
-                int endQuanta = totalQuanta;
-                if (exactSplits.count(m.rawEnd)) {
-                    endQuanta = static_cast<int>((m.rawEnd - ps.startSample + q / 2) / q);
-                    endQuanta = std::clamp(endQuanta, startQuanta + 1, totalQuanta);
-                } else {
-                    endQuanta = static_cast<int>((m.rawEnd - ps.startSample + q - 1) / q);
-                    endQuanta = std::clamp(endQuanta, startQuanta + 1, totalQuanta);
+                for (const auto& m : sl.members) {
+                    int startQuanta = 0;
+                    if (exactSplits.count(m.rawStart)) {
+                        startQuanta = static_cast<int>((m.rawStart - sl.startSample + q / 2) / q);
+                    } else {
+                        startQuanta = static_cast<int>((m.rawStart - sl.startSample) / q);
+                    }
+                    startQuanta = std::clamp(startQuanta, 0, std::max(0, slQuanta - 1));
+
+                    int endQuanta = slQuanta;
+                    if (exactSplits.count(m.rawEnd)) {
+                        endQuanta = static_cast<int>((m.rawEnd - sl.startSample + q / 2) / q);
+                        endQuanta = std::clamp(endQuanta, startQuanta + 1, slQuanta);
+                    } else {
+                        endQuanta = static_cast<int>((m.rawEnd - sl.startSample + q - 1) / q);
+                        endQuanta = std::clamp(endQuanta, startQuanta + 1, slQuanta);
+                    }
+
+                    const int partUnitOffset = sliceUnitOffset + startQuanta * upq;
+                    const int partUnitCount = (endQuanta - startQuanta) * upq;
+
+                    MdPartPlacement place;
+                    place.trackIndex = m.trackIndex;
+                    place.partIndex = m.partIndex;
+                    place.spanIndex = static_cast<int>(sIdx);
+                    place.unitOffsetInSpan = partUnitOffset;
+                    place.unitCount = partUnitCount;
+                    place.startAddr =
+                        MdPhysAddr::fromLinearUnits(spanBaseLinearUnit + partUnitOffset);
+                    place.endAddr = MdPhysAddr::fromLinearUnits(spanBaseLinearUnit +
+                                                                partUnitOffset + partUnitCount - 1);
+                    place.isOnDisc = false;
+                    place.onDiscRegionIndex = -1;
+                    place.rawModeByte = 0;
+
+                    const auto slot = placementIndexByTrackPart.at({m.trackIndex, m.partIndex});
+                    out.placements[slot] = place;
                 }
 
-                const int partUnitOffset = startQuanta * upq;
-                const int partUnitCount = (endQuanta - startQuanta) * upq;
-
-                MdPartPlacement place;
-                place.trackIndex = m.trackIndex;
-                place.partIndex = m.partIndex;
-                place.spanIndex = static_cast<int>(sIdx);
-                place.unitOffsetInSpan = partUnitOffset;
-                place.unitCount = partUnitCount;
-                place.startAddr = MdPhysAddr::fromLinearUnits(spanBaseLinearUnit + partUnitOffset);
-                place.endAddr = MdPhysAddr::fromLinearUnits(spanBaseLinearUnit + partUnitOffset +
-                                                            partUnitCount - 1);
-                place.isOnDisc = false;
-                place.onDiscRegionIndex = -1;
-                place.rawModeByte = 0;
-
-                const auto slot = placementIndexByTrackPart.at({m.trackIndex, m.partIndex});
-                out.placements[slot] = place;
+                sliceUnitOffset += slQuanta * upq;
             }
 
+            const int spanUnits = sliceUnitOffset;
+            const int spanClusters = (spanUnits + kMdUnitsPerCluster - 1) / kMdUnitsPerCluster;
+            span.unitCount = spanUnits;
+            span.clusterCount = spanClusters;
+            out.spans.push_back(std::move(span));
+
+            out.uniquePhysicalSamples += out.spans.back().totalSamples();
+            out.newUploadClusters += spanClusters;
+            out.usedClusters += spanClusters;
             nextCluster = static_cast<std::uint16_t>(nextCluster + spanClusters);
         }
     }
@@ -1217,6 +1344,19 @@ bool appendAutoTrackForClip(MdDisc& disc, const std::string& title, std::int64_t
         return false;
     }
 
+    if (!disc.tracks.empty() && !disc.tracks.back().parts.empty()) {
+        auto& lastPart = disc.tracks.back().parts.back();
+        const bool lastIsOnDisc =
+            disc.loadedDisc.active &&
+            findMdOnDiscRegionForPart(disc.loadedDisc, lastPart) >= 0;
+        const bool lastIsUnique =
+            countMdAudioRefs(disc, effectiveMdAudioId(disc.tracks.back())) <= 1;
+        if (!lastIsOnDisc && lastIsUnique && startSample > lastPart.endSample &&
+            !rangeOverlapsLoadedRegion(disc.loadedDisc, lastPart.endSample, startSample)) {
+            lastPart.endSample = startSample;
+        }
+    }
+
     MdTrack tr;
     tr.id = makeMdTrackId();
     tr.halfWidthTitle = normalizeAutoTrackTitle(title, disc.tracks.size() + 1);
@@ -1253,9 +1393,16 @@ bool applyAutoTrackForPlacedClip(MdDisc& disc, const std::string& title, std::in
         const bool lastIsOnDisc =
             candidate.loadedDisc.active &&
             findMdOnDiscRegionForPart(candidate.loadedDisc, lastPart) >= 0;
-        if (!lastIsOnDisc && startSample > lastPart.startSample && startSample < lastPart.endSample &&
-            endSample > maxMdEnd) {
-            lastPart.endSample = startSample;
+        const bool lastIsUnique =
+            countMdAudioRefs(candidate, effectiveMdAudioId(candidate.tracks.back())) <= 1;
+        if (!lastIsOnDisc && lastIsUnique && endSample > maxMdEnd) {
+            if (startSample > lastPart.startSample && startSample < lastPart.endSample) {
+                lastPart.endSample = startSample;
+            } else if (startSample > lastPart.endSample &&
+                       !rangeOverlapsLoadedRegion(candidate.loadedDisc, lastPart.endSample,
+                                                  startSample)) {
+                lastPart.endSample = startSample;
+            }
         }
     }
 
@@ -1343,6 +1490,7 @@ bool splitMdTrackAtSample(MdDisc& disc, int trackIndex0, std::int64_t timelineSa
     MdTrack second = first;
     second.id = makeMdTrackId();
     second.audioId.clear();
+    second.forceGapBefore = false;
 
     const MdPart splitPart = first.parts[static_cast<std::size_t>(hitPart)];
     std::int64_t splitSample = timelineSample;
@@ -1606,6 +1754,162 @@ bool slideMdPartRange(MdDisc& disc, int trackIndex0, int partIndex0, std::int64_
     return true;
 }
 
+bool slideMdPartRangeContiguous(MdDisc& disc, int trackIndex0, int partIndex0,
+                                std::int64_t newStartSample, std::int64_t maxSample,
+                                std::string& error) {
+    error.clear();
+    if (trackIndex0 < 0 || trackIndex0 >= static_cast<int>(disc.tracks.size())) {
+        error = "Track index out of range.";
+        return false;
+    }
+    const auto& srcParts = disc.tracks[static_cast<std::size_t>(trackIndex0)].parts;
+    if (partIndex0 < 0 || partIndex0 >= static_cast<int>(srcParts.size())) {
+        error = "Part index out of range.";
+        return false;
+    }
+
+    const MdPart& srcPart = srcParts[static_cast<std::size_t>(partIndex0)];
+    if (disc.loadedDisc.active && findMdOnDiscRegionForPart(disc.loadedDisc, srcPart) >= 0) {
+        return slideMdPartRange(disc, trackIndex0, partIndex0, newStartSample, maxSample, error);
+    }
+
+    const std::int64_t origStart = srcPart.startSample;
+    const std::int64_t origEnd = srcPart.endSample;
+    const std::int64_t len = origEnd - origStart;
+    if (len <= 0) {
+        error = "Part length must be positive.";
+        return false;
+    }
+
+    const std::string selfKey = effectiveMdAudioId(disc.tracks[static_cast<std::size_t>(trackIndex0)]);
+    int leftTi = -1;
+    int leftPi = -1;
+    std::string leftKey;
+    bool leftAmbiguous = false;
+    std::int64_t leftOrigStart = 0;
+
+    int rightTi = -1;
+    int rightPi = -1;
+    std::string rightKey;
+    bool rightAmbiguous = false;
+    std::int64_t rightOrigEnd = 0;
+
+    for (std::size_t ti = 0; ti < disc.tracks.size(); ++ti) {
+        const auto& tr = disc.tracks[ti];
+        const std::string key = effectiveMdAudioId(tr);
+        if (key == selfKey) {
+            continue;
+        }
+        for (std::size_t pi = 0; pi < tr.parts.size(); ++pi) {
+            const auto& op = tr.parts[pi];
+            const bool opIsOnDisc =
+                disc.loadedDisc.active && findMdOnDiscRegionForPart(disc.loadedDisc, op) >= 0;
+            if (opIsOnDisc) {
+                continue;
+            }
+            if (op.endSample == origStart) {
+                if (leftTi < 0) {
+                    leftTi = static_cast<int>(ti);
+                    leftPi = static_cast<int>(pi);
+                    leftKey = key;
+                    leftOrigStart = op.startSample;
+                } else if (key != leftKey) {
+                    leftAmbiguous = true;
+                }
+            }
+            if (op.startSample == origEnd) {
+                if (rightTi < 0) {
+                    rightTi = static_cast<int>(ti);
+                    rightPi = static_cast<int>(pi);
+                    rightKey = key;
+                    rightOrigEnd = op.endSample;
+                } else if (key != rightKey) {
+                    rightAmbiguous = true;
+                }
+            }
+        }
+    }
+
+    std::int64_t minBound = 0;
+    std::int64_t maxStartBound = maxSample - len;
+    if (!leftAmbiguous && leftTi >= 0) {
+        minBound = std::max(minBound, leftOrigStart + 1);
+    }
+    if (!rightAmbiguous && rightTi >= 0) {
+        maxStartBound = std::min(maxStartBound, rightOrigEnd - 1 - len);
+    }
+    if (disc.loadedDisc.active) {
+        for (const auto& reg : disc.loadedDisc.regions) {
+            if (reg.timelineEndSample <= origStart) {
+                minBound = std::max(minBound, reg.timelineEndSample);
+            } else if (reg.timelineStartSample >= origEnd) {
+                maxStartBound = std::min(maxStartBound, reg.timelineStartSample - len);
+            } else {
+                error = "Part overlaps a locked on-disc region.";
+                return false;
+            }
+        }
+    }
+    if (maxStartBound < minBound) {
+        error = "No room to slide track while keeping contiguous neighbors.";
+        return false;
+    }
+
+    const std::int64_t clamped = std::clamp<std::int64_t>(newStartSample, minBound, maxStartBound);
+    if (disc.loadedDisc.active &&
+        (rangeOverlapsLoadedRegion(disc.loadedDisc, clamped, clamped + len) ||
+         (!leftAmbiguous && leftTi >= 0 &&
+          rangeOverlapsLoadedRegion(disc.loadedDisc, leftOrigStart, clamped)) ||
+         (!rightAmbiguous && rightTi >= 0 &&
+          rangeOverlapsLoadedRegion(disc.loadedDisc, clamped + len, rightOrigEnd)))) {
+        error = "Sliding track cannot cross a locked on-disc region.";
+        return false;
+    }
+
+    MdDisc candidate = disc;
+    auto& selfPart = candidate.tracks[static_cast<std::size_t>(trackIndex0)]
+                         .parts[static_cast<std::size_t>(partIndex0)];
+    selfPart.startSample = clamped;
+    selfPart.endSample = clamped + len;
+    syncAliasedMdTracks(candidate, trackIndex0);
+
+    if (!leftAmbiguous && leftTi >= 0) {
+        candidate.tracks[static_cast<std::size_t>(leftTi)]
+            .parts[static_cast<std::size_t>(leftPi)]
+            .endSample = clamped;
+        syncAliasedMdTracks(candidate, leftTi);
+    }
+    if (!rightAmbiguous && rightTi >= 0) {
+        candidate.tracks[static_cast<std::size_t>(rightTi)]
+            .parts[static_cast<std::size_t>(rightPi)]
+            .startSample = clamped + len;
+        syncAliasedMdTracks(candidate, rightTi);
+    }
+
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
+bool setMdTrackForceGap(MdDisc& disc, int trackIndex0, bool forceGapBefore, std::string& error) {
+    error.clear();
+    if (trackIndex0 < 0 || trackIndex0 >= static_cast<int>(disc.tracks.size())) {
+        error = "Track index out of range.";
+        return false;
+    }
+    MdDisc candidate = disc;
+    auto& tr = candidate.tracks[static_cast<std::size_t>(trackIndex0)];
+    tr.forceGapBefore = forceGapBefore;
+    syncAliasedMdTracks(candidate, trackIndex0);
+    if (!validateMdDisc(candidate, error)) {
+        return false;
+    }
+    disc = std::move(candidate);
+    return true;
+}
+
 void syncAliasedMdTracks(MdDisc& disc, int sourceTrackIndex0) {
     if (sourceTrackIndex0 < 0 || sourceTrackIndex0 >= static_cast<int>(disc.tracks.size())) {
         return;
@@ -1630,6 +1934,7 @@ void syncAliasedMdTracks(MdDisc& disc, int sourceTrackIndex0) {
             dst.emphasis = src.emphasis;
             dst.timestamp = src.timestamp;
             dst.parts = src.parts;
+            dst.forceGapBefore = src.forceGapBefore;
         }
     }
 }
@@ -2121,6 +2426,10 @@ bool syncTracksFromClips(const Session& session, MdDisc& disc, std::string& erro
                     prev.end = c.end;
                 }
             } else {
+                if (c.start > prev.end &&
+                    !rangeOverlapsLoadedRegion(candidate.loadedDisc, prev.end, c.start)) {
+                    prev.end = c.start;
+                }
                 chain.push_back({c.start, c.end, c.title});
             }
         }
@@ -2195,6 +2504,12 @@ bool syncTracksFromLayerClips(const Session& session, MdDisc& disc, std::string&
         std::sort(items.begin(), items.end(), [](const ClipEntry& a, const ClipEntry& b) {
             return std::tie(a.start, a.end) < std::tie(b.start, b.end);
         });
+        for (std::size_t i = 0; i + 1 < items.size(); ++i) {
+            if (items[i + 1].start > items[i].end &&
+                !rangeOverlapsLoadedRegion(candidate.loadedDisc, items[i].end, items[i + 1].start)) {
+                items[i].end = items[i + 1].start;
+            }
+        }
         if (loadedActive) {
             const auto covered = collectExistingPartBounds(candidate);
             std::vector<std::tuple<std::int64_t, std::int64_t, std::string>> tuples;

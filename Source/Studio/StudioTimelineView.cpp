@@ -259,6 +259,10 @@ Studio::MdRibbonPointerInfo Studio::classifyMdRibbonPointer(juce::Point<int> poi
         }
     }
 
+    std::sort(parts.begin(), parts.end(), [](const PartRef& a, const PartRef& b) {
+        return std::tie(a.start, a.end, a.ti, a.pi) < std::tie(b.start, b.end, b.ti, b.pi);
+    });
+
     // Check shared sequential split handles first (+/- 6 px).
     struct SplitCand {
         size_t l = 0;
@@ -271,6 +275,15 @@ Studio::MdRibbonPointerInfo Studio::classifyMdRibbonPointer(juce::Point<int> poi
     auto considerSplit = [&](size_t l, size_t r) {
         if (parts[l].end != parts[r].start) {
             return;
+        }
+        if (session.mdDisc.loadedDisc.active) {
+            const int lr = carta::findMdOnDiscRegionForPart(session.mdDisc.loadedDisc,
+                                                             {parts[l].start, parts[l].end});
+            const int rr = carta::findMdOnDiscRegionForPart(session.mdDisc.loadedDisc,
+                                                             {parts[r].start, parts[r].end});
+            if (lr != rr && (lr >= 0 || rr >= 0)) {
+                return;
+            }
         }
         const int sx = parts[l].x1;
         const int dist = std::abs(point.x - sx);
@@ -286,35 +299,19 @@ Studio::MdRibbonPointerInfo Studio::classifyMdRibbonPointer(juce::Point<int> poi
     };
 
     for (size_t i = 0; i + 1 < parts.size(); ++i) {
-        const bool consecutiveSameTrack =
-            parts[i].ti == parts[i + 1].ti && parts[i].pi + 1 == parts[i + 1].pi;
-        const bool consecutiveTrack =
-            parts[i].ti + 1 == parts[i + 1].ti && parts[i + 1].pi == 0 &&
-            parts[i].pi + 1 ==
-                static_cast<int>(
-                    session.mdDisc.tracks[static_cast<size_t>(parts[i].ti)].parts.size());
-        if (consecutiveSameTrack || consecutiveTrack) {
-            considerSplit(i, i + 1);
+        for (size_t r = i + 1; r < parts.size() && parts[r].start <= parts[i].end; ++r) {
+            if (parts[i].end == parts[r].start) {
+                considerSplit(i, r);
+            }
         }
     }
 
     if (bestSplit) {
         const auto& L = parts[bestSplit->l];
         const auto& R = parts[bestSplit->r];
-        if (!mods.isAltDown()) {
-            const bool useRightId = primary.isNotEmpty() && R.id == primary;
-            return {
-                MdRibbonGesture::sharedSplit,   L.ti, L.pi, R.ti, R.pi, useRightId ? R.id : L.id,
-                useRightId ? R.title : L.title, L.end};
-        }
-        // Option/Alt-drag splits the shared boundary into an independent one-sided trim.
-        const bool pickRight =
-            (point.x > bestSplit->sx) ||
-            (point.x == bestSplit->sx && primary.isNotEmpty() && R.id == primary);
-        if (pickRight) {
-            return {MdRibbonGesture::leftEdge, R.ti, R.pi, -1, -1, R.id, R.title, R.start};
-        }
-        return {MdRibbonGesture::rightEdge, L.ti, L.pi, -1, -1, L.id, L.title, L.end};
+        const bool useRightId = primary.isNotEmpty() && R.id == primary;
+        return {MdRibbonGesture::sharedSplit, L.ti, L.pi, R.ti, R.pi,
+                useRightId ? R.id : L.id, useRightId ? R.title : L.title, L.end};
     }
 
     // Check outer / unshared edge handles (+/- 6 px).
@@ -456,38 +453,74 @@ void Studio::drawMdRibbon(juce::Graphics& g, juce::Rectangle<int> area, double s
         }
     }
 
-    // Draw shared T-MARK split grips and unshared outer edge handles.
-    std::vector<int> splitXs;
-    for (size_t i = 0; i + 1 < session.mdDisc.tracks.size(); ++i) {
-        const auto& leftTr = session.mdDisc.tracks[i];
-        const auto& rightTr = session.mdDisc.tracks[i + 1];
-        if (leftTr.parts.empty() || rightTr.parts.empty()) {
-            continue;
-        }
-        if (leftTr.parts.back().endSample == rightTr.parts.front().startSample) {
-            const int sx =
-                timeToX(static_cast<double>(leftTr.parts.back().endSample) / carta::sessionRate,
-                        area, span);
-            if (sx >= body.getX() && sx < body.getRight()) {
-                splitXs.push_back(sx);
+    // Draw shared T-MARK split grips across abutting timeline boundaries, highlighting gapped breaks.
+    struct TimelinePartEntry {
+        size_t ti = 0;
+        std::int64_t start = 0;
+        std::int64_t end = 0;
+    };
+    std::vector<TimelinePartEntry> timelineParts;
+    {
+        std::map<std::string, size_t> repTrack;
+        for (size_t ti = 0; ti < session.mdDisc.tracks.size(); ++ti) {
+            const auto& tr = session.mdDisc.tracks[ti];
+            const std::string audioKey = carta::effectiveMdAudioId(tr);
+            if (!repTrack.count(audioKey) ||
+                (primary.isNotEmpty() && tr.id == primary.toStdString())) {
+                repTrack[audioKey] = ti;
             }
         }
-    }
-    for (const auto& tr : session.mdDisc.tracks) {
-        for (size_t pi = 0; pi + 1 < tr.parts.size(); ++pi) {
-            if (tr.parts[pi].endSample == tr.parts[pi + 1].startSample) {
-                const int sx = timeToX(
-                    static_cast<double>(tr.parts[pi].endSample) / carta::sessionRate, area, span);
-                if (sx >= body.getX() && sx < body.getRight()) {
-                    splitXs.push_back(sx);
-                }
+        for (size_t ti = 0; ti < session.mdDisc.tracks.size(); ++ti) {
+            const auto& tr = session.mdDisc.tracks[ti];
+            if (repTrack[carta::effectiveMdAudioId(tr)] != ti) {
+                continue;
+            }
+            for (const auto& pt : tr.parts) {
+                timelineParts.push_back({ti, pt.startSample, pt.endSample});
             }
         }
+        std::sort(timelineParts.begin(), timelineParts.end(),
+                  [](const TimelinePartEntry& a, const TimelinePartEntry& b) {
+                      return std::tie(a.start, a.end, a.ti) < std::tie(b.start, b.end, b.ti);
+                  });
     }
-    for (const int sx : splitXs) {
+    struct SplitGrip {
+        int x = 0;
+        bool gapped = false;
+    };
+    std::vector<SplitGrip> splitGrips;
+    for (size_t i = 0; i + 1 < timelineParts.size(); ++i) {
+        const auto& l = timelineParts[i];
+        for (size_t rIdx = i + 1; rIdx < timelineParts.size() && timelineParts[rIdx].start <= l.end;
+             ++rIdx) {
+            const auto& r = timelineParts[rIdx];
+            if (l.end != r.start) {
+                continue;
+            }
+            const int sx = timeToX(static_cast<double>(l.end) / carta::sessionRate, area, span);
+            if (sx < body.getX() || sx >= body.getRight()) {
+                continue;
+            }
+            bool gapped = false;
+            if (l.ti != r.ti) {
+                const auto& leftTr = session.mdDisc.tracks[l.ti];
+                const auto& rightTr = session.mdDisc.tracks[r.ti];
+                gapped = rightTr.forceGapBefore ||
+                         carta::effectiveTrackCodec(session.mdDisc, leftTr) !=
+                             carta::effectiveTrackCodec(session.mdDisc, rightTr) ||
+                         carta::mdTrackUsesOnDiscAudio(session.mdDisc, leftTr) !=
+                             carta::mdTrackUsesOnDiscAudio(session.mdDisc, rightTr);
+            }
+            splitGrips.push_back({sx, gapped});
+        }
+    }
+    for (const auto& grip : splitGrips) {
+        const int sx = grip.x;
         g.setColour(dark ? juce::Colour(0xff181818) : juce::Colours::white);
         g.fillRect(sx - 2, ribbon.getY() + 2, 4, ribbon.getHeight() - 4);
-        g.setColour(dark ? juce::Colour(0xffd4d4d4) : juce::Colour(0xff444444));
+        g.setColour(grip.gapped
+                        ? (dark ? juce::Colour(0xfff59e0b) : juce::Colour(0xffb45309))
+                        : (dark ? juce::Colour(0xffd4d4d4) : juce::Colour(0xff444444)));
         g.drawVerticalLine(sx, static_cast<float>(ribbon.getY() + 2),
                            static_cast<float>(ribbon.getBottom() - 2));
         const int cy = ribbon.getCentreY();

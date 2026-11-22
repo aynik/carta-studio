@@ -120,6 +120,7 @@ struct CachedSpanEntry {
     std::int64_t startSample = 0;
     std::int64_t endSample = 0;
     int unitCount = 0;
+    std::vector<MdSpanSlice> slices;
     std::vector<std::pair<UtocAddress, UtocAddress>> physRanges;
 };
 
@@ -182,7 +183,7 @@ int physicalTotalClustersFromUtoc(const UtocDiscState& utoc) {
 }
 
 std::int64_t expectedUploadedUnitsForSpan(const MdPhysicalSpan& span) noexcept {
-    const auto unpadded = std::max<std::int64_t>(0, span.endSample - span.startSample);
+    const auto unpadded = span.totalSamples();
     if (unpadded == 0) {
         return 0;
     }
@@ -1390,8 +1391,7 @@ bool buildSpanUploadPlans(const MdDisc& disc, const MdPhysicalPlan& physPlan,
     }
 
     auto spanTargetSampleCount = [](const MdPhysicalSpan& span) noexcept -> std::size_t {
-        const auto unpaddedSamples =
-            static_cast<std::size_t>(std::max<std::int64_t>(0, span.endSample - span.startSample));
+        const auto unpaddedSamples = static_cast<std::size_t>(span.totalSamples());
         if (span.codec == MdCodecMode::spStereo || span.codec == MdCodecMode::spMono) {
             const std::size_t pcmFrames = (unpaddedSamples + 511u) / 512u;
             const std::size_t totalOutFrames = pcmFrames + 1u;
@@ -1471,9 +1471,33 @@ bool buildSpanUploadPlans(const MdDisc& disc, const MdPhysicalPlan& physPlan,
                              0.02 + 0.28 * startFrac);
             std::vector<float> left;
             std::vector<float> right;
-            if (!renderSessionMixRange(*sessionOrNull, span.startSample, span.endSample,
-                                       codecSpec->channels, left, right, error)) {
-                return false;
+            if (span.slices.size() <= 1u) {
+                const std::int64_t sStart =
+                    span.slices.empty() ? span.startSample : span.slices.front().startSample;
+                const std::int64_t sEnd =
+                    span.slices.empty() ? span.endSample : span.slices.front().endSample;
+                if (!renderSessionMixRange(*sessionOrNull, sStart, sEnd, codecSpec->channels, left,
+                                           right, error)) {
+                    return false;
+                }
+            } else {
+                const std::size_t expectedTotal = static_cast<std::size_t>(span.totalSamples());
+                left.reserve(expectedTotal);
+                if (codecSpec->channels == 2) {
+                    right.reserve(expectedTotal);
+                }
+                for (const auto& slice : span.slices) {
+                    std::vector<float> slL;
+                    std::vector<float> slR;
+                    if (!renderSessionMixRange(*sessionOrNull, slice.startSample, slice.endSample,
+                                               codecSpec->channels, slL, slR, error)) {
+                        return false;
+                    }
+                    left.insert(left.end(), slL.begin(), slL.end());
+                    if (codecSpec->channels == 2) {
+                        right.insert(right.end(), slR.begin(), slR.end());
+                    }
+                }
             }
             const std::size_t unpaddedSamples = left.size();
             const std::size_t targetSamples = spanTargetSampleCount(span);
@@ -1788,6 +1812,7 @@ void storeCachedPhysicalSpanMap(const std::string& resolvedId, const MdPhysicalP
         entry.startSample = physPlan.spans[i].startSample;
         entry.endSample = physPlan.spans[i].endSample;
         entry.unitCount = physPlan.spans[i].unitCount;
+        entry.slices = physPlan.spans[i].slices;
         entry.physRanges = plans[i].physRanges;
         cache.spans.push_back(std::move(entry));
     }
@@ -1814,7 +1839,7 @@ bool tryRemapUtocFromCachedSpans(const MdDisc& disc, const std::string& resolved
                 const auto& b = physPlan.spans[i];
                 if (a.codec != b.codec || a.startSample != b.startSample ||
                     a.endSample != b.endSample || a.unitCount != b.unitCount ||
-                    a.physRanges.empty()) {
+                    a.slices != b.slices || a.physRanges.empty()) {
                     allMatch = false;
                     break;
                 }

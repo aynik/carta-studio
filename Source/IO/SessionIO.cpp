@@ -1549,6 +1549,9 @@ bool encodeMdDisc(const MdDisc& disc, juce::var& output, juce::String& error) {
         if (track.emphasis) {
             p->setProperty("emphasis", true);
         }
+        if (track.forceGapBefore) {
+            p->setProperty("forceGapBefore", true);
+        }
         if (!track.timestamp.empty()) {
             p->setProperty("timestamp", juce::String::fromUTF8(track.timestamp.c_str()));
         }
@@ -1801,6 +1804,13 @@ bool decodeMdDisc(const juce::var& value, MdDisc& output, juce::String& error) {
                 return false;
             }
             trk.emphasis = static_cast<bool>(item["emphasis"]);
+        }
+        if (tp->hasProperty("forceGapBefore")) {
+            if (!item["forceGapBefore"].isBool()) {
+                error = "Invalid MD track forceGapBefore flag.";
+                return false;
+            }
+            trk.forceGapBefore = static_cast<bool>(item["forceGapBefore"]);
         }
         if (tp->hasProperty("timestamp")) {
             if (!item["timestamp"].isString()) {
@@ -2431,7 +2441,9 @@ bool determineProjectVersion(const Session& session, WavRange savedLoop, bool& h
     const bool hasPlayOrderFeatures =
         static_cast<int>(session.mdDisc.tracks.size()) > kMdMaxStandardTracks ||
         std::any_of(session.mdDisc.tracks.begin(), session.mdDisc.tracks.end(),
-                    [](const MdTrack& track) { return !track.audioId.empty(); });
+                    [](const MdTrack& track) {
+                        return !track.audioId.empty() || track.forceGapBefore;
+                    });
     const bool hasHiMdFeatures =
         isHiMdMedium(session.mdDisc.medium) || isHiMdOnlyCodec(session.mdDisc.defaultCodec) ||
         std::any_of(session.mdDisc.tracks.begin(), session.mdDisc.tracks.end(),
@@ -3618,7 +3630,9 @@ bool loadSession(Session& result, int& master, juce::AudioFormatManager& formats
         const bool usesPlayOrderV27 =
             static_cast<int>(next.mdDisc.tracks.size()) > kMdMaxStandardTracks ||
             std::any_of(next.mdDisc.tracks.begin(), next.mdDisc.tracks.end(),
-                        [](const MdTrack& track) { return !track.audioId.empty(); });
+                        [](const MdTrack& track) {
+                            return !track.audioId.empty() || track.forceGapBefore;
+                        });
         const bool usesHiMd =
             isHiMdMedium(next.mdDisc.medium) || isHiMdOnlyCodec(next.mdDisc.defaultCodec) ||
             std::any_of(next.mdDisc.tracks.begin(), next.mdDisc.tracks.end(),

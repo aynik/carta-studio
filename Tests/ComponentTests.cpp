@@ -1127,7 +1127,135 @@ struct StudioComponentTests {
               "Closing Disc workspace hides pinned MD Tracks lane and returns Layer 1 directly "
               "under the ruler");
     }
+    static void runUnifiedAudioBankAndGapChecks() {
+        const auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                             .getNonexistentChildFile("carta-md-unified", {});
+        check(dir.createDirectory().wasOk(), "Create temporary folder for unified MD bank tests");
+        struct DirCleanup {
+            juce::File d;
+            ~DirCleanup() { d.deleteRecursively(); }
+        } cleanup{dir};
+
+        Studio studio;
+        studio.setSize(1180, 760);
+        const auto wav = dir.getChildFile("unified_test.wav");
+        writeTestWavFile(wav, 2, 132300, 0.25f);
+        studio.session.mdDisc.autoTrackOnImport = false;
+        check(static_cast<bool>(studio.ipcCommand({"import", wav.getFullPathName()})["ok"]),
+              "Import WAV fixture for unified Audio Bank test");
+        for (int i = 0; i < 400 && !studio.pendingImports.empty(); ++i)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+        check(studio.pendingImports.empty() && studio.session.tracks.size() == 1 &&
+                  studio.session.tracks[0].clips.size() == 1,
+              "Unified Audio Bank WAV import completes cleanly");
+
+        carta::MdDisc disc;
+        disc.medium = carta::MdMedium::md80;
+        disc.defaultCodec = carta::MdCodecMode::spStereo;
+        for (int i = 0; i < 3; ++i) {
+            carta::MdTrack tr;
+            tr.id = carta::makeMdTrackId();
+            tr.halfWidthTitle = "Track " + std::to_string(i + 1);
+            tr.parts = {{static_cast<std::int64_t>(i) * 44100,
+                         static_cast<std::int64_t>(i + 1) * 44100}};
+            disc.tracks.push_back(std::move(tr));
+        }
+        studio.session.mdDisc = disc;
+        studio.refreshCommittedMasterRange();
+        studio.editHistory.reset();
+        studio.setDiscWorkspaceVisible(true);
+        studio.refreshDiscWorkspace(true);
+
+        auto& dock = studio.discWorkspace;
+        dock.setSize(1180, 280);
+        dock.resized();
+
+        check(static_cast<bool>(studio.ipcCommand({"disc", "view", "record"})["ok"]) &&
+                  static_cast<bool>(studio.ipcCommand({"disc", "view", "bank"})["ok"]),
+              "Switch to Record & Audio Bank view");
+        check(dock.audioBankRows.size() == 3 && dock.planRows.size() == 3 &&
+                  dock.inspectUtocButton.isVisible() && dock.importUtocButton.isVisible() &&
+                  dock.exportUtocButton.isVisible(),
+              "Standard MD shows 1 Audio Bank row per unique audio item and shows UTOC controls");
+
+        // Switch to Hi-MD and verify UTOC buttons hide, bank rows stay unified, and 270 MB formats
+        check(static_cast<bool>(studio.ipcCommand({"disc", "medium", "himd300"})["ok"]),
+              "Switch target medium to himd300");
+        dock.resized();
+        check(!dock.inspectUtocButton.isVisible() && !dock.importUtocButton.isVisible() &&
+                  !dock.exportUtocButton.isVisible() && dock.audioBankRows.size() == 3,
+              "Hi-MD hides UTOC controls while keeping unified 3-row Audio Bank");
+        check(dock.budgetPillText.contains("270 MB") && !dock.budgetPillText.contains("270.094") &&
+                  dock.planHintLabel.getText().contains("270 MB") &&
+                  !dock.planHintLabel.getText().contains("270.094"),
+              "Hi-MD 300M rounds capacity text cleanly to 270 MB");
+        {
+            juce::Image img(juce::Image::ARGB, 1180, 280, true);
+            juce::Graphics g(img);
+            dock.paintEntireComponent(g, true);
+        }
+
+        // Switch back to md80, toggle disc track gap via IPC, verify v27 .carta roundtrip
+        check(static_cast<bool>(studio.ipcCommand({"disc", "medium", "md80"})["ok"]) &&
+                  static_cast<bool>(studio.ipcCommand({"disc", "track", "gap", "1", "on"})["ok"]),
+              "Enable forceGapBefore on track 2 via IPC");
+        const auto gapStatus = studio.ipcCommand({"disc", "status"})["result"];
+        check(studio.session.mdDisc.tracks[1].forceGapBefore &&
+                  dock.trackRows.size() == 3 && dock.trackRows[1].forceGapBefore &&
+                  dock.planRows.size() == 3 && dock.planRows[1].forceGapBefore &&
+                  dock.planRows[1].gappedBefore && dock.audioBankRows.size() == 3 &&
+                  dock.audioBankRows[1].forceGapBefore && dock.audioBankRows[1].gappedBefore &&
+                  static_cast<bool>(gapStatus["tracks"][1]["force_gap_before"]) &&
+                  gapStatus["physical_plan"]["spans"].size() == 2,
+              "Forced gapped break updates model, UI rows, status JSON, and splits physical spans");
+        {
+            juce::Image img(juce::Image::ARGB, 1180, 280, true);
+            juce::Graphics g(img);
+            dock.paintEntireComponent(g, true);
+        }
+
+        const auto projFile = dir.getChildFile("force_gap_v27.carta");
+        juce::String ioErr;
+        check(carta::saveSession(studio.session, 2, projFile, ioErr),
+              ("Save v27 project with forceGapBefore: " + ioErr).toRawUTF8());
+        carta::Session reloaded;
+        int reloadedMaster = 0;
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        check(carta::loadSession(reloaded, reloadedMaster, fm, projFile, ioErr) &&
+                  reloaded.mdDisc.tracks.size() == 3 && reloaded.mdDisc.tracks[1].forceGapBefore,
+              ("Reload v27 project preserves forceGapBefore: " + ioErr).toRawUTF8());
+
+        check(static_cast<bool>(studio.ipcCommand({"disc", "track", "gap", "1", "toggle"})["ok"]) &&
+                  !studio.session.mdDisc.tracks[1].forceGapBefore &&
+                  studio.ipcCommand({"disc", "status"})["result"]["physical_plan"]["spans"].size() ==
+                      1,
+              "IPC disc track gap toggle clears forced break and merges back to 1 physical span");
+
+        // Dragging Track 2 body on the MD ribbon slides neighbors contiguously without gaps
+        studio.snapMode = 0;
+        studio.resized();
+        const auto ribbon = studio.mdRibbonArea();
+        const auto tl = studio.timeline();
+        const double viewSpan = studio.viewLength();
+        const int ribbonY = ribbon.getCentreY();
+        const int bodyX = studio.timeToX(1.5, tl, viewSpan);
+        const int destX = studio.timeToX(1.75, tl, viewSpan);
+        check(bodyX > tl.getX() && destX < tl.getRight(),
+              "Ribbon drag coordinates stay inside timeline area");
+        studio.mouseDown(event(studio, {bodyX, ribbonY}, {bodyX, ribbonY}));
+        studio.mouseDrag(event(studio, {destX, ribbonY}, {bodyX, ribbonY}, true));
+        studio.mouseUp(event(studio, {destX, ribbonY}, {bodyX, ribbonY}, true));
+        check(studio.session.mdDisc.tracks[1].parts[0].startSample > 44100 &&
+                  studio.session.mdDisc.tracks[0].parts[0].endSample ==
+                      studio.session.mdDisc.tracks[1].parts[0].startSample &&
+                  studio.session.mdDisc.tracks[1].parts[0].endSample ==
+                      studio.session.mdDisc.tracks[2].parts[0].startSample,
+              "Dragging MD track body keeps abutting local neighbors contiguous");
+    }
+
     static void runMdAuthoringWorkflowOnly() {
+        runUnifiedAudioBankAndGapChecks();
         runDawGainAndFadeChecks();
 
         const auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
@@ -1839,8 +1967,9 @@ struct StudioComponentTests {
             dragStudio.mouseUp(
                 event(dragStudio, {trimX, ribbonY}, {splitX48 - 1, ribbonY}, true, altMods));
             check(dragStudio.session.mdDisc.tracks[0].parts[0].endSample < 45000 &&
-                      dragStudio.session.mdDisc.tracks[1].parts[0].startSample == 48000,
-                  "Alt-dragging a shared split trims the left track edge independently");
+                      dragStudio.session.mdDisc.tracks[1].parts[0].startSample ==
+                          dragStudio.session.mdDisc.tracks[0].parts[0].endSample,
+                  "Alt-dragging a shared split keeps adjacent local tracks contiguous");
 
             const int bodyX = dragStudio.timeToX(20000.0 / carta::sessionRate, area, span);
             const int dupX = dragStudio.timeToX(30000.0 / carta::sessionRate, area, span);

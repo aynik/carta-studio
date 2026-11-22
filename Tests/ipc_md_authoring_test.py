@@ -161,6 +161,12 @@ with tempfile.TemporaryDirectory(prefix='carta-md-authoring-ipc-') as directory:
         imp = call('utoc', 'import', utoc_path)
         assert imp['tracks'] == 6 and call('disc', 'status')['half_width_title'] == '', imp
 
+        # Forced gapped break toggle roundtrip via IPC
+        gap_on = call('disc', 'track', 'gap', '1', 'on')
+        assert gap_on['tracks'][1]['force_gap_before'] is True, gap_on
+        gap_off = call('disc', 'track', 'gap', '1', 'off')
+        assert gap_off['tracks'][1]['force_gap_before'] is False, gap_off
+
         # Hi-MD Play Order aliasing saves estimated bytes without touching hardware
         himd_st = call('disc', 'medium', 'himd300')
         assert himd_st['is_himd'] is True and himd_st['max_tracks'] == 2047, himd_st

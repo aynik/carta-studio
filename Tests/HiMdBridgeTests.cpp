@@ -1170,6 +1170,52 @@ int main() {
                     finalSt.tracks[2].bitrate == 64 && finalSt.groups.size() == 1u &&
                     finalSt.groups[0].trackCount == 3,
                 "Final probe mismatch after incremental Hi-MD recording");
+
+        // Non-abutting local same-codec tracks remain gapless; forceGapBefore breaks gaplessRuns.
+        REQUIRE(carta::wipeHiMdDisc("mock:mz-rh1", false, false, err), err);
+        carta::MdDisc nonAbutDisc;
+        nonAbutDisc.medium = carta::MdMedium::himd300;
+        nonAbutDisc.defaultCodec = carta::MdCodecMode::hiSp;
+        nonAbutDisc.halfWidthTitle = "NonAbut Gapless";
+        carta::MdTrack na1;
+        na1.id = carta::makeMdTrackId();
+        na1.halfWidthTitle = "Track One";
+        na1.parts = {{0, 88200}};
+        carta::MdTrack na2;
+        na2.id = carta::makeMdTrackId();
+        na2.halfWidthTitle = "Track Two";
+        na2.parts = {{110000, 176400}};
+        nonAbutDisc.tracks = {na1, na2};
+
+        carta::HiMdRecordResult naRes;
+        REQUIRE(carta::recordHiMdDisc(gapSess, nonAbutDisc, "mock:mz-rh1", false, naRes, err),
+                "Non-abutting gapless Hi-MD recording failed: " + err);
+        REQUIRE(naRes.ok && naRes.uploadedTracks == 2 && naRes.uniqueAudioTracksUploaded == 2 &&
+                    naRes.gaplessRuns == 1,
+                "Non-abutting local same-codec Hi-MD tracks must coalesce into 1 gapless run");
+
+        REQUIRE(carta::wipeHiMdDisc("mock:mz-rh1", false, false, err), err);
+        carta::MdDisc forcedGapDisc;
+        forcedGapDisc.medium = carta::MdMedium::himd300;
+        forcedGapDisc.defaultCodec = carta::MdCodecMode::hiSp;
+        forcedGapDisc.halfWidthTitle = "Forced Gap";
+        carta::MdTrack fg1;
+        fg1.id = carta::makeMdTrackId();
+        fg1.halfWidthTitle = "Gap One";
+        fg1.parts = {{0, 88200}};
+        carta::MdTrack fg2;
+        fg2.id = carta::makeMdTrackId();
+        fg2.halfWidthTitle = "Gap Two";
+        fg2.forceGapBefore = true;
+        fg2.parts = {{88200, 176400}};
+        forcedGapDisc.tracks = {fg1, fg2};
+
+        carta::HiMdRecordResult fgRes;
+        REQUIRE(carta::recordHiMdDisc(gapSess, forcedGapDisc, "mock:mz-rh1", false, fgRes, err),
+                "Forced-gap Hi-MD recording failed: " + err);
+        REQUIRE(fgRes.ok && fgRes.uploadedTracks == 2 && fgRes.uniqueAudioTracksUploaded == 2 &&
+                    fgRes.gaplessRuns == 0,
+                "forceGapBefore must break Hi-MD gapless coalescing cleanly");
     }
 
     std::cout << "[HiMdBridgeTests] All Hi-MD bridge, gapless, batch PlayOrder, writeIndex, guard, and lifecycle tests passed.\n";

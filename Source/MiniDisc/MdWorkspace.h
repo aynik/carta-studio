@@ -371,6 +371,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         bool sharesPhysicalSpan = false;
         int maxSharedRefs = 1;
         bool onDisc = false;
+        bool forceGapBefore = false;
         juce::int64 totalSamples = 0;
         juce::int64 firstStartSample = 0;
         juce::int64 firstEndSample = 0;
@@ -395,6 +396,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         int spanRefCount = 0;
         bool sharesPhysicalSpan = false;
         bool onDisc = false;
+        bool forceGapBefore = false;
+        bool gappedBefore = false;
         juce::String partHopsText;
     };
 
@@ -412,6 +415,9 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         int startCluster = 0;
         int endCluster = 0;
         int clusterCount = 0;
+        int unitCount = 0;
+        bool forceGapBefore = false;
+        bool gappedBefore = false;
         juce::int64 timelineStartSample = 0;
         juce::int64 timelineEndSample = 0;
         std::vector<int> referencingTrackIndices0;

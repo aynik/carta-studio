@@ -74,7 +74,8 @@ Usage:
   CartaStudio ipc disc track rename INDEX TITLE
   CartaStudio ipc disc track title-forms INDEX HALF_WIDTH FULL_WIDTH
   CartaStudio ipc disc track metadata INDEX ARTIST ALBUM
-  CartaStudio ipc disc track flags INDEX MODE|clear|keep WP|keep SCMS|keep EMP|keep [TS|clear|keep]
+  CartaStudio ipc disc track flags INDEX MODE|clear|keep WP|keep SCMS|keep EMP|keep [TS|clear|keep] [GAP|keep]
+  CartaStudio ipc disc track gap INDEX on|off|toggle
   CartaStudio ipc disc group set START_TRACK END_TRACK TITLE [FULL_WIDTH]
   CartaStudio ipc disc group clear START_TRACK END_TRACK
   CartaStudio ipc disc focus TRACK_INDEX

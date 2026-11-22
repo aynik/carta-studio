@@ -1260,6 +1260,92 @@ int main() {
                 "Failed restoring mock guard after 3C: " + mockErr);
     }
 
+    // 3D. Multi-slice gapless 1-span upload and forced gapped break 2-span upload
+    {
+        std::string err;
+        REQUIRE(carta::resetNetMdTestMockSession(err),
+                "Failed resetting mock session for 3D multi-slice test: " + err);
+
+        carta::MdDisc multiDisc;
+        multiDisc.medium = carta::MdMedium::md80;
+        multiDisc.defaultCodec = carta::MdCodecMode::spStereo;
+        multiDisc.halfWidthTitle = "MultiSlice";
+        carta::MdTrack m1;
+        m1.id = carta::makeMdTrackId();
+        m1.halfWidthTitle = "Slice One";
+        m1.parts = {{0, kSegLen}};
+        carta::MdTrack m2;
+        m2.id = carta::makeMdTrackId();
+        m2.halfWidthTitle = "Slice Two";
+        m2.parts = {{kSegLen * 2, kSegLen * 3}};
+        multiDisc.tracks = {m1, m2};
+
+        carta::MdPhysicalPlan multiPlan{};
+        REQUIRE(carta::planMdPhysicalAudio(multiDisc, multiPlan, err) &&
+                    multiPlan.spans.size() == 1 && multiPlan.spans[0].slices.size() == 2,
+                "3D multi-slice disc must plan 1 SP span with 2 slices: " + err);
+
+        carta::NetMdRecordResult multiRec{};
+        REQUIRE(carta::recordNetMdDisc(session, multiDisc, "mock:mz-n920", false, multiRec, err),
+                "3D multi-slice recordNetMdDisc failed: " + err);
+        REQUIRE(multiRec.uploadedPhysicalSegments == 1 && multiRec.logicalTracks == 2 &&
+                    multiRec.committedUtoc,
+                "3D multi-slice must upload 1 physical segment with 2 logical UTOC tracks");
+
+        TestMockSnapshot multiSnap;
+        REQUIRE(fetchMockSnapshot(multiSnap, err), "fetchMockSnapshot 3D multi failed: " + err);
+        REQUIRE(multiSnap.uploadedTracks.size() == 1,
+                "3D multi-slice must upload exactly 1 SP track to hardware");
+        carta::UtocDiscState multiParsed{};
+        REQUIRE(carta::parseUtocSectors(multiSnap.committedUtoc[0].data(),
+                                        multiSnap.committedUtoc[1].data(), nullptr, nullptr,
+                                        multiParsed, err) &&
+                    multiParsed.trackCount == 2,
+                "3D multi-slice UTOC must contain 2 tracks: " + err);
+
+        REQUIRE(carta::resetNetMdTestMockSession(err),
+                "Failed resetting mock session for 3D forced-gap test: " + err);
+
+        carta::MdDisc gapDisc;
+        gapDisc.medium = carta::MdMedium::md80;
+        gapDisc.defaultCodec = carta::MdCodecMode::spStereo;
+        gapDisc.halfWidthTitle = "ForcedGap";
+        carta::MdTrack g1;
+        g1.id = carta::makeMdTrackId();
+        g1.halfWidthTitle = "Gap Left";
+        g1.parts = {{0, kSegLen}};
+        carta::MdTrack g2;
+        g2.id = carta::makeMdTrackId();
+        g2.halfWidthTitle = "Gap Right";
+        g2.forceGapBefore = true;
+        g2.parts = {{kSegLen, kSegLen * 2}};
+        gapDisc.tracks = {g1, g2};
+
+        carta::MdPhysicalPlan gapPlan{};
+        REQUIRE(carta::planMdPhysicalAudio(gapDisc, gapPlan, err) && gapPlan.spans.size() == 2,
+                "3D forced-gap disc must split abutting SP tracks into 2 spans: " + err);
+
+        carta::NetMdRecordResult gapRec{};
+        REQUIRE(carta::recordNetMdDisc(session, gapDisc, "mock:mz-n920", false, gapRec, err),
+                "3D forced-gap recordNetMdDisc failed: " + err);
+        REQUIRE(gapRec.uploadedPhysicalSegments == 2 && gapRec.logicalTracks == 2 &&
+                    gapRec.committedUtoc,
+                "3D forced-gap must upload 2 separate physical segments and 2 logical UTOC tracks");
+
+        TestMockSnapshot gapSnap;
+        REQUIRE(fetchMockSnapshot(gapSnap, err), "fetchMockSnapshot 3D gap failed: " + err);
+        REQUIRE(gapSnap.uploadedTracks.size() == 2,
+                "3D forced-gap must upload 2 separate SP tracks to hardware");
+        carta::UtocDiscState gapParsed{};
+        REQUIRE(carta::parseUtocSectors(gapSnap.committedUtoc[0].data(),
+                                        gapSnap.committedUtoc[1].data(), nullptr, nullptr,
+                                        gapParsed, err) &&
+                    gapParsed.trackCount == 2 &&
+                    gapParsed.fragments[gapParsed.trackMap[1]].start.toLinearGroup() !=
+                        gapParsed.fragments[gapParsed.trackMap[2]].start.toLinearGroup(),
+                "3D forced-gap UTOC tracks must reference separate physical spans: " + err);
+    }
+
     REQUIRE(carta::setNetMdTestMockSessionEnabled(false, mockErr),
             "Failed stopping mock session: " + mockErr);
 

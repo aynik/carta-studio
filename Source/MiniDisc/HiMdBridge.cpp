@@ -2101,6 +2101,7 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
         std::string title;
         std::string artist;
         std::string album;
+        bool forceGapBefore = false;
         std::int64_t totalSamples = 0;
         std::int64_t payloadBytes = 0;
         juce::File payloadFile;
@@ -2162,6 +2163,7 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
             u.title = preferredTrackTitle(trk);
             u.artist = trk.artist;
             u.album = trk.album;
+            u.forceGapBefore = trk.forceGapBefore;
             u.totalSamples = totalTrackSamples;
             uniqueNewItems.push_back(std::move(u));
         }
@@ -2171,12 +2173,12 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
         playOrderEntries.push_back(std::move(po));
     }
 
-    // Step 2: Coalesce contiguous same-codec new unique items into gapless encoding runs.
+    // Step 2: Coalesce consecutive same-codec new unique items into gapless encoding runs unless
+    // explicitly broken by `forceGapBefore` or divergent Play Order occurrences.
     auto canCoalesceGapless = [&](std::size_t idxA, std::size_t idxB) -> bool {
         const auto& a = uniqueNewItems[idxA];
         const auto& b = uniqueNewItems[idxB];
-        if (a.codec != b.codec || a.parts.size() != 1u || b.parts.size() != 1u ||
-            a.parts[0].endSample != b.parts[0].startSample) {
+        if (b.forceGapBefore || a.codec != b.codec) {
             return false;
         }
         const auto itA = newOccByKey.find(a.audioKey);
@@ -2268,8 +2270,16 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
                 return false;
             }
         } else {
-            const std::int64_t runStart = uniqueNewItems[run.beginIdx].parts[0].startSample;
-            const std::int64_t runEnd = uniqueNewItems[run.endIdx - 1u].parts[0].endSample;
+            bool contiguousSingleParts = true;
+            for (std::size_t k = run.beginIdx; k < run.endIdx; ++k) {
+                const auto& u = uniqueNewItems[k];
+                if (u.parts.size() != 1u ||
+                    (k > run.beginIdx &&
+                     uniqueNewItems[k - 1u].parts[0].endSample != u.parts[0].startSample)) {
+                    contiguousSingleParts = false;
+                    break;
+                }
+            }
             setHiMdProgress("record",
                             "Encoding gapless run " + std::to_string(run.beginIdx + 1u) + "-" +
                                 std::to_string(run.endIdx) + "/" +
@@ -2277,14 +2287,38 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
                             runBase);
             std::vector<float> runL;
             std::vector<float> runR;
-            if (!renderSessionMixRange(session, runStart, runEnd, 2, runL, runR, error)) {
-                return false;
-            }
             std::vector<int> trackEndSamples;
             trackEndSamples.reserve(runLen);
-            for (std::size_t k = run.beginIdx; k < run.endIdx; ++k) {
-                const std::int64_t relEnd = uniqueNewItems[k].parts[0].endSample - runStart;
-                trackEndSamples.push_back(static_cast<int>(relEnd));
+            if (contiguousSingleParts) {
+                const std::int64_t runStart = uniqueNewItems[run.beginIdx].parts[0].startSample;
+                const std::int64_t runEnd = uniqueNewItems[run.endIdx - 1u].parts[0].endSample;
+                if (!renderSessionMixRange(session, runStart, runEnd, 2, runL, runR, error)) {
+                    return false;
+                }
+                for (std::size_t k = run.beginIdx; k < run.endIdx; ++k) {
+                    const std::int64_t relEnd = uniqueNewItems[k].parts[0].endSample - runStart;
+                    trackEndSamples.push_back(static_cast<int>(relEnd));
+                }
+            } else {
+                std::int64_t runSamplesTotal = 0;
+                for (std::size_t k = run.beginIdx; k < run.endIdx; ++k) {
+                    runSamplesTotal += uniqueNewItems[k].totalSamples;
+                }
+                runL.reserve(static_cast<std::size_t>(runSamplesTotal));
+                runR.reserve(static_cast<std::size_t>(runSamplesTotal));
+                for (std::size_t k = run.beginIdx; k < run.endIdx; ++k) {
+                    for (const auto& part : uniqueNewItems[k].parts) {
+                        std::vector<float> partL;
+                        std::vector<float> partR;
+                        if (!renderSessionMixRange(session, part.startSample, part.endSample, 2,
+                                                   partL, partR, error)) {
+                            return false;
+                        }
+                        runL.insert(runL.end(), partL.begin(), partL.end());
+                        runR.insert(runR.end(), partR.begin(), partR.end());
+                    }
+                    trackEndSamples.push_back(static_cast<int>(runL.size()));
+                }
             }
             auto encodeCb = [&](int done, int total) {
                 const double frac =

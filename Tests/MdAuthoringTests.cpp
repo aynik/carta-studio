@@ -1025,6 +1025,186 @@ void testHiMdAuthoringAndSessionV27() {
     }
 }
 
+void testSilenceBridgingContiguousSlideAndForceGap() {
+    std::string err;
+
+    // 1. Silence bridging in appendAutoTrackForClip, applyAutoTrackForPlacedClip, and Clip Sync
+    {
+        carta::MdDisc disc;
+        check(carta::appendAutoTrackForClip(disc, "Clip1.wav", 0, 44100), "append clip 1");
+        check(carta::appendAutoTrackForClip(disc, "Clip2.wav", 88200, 132300), "append clip 2");
+        check(disc.tracks.size() == 2 && disc.tracks[0].parts.size() == 1 &&
+                  disc.tracks[0].parts[0].startSample == 0 &&
+                  disc.tracks[0].parts[0].endSample == 88200 &&
+                  disc.tracks[1].parts[0].startSample == 88200 &&
+                  disc.tracks[1].parts[0].endSample == 132300,
+              "appendAutoTrackForClip bridges silence across gap into preceding local track");
+
+        check(carta::applyAutoTrackForPlacedClip(disc, "Clip3.wav", 176400, 220500),
+              "place clip 3 with gap");
+        check(disc.tracks.size() == 3 && disc.tracks[1].parts[0].endSample == 176400 &&
+                  disc.tracks[2].parts[0].startSample == 176400 &&
+                  disc.tracks[2].parts[0].endSample == 220500,
+              "applyAutoTrackForPlacedClip bridges silence into preceding local track");
+
+        carta::Session sess;
+        auto a1 = makeSilentAudio(44100);
+        sess.tracks.push_back({"Layer 1", {{a1, 0.0, 0.0, 1.0}, {a1, 2.0, 0.0, 1.0}}});
+
+        carta::MdDisc layerSyncDisc;
+        check(carta::syncTracksFromLayerClips(sess, layerSyncDisc, err) &&
+                  layerSyncDisc.tracks.size() == 2 &&
+                  layerSyncDisc.tracks[0].parts[0].startSample == 0 &&
+                  layerSyncDisc.tracks[0].parts[0].endSample == 88200 &&
+                  layerSyncDisc.tracks[1].parts[0].startSample == 88200 &&
+                  layerSyncDisc.tracks[1].parts[0].endSample == 132300,
+              "syncTracksFromLayerClips bridges empty timeline gap with silence: " + err);
+
+        carta::MdDisc clipSyncDisc;
+        check(carta::syncTracksFromClips(sess, clipSyncDisc, err) &&
+                  clipSyncDisc.tracks.size() == 2 &&
+                  clipSyncDisc.tracks[0].parts[0].startSample == 0 &&
+                  clipSyncDisc.tracks[0].parts[0].endSample == 88200 &&
+                  clipSyncDisc.tracks[1].parts[0].startSample == 88200 &&
+                  clipSyncDisc.tracks[1].parts[0].endSample == 132300,
+              "syncTracksFromClips bridges empty timeline gap with silence: " + err);
+    }
+
+    // 2. Loaded on-disc region blocks silence bridging across it
+    {
+        carta::MdDisc ld;
+        ld.loadedDisc.active = true;
+        carta::MdOnDiscRegion reg;
+        reg.id = "od-mid";
+        reg.codec = carta::MdCodecMode::spStereo;
+        reg.unitCount = 172;
+        reg.physStart = carta::MdPhysAddr::fromLinearUnits(50LL * carta::kMdUnitsPerCluster);
+        reg.physEnd = carta::MdPhysAddr::fromLinearUnits(50LL * carta::kMdUnitsPerCluster +
+                                                         reg.unitCount - 1);
+        reg.timelineStartSample = 44032;
+        reg.timelineEndSample = 88064;
+        ld.loadedDisc.regions.push_back(reg);
+
+        check(carta::appendAutoTrackForClip(ld, "Pre", 0, 44032), "append pre on loaded disc");
+        check(carta::appendAutoTrackForClip(ld, "Post", 88064, 132096),
+              "append post on loaded disc");
+        check(ld.tracks.size() == 2 && ld.tracks[0].parts[0].endSample == 44032 &&
+                  ld.tracks[1].parts[0].startSample == 88064,
+              "appendAutoTrackForClip does not bridge silence across a loaded on-disc region");
+
+        carta::Session sess;
+        auto a1 = makeSilentAudio(44032);
+        const double segSec = 44032.0 / carta::sessionRate;
+        sess.tracks.push_back(
+            {"Layer 1", {{a1, 0.0, 0.0, segSec}, {a1, segSec * 2.0, 0.0, segSec}}});
+        carta::MdDisc ldSync;
+        ldSync.loadedDisc = ld.loadedDisc;
+        check(carta::syncTracksFromLayerClips(sess, ldSync, err) &&
+                  ldSync.tracks.size() == 2 && ldSync.tracks[0].parts[0].endSample == 44032 &&
+                  ldSync.tracks[1].parts[0].startSample == 88064,
+              "syncTracksFromLayerClips does not bridge silence across loaded region: " + err);
+    }
+
+    // 3. slideMdPartRangeContiguous slides middle track cleanly and obeys loaded barriers
+    {
+        carta::MdDisc cd;
+        for (int i = 0; i < 3; ++i) {
+            carta::MdTrack t;
+            t.id = carta::makeMdTrackId();
+            t.halfWidthTitle = "T" + std::to_string(i + 1);
+            t.parts = {{static_cast<std::int64_t>(i) * 44100,
+                        static_cast<std::int64_t>(i + 1) * 44100}};
+            cd.tracks.push_back(std::move(t));
+        }
+        check(carta::slideMdPartRangeContiguous(cd, 1, 0, 50000, 200000, err) &&
+                  cd.tracks[0].parts[0].endSample == 50000 &&
+                  cd.tracks[1].parts[0].startSample == 50000 &&
+                  cd.tracks[1].parts[0].endSample == 94100 &&
+                  cd.tracks[2].parts[0].startSample == 94100 &&
+                  cd.tracks[2].parts[0].endSample == 132300,
+              "slideMdPartRangeContiguous keeps abutting local neighbors contiguous: " + err);
+
+        carta::MdDisc cdLoaded;
+        cdLoaded.loadedDisc.active = true;
+        carta::MdOnDiscRegion reg;
+        reg.id = "od-0";
+        reg.codec = carta::MdCodecMode::spStereo;
+        reg.unitCount = 172;
+        reg.physStart = carta::MdPhysAddr::fromLinearUnits(50LL * carta::kMdUnitsPerCluster);
+        reg.physEnd = carta::MdPhysAddr::fromLinearUnits(50LL * carta::kMdUnitsPerCluster +
+                                                         reg.unitCount - 1);
+        reg.timelineStartSample = 0;
+        reg.timelineEndSample = 44032;
+        cdLoaded.loadedDisc.regions.push_back(reg);
+
+        carta::MdTrack odTr;
+        odTr.id = carta::makeMdTrackId();
+        odTr.halfWidthTitle = "Locked";
+        odTr.parts = {{0, 44032}};
+        carta::MdTrack locTr;
+        locTr.id = carta::makeMdTrackId();
+        locTr.halfWidthTitle = "Local";
+        locTr.parts = {{44032, 88064}};
+        cdLoaded.tracks = {odTr, locTr};
+
+        check(carta::slideMdPartRangeContiguous(cdLoaded, 1, 0, 20000, 200000, err) &&
+                  cdLoaded.tracks[1].parts[0].startSample == 44032,
+              "slideMdPartRangeContiguous cannot cross locked on-disc region: " + err);
+    }
+
+    // 4. Multi-slice gapless span planning, setMdTrackForceGap, and non-512 forced-gap UTOC
+    {
+        carta::MdDisc sep;
+        sep.medium = carta::MdMedium::md80;
+        sep.defaultCodec = carta::MdCodecMode::spStereo;
+        carta::MdTrack s1;
+        s1.id = carta::makeMdTrackId();
+        s1.halfWidthTitle = "Slice 1";
+        s1.parts = {{0, 44032}};
+        carta::MdTrack s2;
+        s2.id = carta::makeMdTrackId();
+        s2.halfWidthTitle = "Slice 2";
+        s2.parts = {{88064, 132096}};
+        sep.tracks = {s1, s2};
+
+        carta::MdPhysicalPlan sepPlan;
+        check(carta::planMdPhysicalAudio(sep, sepPlan, err) && sepPlan.spans.size() == 1 &&
+                  sepPlan.spans[0].slices.size() == 2 &&
+                  sepPlan.spans[0].totalSamples() == 88064,
+              "Separated local SP tracks coalesce into 1 multi-slice gapless span: " + err);
+
+        check(carta::setMdTrackForceGap(sep, 1, true, err) && sep.tracks[1].forceGapBefore,
+              "setMdTrackForceGap sets forceGapBefore: " + err);
+        carta::MdPhysicalPlan gapPlan;
+        check(carta::planMdPhysicalAudio(sep, gapPlan, err) && gapPlan.spans.size() == 2 &&
+                  gapPlan.spans[0].slices.size() == 1 && gapPlan.spans[1].slices.size() == 1,
+              "setMdTrackForceGap breaks multi-slice coalescence into 2 spans: " + err);
+
+        carta::MdDisc odd;
+        odd.medium = carta::MdMedium::md80;
+        odd.defaultCodec = carta::MdCodecMode::spStereo;
+        carta::MdTrack o1;
+        o1.id = carta::makeMdTrackId();
+        o1.halfWidthTitle = "Odd A";
+        o1.parts = {{0, 44400}};
+        carta::MdTrack o2;
+        o2.id = carta::makeMdTrackId();
+        o2.halfWidthTitle = "Odd B";
+        o2.parts = {{44400, 88200}};
+        odd.tracks = {o1, o2};
+        check(carta::setMdTrackForceGap(odd, 1, true, err), err);
+        check(carta::validateMdDisc(odd, err), "Odd forced-gap disc validates: " + err);
+        carta::MdPhysicalPlan oddPlan;
+        check(carta::planMdPhysicalAudio(odd, oddPlan, err) && oddPlan.spans.size() == 2 &&
+                  oddPlan.spans[0].endSample == oddPlan.spans[1].startSample,
+              "Non-512-aligned forced-gap split aligns onto 2 non-overlapping spans: " + err);
+        carta::UtocDiscState utoc{};
+        check(carta::compileMdDiscToUtoc(odd, utoc, err) &&
+                  carta::computeUtocBudget(utoc, "md80").fits(),
+              "Non-512-aligned forced-gap disc builds valid UTOC: " + err);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1036,6 +1216,7 @@ int main() {
     testLoadedDiscLocksPlaceholderAndSessionIO();
     testNonLinearPartAndBlockEdits();
     testHiMdAuthoringAndSessionV27();
+    testSilenceBridgingContiguousSlideAndForceGap();
     if (gFailures == 0) {
         std::cout << "MdAuthoringTests passed.\n";
         return 0;
