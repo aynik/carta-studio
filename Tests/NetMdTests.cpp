@@ -1429,8 +1429,79 @@ int main() {
         REQUIRE(carta::probeNetMdDevice("mock:mz-n920", fwUpdatedProbe, err),
                 "3E probeNetMdDevice after Write UTOC failed: " + err);
         REQUIRE(fwUpdatedProbe.discTitle == "Updated Title" &&
-                    fwUpdatedProbe.fullWidthTitle == fwDisc.fullWidthTitle,
-                "3E Write UTOC Only title edits must reflect immediately in probeNetMdDevice");
+                    fwUpdatedProbe.fullWidthTitle == fwDisc.fullWidthTitle &&
+                    fwUpdatedProbe.supportsAtracRecovery,
+                "3E Write UTOC Only title edits must reflect immediately and report supportsAtracRecovery");
+
+        // 3F: NetMD on-disc audio download -> decode -> non-destructive placeholder replacement
+        {
+            carta::MdDisc loaded3f{};
+            REQUIRE(carta::loadNetMdDisc("mock:mz-n920", loaded3f, nullptr, err),
+                    "3F loadNetMdDisc failed: " + err);
+            carta::Session sess3f{};
+            carta::populateLoadedDiscSession(loaded3f, sess3f);
+            REQUIRE(sess3f.tracks.size() == 1 && !sess3f.tracks[0].clips.empty() &&
+                        !sess3f.mdDisc.loadedDisc.regions.empty(),
+                    "3F populateLoadedDiscSession must create placeholder clip");
+            REQUIRE(sess3f.tracks[0].clips[0].audio->onDiscPlaceholder &&
+                        sess3f.tracks[0].clips[0].lockedOnDisc,
+                    "3F clip must start as locked onDiscPlaceholder");
+
+            const auto& reg = sess3f.mdDisc.loadedDisc.regions[0];
+            const juce::File tmpOut =
+                juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("carta_netmd_dl_test_" +
+                                  juce::String(juce::Time::getHighResolutionTicks()) + ".aea");
+            std::string ext;
+            REQUIRE(carta::downloadNetMdTrack("mock:mz-n920", 0,
+                                              tmpOut.getFullPathName().toStdString(), ext, err),
+                    "3F downloadNetMdTrack failed: " + err);
+            REQUIRE(ext == "aea", "3F expected .aea container for SP-Stereo track, got: " + ext);
+
+            juce::MemoryBlock raw;
+            REQUIRE(tmpOut.loadFileAsData(raw) && raw.getSize() > 2048,
+                    "3F downloaded .aea container must be non-empty");
+            tmpOut.deleteFile();
+
+            std::vector<std::uint8_t> containerBytes(
+                static_cast<const std::uint8_t*>(raw.getData()),
+                static_cast<const std::uint8_t*>(raw.getData()) + raw.getSize());
+            std::vector<std::uint8_t> wireBytes;
+            REQUIRE(carta::extractNetMdWirePayload("sp-stereo", containerBytes, wireBytes, err),
+                    "3F extractNetMdWirePayload failed: " + err);
+
+            std::vector<float> decL, decR;
+            int decCh = 0;
+            REQUIRE(carta::decodeRawAtracPayload("sp-stereo", wireBytes.data(), wireBytes.size(),
+                                                 decL, decR, decCh, err),
+                    "3F decodeRawAtracPayload failed: " + err);
+            REQUIRE(decCh == 2 && !decL.empty(), "3F decoded stereo PCM must be non-empty");
+
+            double energy = 0.0;
+            for (float s : decL) {
+                energy += static_cast<double>(s) * static_cast<double>(s);
+            }
+            REQUIRE(energy > 1.0, "3F decoded audio must preserve non-silent tone energy");
+
+            const int targetFrames = static_cast<int>(
+                std::max<std::int64_t>(1, reg.timelineEndSample - reg.timelineStartSample));
+            std::shared_ptr<carta::Audio> decodedAudio;
+            REQUIRE(carta::createDecodedOnDiscAudioSource(
+                        "Track 1", decL.data(), decR.data(), 2, static_cast<int>(decL.size()),
+                        targetFrames, decodedAudio, err),
+                    "3F createDecodedOnDiscAudioSource failed: " + err);
+            REQUIRE(carta::applyDownloadedOnDiscRegionAudio(sess3f, reg.id, decodedAudio),
+                    "3F applyDownloadedOnDiscRegionAudio must update clip and region");
+
+            const auto& updatedClip = sess3f.tracks[0].clips[0];
+            REQUIRE(updatedClip.audio && !updatedClip.audio->onDiscPlaceholder &&
+                        updatedClip.audio->hasPcm() && updatedClip.audio->numSamples() == targetFrames &&
+                        updatedClip.lockedOnDisc && updatedClip.onDiscRegionId == reg.id,
+                    "3F downloaded clip must have real PCM while staying locked on-disc");
+            REQUIRE(sess3f.mdDisc.loadedDisc.regions[0].audioDownloaded &&
+                        carta::mdTrackUsesOnDiscAudio(sess3f.mdDisc, sess3f.mdDisc.tracks[0]),
+                    "3F downloaded region must stay preserved on-disc (not NEW re-upload)");
+        }
     }
 
     REQUIRE(carta::setNetMdTestMockSessionEnabled(false, mockErr),

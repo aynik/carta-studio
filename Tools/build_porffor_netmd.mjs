@@ -104,6 +104,36 @@ const FORCE_TOC_VERSIONS = [
   'Hx1.0A0',
 ]
 
+const ATRAC_CONTROL_VERSIONS = [
+  'R1.000',
+  'R1.100',
+  'R1.200',
+  'R1.300',
+  'R1.400',
+  'S1.000',
+  'S1.100',
+  'S1.200',
+  'S1.300',
+  'S1.400',
+  'S1.500',
+  'S1.600',
+]
+
+const ATRAC_BULK_VERSIONS = [
+  'S1.000',
+  'S1.100',
+  'S1.200',
+  'S1.300',
+  'S1.400',
+  'S1.500',
+  'S1.600',
+  'Hr1.000',
+  'Hn1.000',
+  'Hn1.100',
+  'Hn1.10A',
+  'Hn1.200',
+]
+
 // ---------------------------------------------------------------------------
 // Process execution, prerequisites, and mtime utilities
 // ---------------------------------------------------------------------------
@@ -360,6 +390,92 @@ async function preassembleForceTocPayloads(requireFromDeps) {
   }
 }
 
+async function preassembleAtracRecoveryPayloads(requireFromDeps) {
+  const { Assembler } = requireFromDeps(
+    'netmd-exploits/dist/assembler/assembler.js'
+  )
+  const { CORE_MACROS } = requireFromDeps(
+    'netmd-exploits/dist/assembler/core-macros.js'
+  )
+  const { CachedSectorControlDownload } = requireFromDeps(
+    'netmd-exploits/dist/exploits/atrac-recovery/cached-sector-control-transfers.js'
+  )
+  const { CachedSectorBulkDownload } = requireFromDeps(
+    'netmd-exploits/dist/exploits/atrac-recovery/cached-sector-bulk-transfers.js'
+  )
+
+  const armAssembler = await Assembler.create(CORE_MACROS, 'ARM')
+  const thumbAssembler = await Assembler.create(CORE_MACROS, 'THUMB')
+
+  const control = {}
+  for (const ver of ATRAC_CONTROL_VERSIONS) {
+    const fakeManager = {
+      iface: null,
+      factoryIface: null,
+      device: { versionCode: ver, isHimd: false },
+      armAssembler,
+      thumbAssembler,
+      allocate() {
+        throw new Error('Unexpected allocate in CachedSectorControlDownload pre-assembly')
+      },
+      log() {},
+    }
+    const inst = new CachedSectorControlDownload(fakeManager)
+    inst.patchSlot1 = 0
+    inst.patchSlot2 = 1
+    control[ver] = {
+      mainCode: Array.from(inst.assembleProperty('mainCode')),
+      cleanupCode: Array.from(inst.assembleProperty('cleanupCode')),
+      enabledFlagAddress: inst.getProperty('enabledFlagAddress'),
+      sectorToReadAddress: inst.getProperty('sectorToReadAddress'),
+    }
+  }
+
+  const bulk = {}
+  for (const ver of ATRAC_BULK_VERSIONS) {
+    const isHimd = ver.startsWith('H')
+    let allocCursor = isHimd ? 0x0080a020 : 0x02006000
+    const fakeManager = {
+      iface: null,
+      factoryIface: null,
+      device: { versionCode: ver, isHimd },
+      armAssembler,
+      thumbAssembler,
+      allocate(length) {
+        const aligned = Math.ceil(length / 4) * 4
+        const out = allocCursor
+        allocCursor += aligned
+        return out
+      },
+      log() {},
+    }
+    const inst = new CachedSectorBulkDownload(fakeManager)
+    if (!isHimd) {
+      inst.patchSlot1 = 0
+      inst.patchSlot2 = 1
+      inst.patchSlot3 = 2
+    }
+    const entry = {
+      isHimd,
+      prepCodeAddress: inst.getProperty('prep_code_address'),
+      prepCode: Array.from(inst.assembleProperty('prep_code')),
+      prepCodeLoader: Array.from(inst.assembleProperty('prep_code_loader')),
+      sectorStart: inst.getProperty('sector_start'),
+      sectorEnd: inst.getProperty('sector_end'),
+      sectorBuffer: inst.getProperty('sector_buffer'),
+    }
+    if (!isHimd) {
+      entry.residentCodeAddress = inst.getProperty('resident_code_address')
+      entry.bulkTransferCode = Array.from(inst.assembleProperty('bulk_transfer_code'))
+      entry.initCode = Array.from(inst.assembleProperty('init_code'))
+      entry.cleanupCode = Array.from(inst.assembleProperty('cleanupCode'))
+    }
+    bulk[ver] = entry
+  }
+
+  return { control, bulk }
+}
+
 /**
  * Replace an exact snippet in `source` or throw with a descriptive label.
  *
@@ -384,7 +500,7 @@ function replaceOrThrow(source, needle, replacement, label) {
  * @param {NodeRequire} requireFromDeps - CommonJS loader anchored in `netmd-deps`.
  * @param {{lowerMap: Record<string, number[]>, triggerMap: Record<string, number[]>, raiseMap: Record<string, number[]>}} forceTocTables
  */
-function stageNetmdPackages(requireFromDeps, forceTocTables) {
+function stageNetmdPackages(requireFromDeps, forceTocTables, atracRecoveryTables) {
   fs.rmSync(workDir, { recursive: true, force: true })
   fs.mkdirSync(path.join(stagedDir, 'netmd-js', 'factory'), { recursive: true })
   fs.mkdirSync(path.join(stagedDir, 'netmd-exploits', 'exploits'), {
@@ -575,6 +691,8 @@ exports.CORE_MACROS = { fw_compat_bridge: { properties: {} } };
   stageExploitFile('exploits/sp-upload.js')
   stageExploitFile('exploits/mono-sp-upload.js')
   stageExploitFile('exploits/kill-eeprom-writes.js')
+  stageExploitFile('exploits/wait-for-disc-spinning.js')
+  stageExploitFile('exploits/himd-unbounded-reading.js')
 
   stageExploitFile('exploit-state.js', (code) => {
     let out = replaceOrThrow(
@@ -781,6 +899,577 @@ ForceTOCEdit.SUPPORTED_VERSIONS = Object.keys(PREASSEMBLED_TRIGGER);
     'utf8'
   )
 
+  const preassembledAtracRecoverySource = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.CachedSectorControlDownload = exports.CachedSectorBulkDownload = exports.ATRAC_RECOVERY_VERSIONS = void 0;
+const netmd_js_1 = require("netmd-js");
+const utils_1 = require("netmd-js/dist/utils");
+const exploit_1 = require("../exploit");
+const utils_2 = require("../utils");
+const usb_code_execution_1 = require("./usb-code-execution");
+const wait_for_disc_spinning_1 = require("./wait-for-disc-spinning");
+const himd_unbounded_reading_1 = require("./himd-unbounded-reading");
+
+const PREASSEMBLED_CONTROL = ${JSON.stringify(atracRecoveryTables.control)};
+const PREASSEMBLED_BULK = ${JSON.stringify(atracRecoveryTables.bulk)};
+const ATRAC_RECOVERY_VERSIONS = Object.keys(PREASSEMBLED_BULK).concat(
+  Object.keys(PREASSEMBLED_CONTROL).filter((v) => !PREASSEMBLED_BULK[v])
+);
+exports.ATRAC_RECOVERY_VERSIONS = ATRAC_RECOVERY_VERSIONS;
+
+function writeU16LE(buf, off, val) {
+  buf[off] = val & 0xff;
+  buf[off + 1] = (val >>> 8) & 0xff;
+}
+function writeU32LE(buf, off, val) {
+  buf[off] = val & 0xff;
+  buf[off + 1] = (val >>> 8) & 0xff;
+  buf[off + 2] = (val >>> 16) & 0xff;
+  buf[off + 3] = (val >>> 24) & 0xff;
+}
+function makeAeaHeader(channels, soundGroups) {
+  const hdr = new Uint8Array(2048);
+  hdr[0] = 0x00;
+  hdr[1] = 0x08;
+  hdr[2] = 0x00;
+  hdr[3] = 0x00;
+  writeU32LE(hdr, 260, soundGroups >>> 0);
+  hdr[264] = channels & 0xff;
+  return hdr;
+}
+function makeLpWavHeader(isLp2, dataSize) {
+  const blockAlign = isLp2 ? 384 : 192;
+  const bytesPerSec = isLp2 ? 16537 : 8268;
+  const hdr = new Uint8Array(60);
+  hdr[0] = 0x52; hdr[1] = 0x49; hdr[2] = 0x46; hdr[3] = 0x46; // RIFF
+  writeU32LE(hdr, 4, (4 + 40 + 8 + dataSize) >>> 0);
+  hdr[8] = 0x57; hdr[9] = 0x41; hdr[10] = 0x56; hdr[11] = 0x45; // WAVE
+  hdr[12] = 0x66; hdr[13] = 0x6d; hdr[14] = 0x74; hdr[15] = 0x20; // fmt 
+  writeU32LE(hdr, 16, 32);
+  writeU16LE(hdr, 20, 0x0270);
+  writeU16LE(hdr, 22, 2);
+  writeU32LE(hdr, 24, 44100);
+  writeU32LE(hdr, 28, bytesPerSec);
+  writeU16LE(hdr, 32, blockAlign);
+  writeU16LE(hdr, 34, 0);
+  writeU16LE(hdr, 36, 14);
+  writeU16LE(hdr, 38, 1);
+  writeU32LE(hdr, 40, 4096);
+  writeU16LE(hdr, 44, isLp2 ? 0 : 1);
+  writeU16LE(hdr, 46, isLp2 ? 0 : 1);
+  writeU16LE(hdr, 48, 1);
+  writeU16LE(hdr, 50, 0);
+  hdr[52] = 0x64; hdr[53] = 0x61; hdr[54] = 0x74; hdr[55] = 0x61; // data
+  writeU32LE(hdr, 56, dataSize >>> 0);
+  return hdr;
+}
+
+function parseSector0Fragments(sector0, trackIndex) {
+  const trackCount = sector0[0x1f] | 0;
+  if (trackIndex < 0 || trackIndex >= trackCount) {
+    throw new Error('Track index out of range: ' + trackIndex + ' (disc has ' + trackCount + ')');
+  }
+  let slot = sector0[0x30 + trackIndex + 1] | 0;
+  if (slot === 0) {
+    throw new Error('UTOC track ' + trackIndex + ' has empty fragment pointer');
+  }
+  const frags = [];
+  const seen = {};
+  while (slot !== 0 && !seen[slot]) {
+    seen[slot] = true;
+    const off = 0x130 + slot * 8;
+    const sCluster = ((sector0[off] << 6) | (sector0[off + 1] >> 2)) & 0x3fff;
+    const sSector = (((sector0[off + 1] & 3) << 4) | (sector0[off + 2] >> 4)) & 0x3f;
+    const sGroup = sector0[off + 2] & 0x0f;
+    const mode = sector0[off + 3] & 0xff;
+    const eCluster = ((sector0[off + 4] << 6) | (sector0[off + 5] >> 2)) & 0x3fff;
+    const eSector = (((sector0[off + 5] & 3) << 4) | (sector0[off + 6] >> 4)) & 0x3f;
+    const eGroup = sector0[off + 6] & 0x0f;
+    const link = sector0[off + 7] & 0xff;
+    frags.push({
+      startLogical: sCluster * 32 + sSector,
+      startGroup: sGroup,
+      endLogical: eCluster * 32 + eSector,
+      endGroup: eGroup,
+      mode,
+      link,
+    });
+    slot = link;
+  }
+  if (frags.length === 0) {
+    throw new Error('UTOC track ' + trackIndex + ' has no fragments');
+  }
+  return frags;
+}
+
+function timeToRepresentation(seconds) {
+  const unk = Math.floor((seconds * 1566) / 100);
+  return {
+    low: unk & 0x1f,
+    high: (unk >> 5) & 0xffff,
+    type: (unk & 1) === 0 ? 0 : 6,
+  };
+}
+function representationToTime(rep) {
+  const unk = (rep.high << 5) | rep.low;
+  return Math.floor((unk * 100) / 1566);
+}
+function translateRepresentationFromLP4(time) {
+  let tempNewLow = 0;
+  let newHigh = time.high << 2;
+  let newType = time.type * 4;
+  while (10 < newType) {
+    newType -= 11;
+    tempNewLow += 2;
+  }
+  tempNewLow = ((time.low >> 1) << 1) * 4;
+  while (0x1f < tempNewLow) {
+    newHigh += 1;
+    tempNewLow -= 0x20;
+  }
+  let newLow = tempNewLow;
+  if (5 < newType) newLow |= 1;
+  time.type = newType;
+  time.low = newLow;
+  time.high = newHigh;
+}
+function translateRepresentationFromLP2Mono(time) {
+  let tempNewLow = 0;
+  let newHigh = time.high << 1;
+  let newType = time.type * 2;
+  while (10 < newType) {
+    newType -= 11;
+    tempNewLow += 2;
+  }
+  tempNewLow = ((time.low >> 1) << 1) * 2;
+  while (0x1f < tempNewLow) {
+    newHigh += 1;
+    tempNewLow -= 0x20;
+  }
+  let newLow = tempNewLow;
+  if (5 < newType) newLow |= 1;
+  time.type = newType;
+  time.low = newLow;
+  time.high = newHigh;
+}
+function validSector(atracData) {
+  const frames = Math.floor(atracData.length / 212);
+  for (let frame = frames - 1; frame >= 0; frame--) {
+    const start = frame * 212;
+    if (atracData[start] !== atracData[start + 211] &&
+        atracData[start + 1] !== atracData[start + 210]) {
+      return false;
+    }
+  }
+  return true;
+}
+function stripLpPaddingBytes(audioData) {
+  const frames = Math.floor(audioData.length / 212);
+  const out = new Uint8Array(frames * 192);
+  for (let i = 0; i < frames; i++) {
+    const srcOff = i * 212 + 12;
+    const dstOff = i * 192;
+    for (let j = 0; j < 192; j++) {
+      out[dstOff + j] = audioData[srcOff + j];
+    }
+  }
+  return out;
+}
+function metadataEquals(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+class AtracRecoveryBase extends exploit_1.Exploit {
+  async downloadTrackToFd(track, fd, hostWrite, progressCallback, isCancelled) {
+    const checkCancel = () => {
+      if (isCancelled && isCancelled()) {
+        throw new Error('Download cancelled.');
+      }
+    };
+    const sector0 = await (0, netmd_js_1.readUTOCSector)(this.stateManager.factoryIface, 0);
+    const frags = parseSector0Fragments(sector0, track);
+    const rootMode = frags[0].mode;
+    const isStereo = (rootMode & 0x02) !== 0;
+    const isSp = (rootMode & 0x04) !== 0;
+    const format = isSp ? (isStereo ? 'SPS' : 'SPM') : (isStereo ? 'LP2' : 'LP4');
+
+    let allSectors = 0;
+    const ranges = [];
+    const sectorSplices = {};
+    for (let i = 0; i < frags.length; i++) {
+      const f = frags[i];
+      allSectors += (f.endLogical - f.startLogical) + 1;
+      ranges.push([f.startLogical, f.endLogical]);
+      sectorSplices[f.startLogical] = { start: f.startGroup, end: -1 };
+      const endKey = f.endLogical & ~1;
+      if (sectorSplices[endKey]) {
+        sectorSplices[endKey].end = f.endGroup;
+      } else {
+        sectorSplices[endKey] = { start: 0, end: f.endGroup };
+      }
+    }
+    const isPartOfThisTrack = (logical) => {
+      for (let i = 0; i < ranges.length; i++) {
+        if (logical >= ranges[i][0] && logical <= ranges[i][1]) return true;
+      }
+      return false;
+    };
+
+    const sleeper = await this.stateManager.require(wait_for_disc_spinning_1.WaitForDiscToStopSpinning);
+    let bytesWritten = 0;
+    const extension = (format === 'LP2' || format === 'LP4') ? 'wav' : 'aea';
+    if (extension === 'wav') {
+      const hdr = makeLpWavHeader(format === 'LP2', allSectors * (2332 - 20 * 11));
+      bytesWritten += hostWrite(fd, hdr);
+    } else {
+      const hdr = makeAeaHeader(isStereo ? 2 : 1, allSectors * 11);
+      bytesWritten += hostWrite(fd, hdr);
+    }
+
+    await this.iface.gotoTrack(track);
+    await this.iface.gotoTime(track, 0, 0, 0);
+    await sleeper.wait();
+    checkCancel();
+    await this.startDownload(track);
+    try {
+      await this.setSectorToRead(0, allSectors + 2);
+      if (progressCallback) progressCallback(0, allSectors);
+
+      let sectorsRead = 0;
+      let sector = 0;
+      const sectorPositionsRead = [];
+      const sectorPositionsSet = {};
+      const metadataBlacklist = [];
+      let isAfterBlacklist = false;
+      let alignmentKnockBack = 0;
+      let badSectorCounter = 0;
+      let nextSectorBeginRemove = 0;
+      let nextSectorBeginInclude = 0;
+      const MAX_BAD_SECTORS = 15;
+
+      while (sector < 0xfff) {
+        checkCancel();
+        if (sectorsRead >= allSectors && nextSectorBeginInclude === 0) {
+          break;
+        }
+        const sectorContent = await this.readNextSector(
+          progressCallback ? ((d) => progressCallback(d.read + sectorsRead, allSectors)) : null
+        );
+        sector++;
+        const meta = sectorContent.subarray(0, 20);
+        const currentLogical = ((meta[12] << 8) | meta[13]) * 32 + meta[14];
+        let audioData = sectorContent.subarray(20);
+        let wasMitigation = false;
+
+        if (nextSectorBeginInclude) {
+          audioData = audioData.subarray(0, nextSectorBeginInclude);
+          nextSectorBeginInclude = 0;
+          wasMitigation = true;
+        } else if (nextSectorBeginRemove) {
+          audioData = audioData.subarray(nextSectorBeginRemove);
+          nextSectorBeginRemove = 0;
+          wasMitigation = true;
+        } else if (sectorSplices[currentLogical]) {
+          const sp = sectorSplices[currentLogical];
+          let st = sp.start;
+          const en = sp.end;
+          if (st >= 5) st -= 5.5;
+          const startByte = Math.floor(st * 424);
+          const endByte = en === -1 ? audioData.length : ((en + 1) * 424);
+          if (startByte > audioData.length) {
+            nextSectorBeginInclude = startByte - audioData.length;
+            sectorPositionsRead.push(currentLogical);
+            sectorPositionsSet[currentLogical] = true;
+            sectorsRead += 1;
+            isAfterBlacklist = false;
+            continue;
+          }
+          if (endByte > audioData.length) {
+            nextSectorBeginInclude = endByte - audioData.length + startByte;
+            audioData = audioData.subarray(startByte);
+          } else {
+            audioData = audioData.subarray(startByte, endByte);
+          }
+        }
+
+        if ((!validSector(audioData)) || (!isPartOfThisTrack(currentLogical) && !wasMitigation) || sectorPositionsSet[currentLogical]) {
+          let blacklisted = false;
+          if (sectorContent.length === 2352) {
+            for (let b = 0; b < metadataBlacklist.length; b++) {
+              if (metadataEquals(meta, metadataBlacklist[b])) {
+                blacklisted = true;
+                break;
+              }
+            }
+          }
+          if (blacklisted) {
+            if (isAfterBlacklist) {
+              sectorsRead++;
+              isAfterBlacklist = false;
+            }
+            continue;
+          }
+
+          let originalSeconds = sectorsRead * (704 / 11025) - alignmentKnockBack;
+          if (format !== 'SPS') {
+            const rep = timeToRepresentation(originalSeconds);
+            if (format === 'LP4') translateRepresentationFromLP4(rep);
+            else translateRepresentationFromLP2Mono(rep);
+            originalSeconds = representationToTime(rep);
+          }
+          if (sector < 100) {
+            badSectorCounter++;
+            if (badSectorCounter > MAX_BAD_SECTORS) {
+              throw new Error('Aborted NetMD download: too many consecutive bad sectors');
+            }
+          }
+          const metaCopy = new Uint8Array(meta.length);
+          metaCopy.set(meta);
+          metadataBlacklist.push(metaCopy);
+          isAfterBlacklist = true;
+
+          let alignmentTries = 0;
+          let thisAlignmentKnockBack = 0;
+          for (;;) {
+            let secs = Math.max(0, originalSeconds - thisAlignmentKnockBack);
+            const hours = Math.floor(secs / 3600);
+            secs -= hours * 3600;
+            const minutes = Math.floor(secs / 60);
+            secs -= minutes * 60;
+            await this.finishDownload();
+            await (0, utils_1.sleep)(1000);
+            await this.iface.stop();
+            let tries = 0;
+            for (;;) {
+              try {
+                await this.iface.gotoTime(track, hours, minutes, secs);
+                break;
+              } catch (ex) {
+                if (tries++ > 5) throw new Error('Cannot seek NetMD head during download');
+                await (0, utils_1.sleep)(1000);
+              }
+            }
+            await this.iface.stop();
+            await sleeper.wait();
+            checkCancel();
+            await this.startDownload(track);
+            await this.setSectorToRead(0, 1);
+            const syncSector = await this.readNextSector(null);
+            const syncLogical = ((syncSector[12] << 8) | syncSector[13]) * 32 + syncSector[14];
+            let alignPos = -1;
+            for (let k = sectorPositionsRead.length - 1; k >= 0; k--) {
+              if (sectorPositionsRead[k] === syncLogical) {
+                alignPos = (sectorPositionsRead.length - 1 - k) + 1;
+                break;
+              }
+            }
+            if (alignPos === -1) {
+              if (alignmentTries < 3) {
+                alignmentTries++;
+                thisAlignmentKnockBack += 2;
+                continue;
+              }
+              throw new Error('Cannot align NetMD DRAM sector after seek');
+            }
+            sector = 0;
+            alignmentTries = 0;
+            await this.setSectorToRead(alignPos, allSectors - sectorsRead + 2);
+            alignmentKnockBack += thisAlignmentKnockBack;
+            break;
+          }
+          continue;
+        }
+
+        badSectorCounter = 0;
+        sectorPositionsRead.push(currentLogical);
+        sectorPositionsSet[currentLogical] = true;
+        const chunkToWrite = (format === 'LP2' || format === 'LP4')
+          ? stripLpPaddingBytes(audioData)
+          : audioData;
+        if (chunkToWrite.length > 0) {
+          bytesWritten += hostWrite(fd, chunkToWrite);
+        }
+        sectorsRead += 1;
+        isAfterBlacklist = false;
+        if (progressCallback) progressCallback(sectorsRead, allSectors);
+      }
+    } finally {
+      await this.finishDownload();
+    }
+    return { extension, bytesWritten, format };
+  }
+}
+
+class CachedSectorControlDownload extends AtracRecoveryBase {
+  constructor() {
+    super(...arguments);
+    this.currentTrack = -1;
+    this.patchSlot1 = -1;
+    this.patchSlot2 = -1;
+  }
+  getPropertyStore() { return {}; }
+  _cfg() {
+    const ver = this.stateManager.device.versionCode;
+    const cfg = PREASSEMBLED_CONTROL[ver];
+    if (!cfg) throw new exploit_1.CompatibilityError('AtracRecovery control unsupported on ' + ver);
+    return cfg;
+  }
+  async init() {
+    await super.init();
+    const cfg = this._cfg();
+    this.patchSlot1 = this.stateManager.getIncrementalPatchNumber();
+    this.patchSlot2 = this.stateManager.getIncrementalPatchNumber();
+    const usbExecution = await this.stateManager.require(usb_code_execution_1.USBCodeExecution);
+    await usbExecution.execute(new Uint8Array(cfg.mainCode));
+  }
+  async unload() {
+    const cfg = this._cfg();
+    const usbExecution = await this.stateManager.require(usb_code_execution_1.USBCodeExecution);
+    await usbExecution.execute(new Uint8Array(cfg.cleanupCode));
+    this.stateManager.freePatch(this.patchSlot1);
+    this.stateManager.freePatch(this.patchSlot2);
+  }
+  async readNextSector() {
+    if (this.currentTrack === -1) throw new Error('startDownload required');
+    return new Uint8Array((await this.iface.netMd.readReply(2352)).data.buffer);
+  }
+  async setSectorToRead(sector) {
+    if (this.currentTrack === -1) throw new Error('startDownload required');
+    const cfg = this._cfg();
+    await (0, netmd_js_1.cleanWrite)(this.factoryIface, cfg.sectorToReadAddress, (0, utils_2.formatUIntQuery)('%<d', sector), netmd_js_1.MemoryType.MAPPED);
+  }
+  async startDownload(track) {
+    const cfg = this._cfg();
+    if (!this.stateManager.device.versionCode.startsWith('R')) {
+      await (0, netmd_js_1.display)(this.stateManager.factoryIface, 'ACCESS', true);
+    }
+    this.currentTrack = track;
+    await (0, netmd_js_1.cleanWrite)(this.factoryIface, cfg.enabledFlagAddress, (0, utils_2.formatUIntQuery)('%<d', 1), netmd_js_1.MemoryType.MAPPED);
+  }
+  async finishDownload() {
+    if (this.currentTrack === -1) return;
+    const cfg = this._cfg();
+    if (!this.stateManager.device.versionCode.startsWith('R')) {
+      await this.factoryIface.setDisplayMode(netmd_js_1.DisplayMode.DEFAULT);
+    }
+    await (0, netmd_js_1.cleanWrite)(this.factoryIface, cfg.enabledFlagAddress, (0, utils_2.formatUIntQuery)('%<d', 0), netmd_js_1.MemoryType.MAPPED);
+    this.currentTrack = -1;
+  }
+}
+exports.CachedSectorControlDownload = CachedSectorControlDownload;
+CachedSectorControlDownload._name = 'CachedSectorControlDownload';
+
+class CachedSectorBulkDownload extends AtracRecoveryBase {
+  constructor() {
+    super(...arguments);
+    this.currentTrack = -1;
+    this.patchSlot1 = -1;
+    this.patchSlot2 = -1;
+    this.patchSlot3 = -1;
+    this.cachedSectors = new Uint8Array(0);
+    this.cachedSectorsPtr = 0;
+    this.currentSector = 0;
+    this.sectorsRemaining = 0;
+    this.sectorsPerLoad = this.stateManager.device.isHimd ? 3455 : 900;
+  }
+  getPropertyStore() { return {}; }
+  _cfg() {
+    const ver = this.stateManager.device.versionCode;
+    const cfg = PREASSEMBLED_BULK[ver];
+    if (!cfg) throw new exploit_1.CompatibilityError('AtracRecovery bulk unsupported on ' + ver);
+    return cfg;
+  }
+  async init() {
+    await super.init();
+    const cfg = this._cfg();
+    await this.stateManager.require(himd_unbounded_reading_1.HiMDUnboundedReading);
+    await (0, netmd_js_1.writeOfAnyLength)(this.factoryIface, cfg.prepCodeAddress, new Uint8Array(cfg.prepCode), netmd_js_1.MemoryType.MAPPED);
+    if (!cfg.isHimd) {
+      this.patchSlot1 = this.stateManager.getIncrementalPatchNumber();
+      this.patchSlot2 = this.stateManager.getIncrementalPatchNumber();
+      this.patchSlot3 = this.stateManager.getIncrementalPatchNumber();
+      await (0, netmd_js_1.writeOfAnyLength)(this.factoryIface, cfg.residentCodeAddress, new Uint8Array(cfg.bulkTransferCode), netmd_js_1.MemoryType.MAPPED);
+      const usbExecution = await this.stateManager.require(usb_code_execution_1.USBCodeExecution);
+      await usbExecution.execute(new Uint8Array(cfg.initCode));
+    }
+  }
+  async unload() {
+    const cfg = this._cfg();
+    if (!cfg.isHimd) {
+      const usbExecution = await this.stateManager.require(usb_code_execution_1.USBCodeExecution);
+      await usbExecution.execute(new Uint8Array(cfg.cleanupCode));
+      this.stateManager.freePatch(this.patchSlot1);
+      this.stateManager.freePatch(this.patchSlot2);
+      this.stateManager.freePatch(this.patchSlot3);
+    }
+  }
+  async reloadBuffer(sectorsCount, callback) {
+    const cfg = this._cfg();
+    let sectorStartContent = 0;
+    let sectorEndContent = 0;
+    let sectorLength = 0;
+    if (cfg.isHimd) {
+      sectorLength = 2368;
+      sectorStartContent = cfg.sectorBuffer + 2368 * this.currentSector;
+      if (sectorsCount + this.currentSector > this.sectorsPerLoad) {
+        sectorsCount = this.sectorsPerLoad - this.currentSector;
+      }
+      if (sectorsCount === 0) {
+        this.cachedSectorsPtr = 0;
+        this.cachedSectors = new Uint8Array(20);
+        this.cachedSectors.fill(255);
+        return;
+      }
+      sectorEndContent = sectorsCount * 2368;
+    } else {
+      sectorLength = 2432;
+      sectorStartContent = this.currentSector;
+      sectorEndContent = this.currentSector + sectorsCount;
+    }
+    await (0, netmd_js_1.cleanWrite)(this.factoryIface, cfg.sectorStart, (0, utils_2.formatUIntQuery)('%<d', sectorStartContent), netmd_js_1.MemoryType.MAPPED);
+    await (0, netmd_js_1.cleanWrite)(this.factoryIface, cfg.sectorEnd, (0, utils_2.formatUIntQuery)('%<d', sectorEndContent), netmd_js_1.MemoryType.MAPPED);
+    const usbExecution = await this.stateManager.require(usb_code_execution_1.USBCodeExecution);
+    await usbExecution.execute(new Uint8Array(cfg.prepCodeLoader));
+    this.cachedSectorsPtr = 0;
+    const raw = await this.stateManager.iface.netMd.readBulkToArray(
+      sectorsCount * sectorLength,
+      sectorsCount * sectorLength,
+      callback ? ((length, read) => callback({ read: Math.floor(read / sectorLength), length: sectorsCount })) : undefined
+    );
+    this.cachedSectors = new Uint8Array(raw);
+  }
+  async readNextSector(callback) {
+    if (this.currentTrack === -1) throw new Error('startDownload required');
+    if (this.cachedSectorsPtr >= this.cachedSectors.length) {
+      await this.reloadBuffer(Math.min(this.sectorsRemaining, this.sectorsPerLoad), callback);
+    }
+    const slice = this.cachedSectors.slice(this.cachedSectorsPtr, this.cachedSectorsPtr + 2352);
+    this.currentSector++;
+    this.cachedSectorsPtr += this._cfg().isHimd ? 2368 : 2432;
+    return slice;
+  }
+  async setSectorToRead(sector, sectorsRemaining) {
+    if (this.currentTrack === -1) throw new Error('startDownload required');
+    this.currentSector = sector;
+    this.sectorsRemaining = sectorsRemaining;
+    this.cachedSectorsPtr = this.cachedSectors.length + 1;
+  }
+  async startDownload(track) { this.currentTrack = track; }
+  async finishDownload() { this.currentTrack = -1; }
+}
+exports.CachedSectorBulkDownload = CachedSectorBulkDownload;
+CachedSectorBulkDownload._name = 'CachedSectorBulkDownload';
+`
+  fs.writeFileSync(
+    path.join(stagedDir, 'netmd-exploits', 'exploits', 'atrac-recovery.js'),
+    preassembledAtracRecoverySource,
+    'utf8'
+  )
+
   fs.writeFileSync(
     path.join(stagedDir, 'netmd-exploits', 'exploits', 'index.js'),
     `"use strict";
@@ -789,7 +1478,25 @@ const { USBCodeExecution } = require('./usb-code-execution');
 const { KillEepromWrite } = require('./kill-eeprom-writes');
 const { SPUpload } = require('./sp-upload');
 const { MonoSPUpload } = require('./mono-sp-upload');
-module.exports = { ForceTOCEdit, USBCodeExecution, KillEepromWrite, SPUpload, MonoSPUpload };
+const { WaitForDiscToStopSpinning } = require('./wait-for-disc-spinning');
+const { HiMDUnboundedReading } = require('./himd-unbounded-reading');
+const {
+  CachedSectorControlDownload,
+  CachedSectorBulkDownload,
+  ATRAC_RECOVERY_VERSIONS,
+} = require('./atrac-recovery');
+module.exports = {
+  ForceTOCEdit,
+  USBCodeExecution,
+  KillEepromWrite,
+  SPUpload,
+  MonoSPUpload,
+  WaitForDiscToStopSpinning,
+  HiMDUnboundedReading,
+  CachedSectorControlDownload,
+  CachedSectorBulkDownload,
+  ATRAC_RECOVERY_VERSIONS,
+};
 `,
     'utf8'
   )
@@ -1515,6 +2222,9 @@ const {
   KillEepromWrite,
   SPUpload,
   ForceTOCEdit,
+  CachedSectorBulkDownload,
+  CachedSectorControlDownload,
+  ATRAC_RECOVERY_VERSIONS,
   getFromVersionStoreOrNull,
 } = netmdExploits;
 
@@ -1717,6 +2427,7 @@ export async function netmdProbeDevice(deviceId, includeTracks) {
     const status = await getDeviceStatus(iface);
     const supportsSpUpload = SP_UPLOAD_VERSIONS.includes(versionCode);
     const supportsForceTocEdit = ForceTOCEdit.SUPPORTED_VERSIONS.includes(versionCode);
+    const supportsAtracRecovery = ATRAC_RECOVERY_VERSIONS.includes(versionCode);
 
     let writable = false;
     let writeProtected = false;
@@ -1793,6 +2504,7 @@ export async function netmdProbeDevice(deviceId, includeTracks) {
       versionCode,
       supportsSpUpload,
       supportsForceTocEdit,
+      supportsAtracRecovery,
       discPresent: Boolean(status.discPresent),
       writable,
       writeProtected,
@@ -1933,6 +2645,41 @@ export async function netmdWriteUtocSectors(deviceId, sectors5, sectorsMask) {
       }
     }
   } finally {
+    await netMd.finalize();
+  }
+}
+
+export async function netmdDownloadTrackToFile(deviceId, trackIndex, outFilePath) {
+  const h = hostOrThrow();
+  const { netMd, iface } = await openNetMdSession(deviceId);
+  const fd = h.fileOpen(outFilePath, 1);
+  try {
+    const factoryIface = await iface.factory();
+    const esm = await ExploitStateManager.create(iface, factoryIface);
+    const ver = esm.device.versionCode;
+    if (!ATRAC_RECOVERY_VERSIONS.includes(ver)) {
+      throw new Error('AtracRecovery download unsupported on firmware ' + ver);
+    }
+    const useBulk = ver.startsWith('S') || ver.startsWith('Hr') || ver.startsWith('Hn');
+    const ExploitCls = useBulk ? CachedSectorBulkDownload : CachedSectorControlDownload;
+    let dlInfo = null;
+    await esm.envelop(ExploitCls, async (ar) => {
+      dlInfo = await ar.downloadTrackToFd(
+        trackIndex | 0,
+        fd,
+        (f, bytes) => h.fileWrite(f, bytes),
+        (done, total) => reportHostStep(done, Math.max(1, total)),
+        () => Boolean(h.isCancelled && h.isCancelled())
+      );
+    });
+    return asciiJsonStringify({
+      trackIndex: trackIndex | 0,
+      extension: dlInfo ? dlInfo.extension : 'aea',
+      bytesWritten: dlInfo ? dlInfo.bytesWritten : 0,
+      format: dlInfo ? dlInfo.format : '',
+    });
+  } finally {
+    h.fileClose(fd);
     await netMd.finalize();
   }
 }
@@ -2503,6 +3250,53 @@ globalThis.__cartaNetMdHost = {
     }
     return out.slice(0, rc | 0);
   },
+  fileOpen(pathStr, writeMode) {
+    const pBytes = utf8EncodeBytes(pathStr);
+    const pLen = pBytes.length | 0;
+    const pp = Porffor.IR.ptr(pBytes.buffer);
+    const poff = pBytes.byteOffset;
+    const wm = writeMode ? 1 : 0;
+    let fd = -1;
+    Porffor.c\`
+      const char* p_c = (const char*)(MEM + (u32)PF_F64(pp) + 8 + (u32)PF_F64(poff));
+      fd = (f64)carta_netmd_host_file_open(p_c, (int)PF_F64(pLen), (int)PF_F64(wm));
+    \`;
+    if (fd < 0) {
+      copyLastHostError('NetMD host file open failed');
+      throw new Error('NetMD host file open failed');
+    }
+    return fd | 0;
+  },
+  fileWrite(fd, bytes) {
+    const len = bytes.length | 0;
+    if (len <= 0) return 0;
+    const f = fd | 0;
+    const bp = Porffor.IR.ptr(bytes.buffer);
+    const boff = bytes.byteOffset;
+    let rc = -1;
+    Porffor.c\`
+      const u8* b_c = (const u8*)(MEM + (u32)PF_F64(bp) + 8 + (u32)PF_F64(boff));
+      rc = (f64)carta_netmd_host_file_write((int)PF_F64(f), b_c, (int)PF_F64(len));
+    \`;
+    if (rc < 0) {
+      copyLastHostError('NetMD host file write failed');
+      throw new Error('NetMD host file write failed');
+    }
+    return rc | 0;
+  },
+  fileClose(fd) {
+    const f = fd | 0;
+    Porffor.c\`
+      carta_netmd_host_file_close((int)PF_F64(f));
+    \`;
+  },
+  isCancelled() {
+    let c = 0;
+    Porffor.c\`
+      c = (f64)carta_netmd_host_is_cancelled();
+    \`;
+    return (c | 0) !== 0;
+  },
 };
 
 export function bridgeListDevices() {
@@ -2579,6 +3373,19 @@ export function bridgeWriteUtocSectors(idPtr, idLen, secPtr, secLen, sectorsMask
   }
 }
 
+export function bridgeDownloadTrack(idPtr, idLen, trackIndex, outPtr, outLen) {
+  globalThis.__resetPromiseJobs();
+  try {
+    const devId = utf8DecodeBytes(copyInBytes(idPtr, idLen));
+    const outPath = utf8DecodeBytes(copyInBytes(outPtr, outLen));
+    const json = __syncAwait(netmdDownloadTrackToFile(devId, trackIndex | 0, outPath));
+    return writeScratchBytes(utf8EncodeBytes(json));
+  } catch (err) {
+    copyLastHostError(err && err.message ? err.message : String(err));
+    return -1;
+  }
+}
+
 if (globalThis.__cartaPorfforRetain) {
   bridgeListDevices();
   bridgeProbeDevice(0, 0, 1);
@@ -2586,6 +3393,7 @@ if (globalThis.__cartaPorfforRetain) {
   bridgeUploadTrack(0, 0, 0, 0, 0, 0, 0, 0, 0);
   bridgeReadUtocSectors(0, 0);
   bridgeWriteUtocSectors(0, 0, 0, 0, 0);
+  bridgeDownloadTrack(0, 0, 0, 0, 0);
 }
 `
   fs.writeFileSync(entryPath, entryCode, 'utf8')
@@ -2621,6 +3429,7 @@ function patchGeneratedC(cSource) {
   const fnUpload = findFn('bridgeUploadTrack', 9)
   const fnReadUtoc = findFn('bridgeReadUtocSectors', 2)
   const fnWriteUtoc = findFn('bridgeWriteUtocSectors', 5)
+  const fnDownload = findFn('bridgeDownloadTrack', 5)
 
   const mainAnchor = `int main(int argc, char** argv) {
   porf_init(argc, argv);
@@ -2662,6 +3471,10 @@ extern int carta_netmd_host_usb_control_out(int handle, int request, int value, 
 extern int carta_netmd_host_usb_control_in(int handle, int request, int value, int index, uint8_t* out, int max_len);
 extern int carta_netmd_host_usb_bulk_out(int handle, int endpoint, const uint8_t* data, int len);
 extern int carta_netmd_host_usb_bulk_in(int handle, int endpoint, uint8_t* out, int max_len);
+extern int carta_netmd_host_file_open(const char* path_ptr, int path_len, int write_mode);
+extern int carta_netmd_host_file_write(int fd, const uint8_t* data, int len);
+extern int carta_netmd_host_file_close(int fd);
+extern int carta_netmd_host_is_cancelled(void);
 extern const char* carta_netmd_host_last_error(void);
 
 static inline double pf_num_jsval(jsval x) { return x.val; }
@@ -2808,6 +3621,26 @@ int netmd_pf_write_utoc_sectors(const char* device_id_ptr,
 }
 
 CARTA_PF_EXPORT
+int netmd_pf_download_track(const char* device_id_ptr,
+                            int device_id_len,
+                            int track_index,
+                            const char* out_file_ptr,
+                            int out_file_len) {
+  volatile int anchor = 0;
+  porf_c_stack_top = (void*)&anchor;
+  netmd_ensure_init();
+  if (!device_id_ptr || device_id_len <= 0 || track_index < 0 || !out_file_ptr || out_file_len <= 0) return -1;
+  g_pf_err[0] = 0;
+  g_pf_out_len = 0;
+  return (int)${fnDownload}(
+    porf_box(0, 0), porf_box(0, 0),
+    (f64)(uintptr_t)device_id_ptr, (f64)device_id_len,
+    (f64)track_index,
+    (f64)(uintptr_t)out_file_ptr, (f64)out_file_len
+  ).val;
+}
+
+CARTA_PF_EXPORT
 const unsigned char* netmd_pf_output_ptr(void) {
   return g_pf_out_buf;
 }
@@ -2892,7 +3725,8 @@ async function main() {
     const esbuild = requireFromTools('esbuild')
 
     const forceTocTables = await preassembleForceTocPayloads(requireFromDeps)
-    stageNetmdPackages(requireFromDeps, forceTocTables)
+    const atracRecoveryTables = await preassembleAtracRecoveryPayloads(requireFromDeps)
+    stageNetmdPackages(requireFromDeps, forceTocTables, atracRecoveryTables)
     const loweredPath = await writeCoreEntryAndBundle(babel, esbuild)
     await runNodeSanitySelfTest(loweredPath)
     const entryPath = buildEntryJs(loweredPath)

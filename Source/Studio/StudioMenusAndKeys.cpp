@@ -235,6 +235,8 @@ constexpr int fadeOutExponential = 397;
 constexpr int clipAmplify = 398;
 constexpr int clipNormalize = 399;
 constexpr int clipContextSplitAtPointer = 9000;
+constexpr int clipContextDownloadAudio = 9001;
+constexpr int clipContextDownloadAllAudio = 9002;
 constexpr int clipContextOverlapBase = 10000;
 
 // Snapping
@@ -1092,6 +1094,15 @@ void Studio::showClipContextMenu(const juce::MouseEvent& event) {
         }
     }
 
+    const bool isPlaceholderClip =
+        chosenClip.audio && chosenClip.audio->onDiscPlaceholder && !chosenClip.onDiscRegionId.empty();
+    if (isPlaceholderClip) {
+        const bool canDl = canDownloadDiscAudio();
+        menu.addItem(MenuId::clipContextDownloadAudio, "Download Audio from Disc", canDl);
+        menu.addItem(MenuId::clipContextDownloadAllAudio, "Download All On-Disc Audio", canDl);
+        menu.addSeparator();
+    }
+
     menu.addSeparator();
     menu.addItem(MenuId::clipContextSplitAtPointer,
                  juce::String(persistentGroup ? "Split group at pointer (sample "
@@ -1169,6 +1180,25 @@ void Studio::showClipContextMenu(const juce::MouseEvent& event) {
                             })) {
                 safe->status.setText("The clip selection changed; open its menu again.",
                                      juce::dontSendNotification);
+                return;
+            }
+
+            if (result == MenuId::clipContextDownloadAudio ||
+                result == MenuId::clipContextDownloadAllAudio) {
+                std::vector<Studio::DownloadTargetClip> targets;
+                if (result == MenuId::clipContextDownloadAudio) {
+                    const auto& c = safe->session.tracks[static_cast<size_t>(track)]
+                                        .clips[static_cast<size_t>(chosen)];
+                    if (!c.onDiscRegionId.empty()) {
+                        const auto s0 =
+                            static_cast<std::int64_t>(std::llround(c.start * carta::sessionRate));
+                        const auto s1 = static_cast<std::int64_t>(
+                            std::llround((c.start + c.duration) * carta::sessionRate));
+                        targets.push_back({c.onDiscRegionId, s0, s1});
+                    }
+                }
+                const juce::ScopedUnlock unlock(safe->lock);
+                safe->triggerDownloadDiscAudioFromUi({}, std::nullopt, std::move(targets));
                 return;
             }
 

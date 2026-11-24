@@ -167,8 +167,17 @@ class ScopedHardwareWriteConfirmation {
     bool previous_ = false;
 };
 
+/** Sets or queries graceful cancellation for long-running read operations (e.g., download-track). */
+void setNetMdCancelRequested(bool cancelled) noexcept;
+bool isNetMdCancelRequested() noexcept;
+
 /** Returns true when `deviceId` identifies the built-in mock NetMD device. */
 bool isNetMdMockDeviceId(const std::string& deviceId) noexcept;
+
+/** Exports a mock NetMD track to `.aea` (SP) or `.wav` (LP2/LP4) for offline download tests. */
+bool exportMockNetMdTrackContainer(int trackIndex, const std::string& outPath,
+                                   std::string& outExtension, std::int64_t& outBytesWritten,
+                                   std::string& error);
 
 } // namespace carta
 
@@ -225,6 +234,15 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_out(int handle, int endpoi
 
 CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_in(int handle, int endpoint,
                                                          std::uint8_t* out, int max_len);
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_file_open(const char* path_ptr, int path_len,
+                                                       int write_mode);
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_file_write(int fd, const std::uint8_t* data, int len);
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_file_close(int fd);
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_is_cancelled(void);
 
 CARTA_NETMD_HOST_EXPORT const char* carta_netmd_host_last_error(void);
 

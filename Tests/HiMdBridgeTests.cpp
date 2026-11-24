@@ -1216,6 +1216,62 @@ int main() {
         REQUIRE(fgRes.ok && fgRes.uploadedTracks == 2 && fgRes.uniqueAudioTracksUploaded == 2 &&
                     fgRes.gaplessRuns == 0,
                 "forceGapBefore must break Hi-MD gapless coalescing cleanly");
+
+        // 14. Hi-MD on-disc audio dump -> decodeRawAtracPayload -> non-destructive placeholder replacement
+        {
+            carta::MdDisc loadedHiMd{};
+            REQUIRE(carta::loadHiMdDiscIntoSession("mock:mz-rh1", loadedHiMd, nullptr, err),
+                    "14 loadHiMdDiscIntoSession failed: " + err);
+            carta::Session sess14{};
+            carta::populateLoadedDiscSession(loadedHiMd, sess14);
+            REQUIRE(sess14.tracks.size() == 1 && !sess14.tracks[0].clips.empty() &&
+                        !sess14.mdDisc.loadedDisc.regions.empty(),
+                    "14 populateLoadedDiscSession must create placeholder clip");
+            const auto& reg = sess14.mdDisc.loadedDisc.regions[0];
+            const juce::File tmpRaw =
+                juce::File::getSpecialLocation(juce::File::tempDirectory)
+                    .getChildFile("carta_himd_dl_test_" +
+                                  juce::String(juce::Time::getHighResolutionTicks()) + ".raw");
+            REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", 0, tmpRaw.getFullPathName().toStdString(),
+                                         /*rawAudio=*/true, err),
+                    "14 dumpHiMdTrack raw failed: " + err);
+            juce::MemoryBlock raw;
+            REQUIRE(tmpRaw.loadFileAsData(raw) && raw.getSize() > 0,
+                    "14 dumped raw Hi-MD track must be non-empty");
+            tmpRaw.deleteFile();
+
+            std::vector<float> decL, decR;
+            int decCh = 0;
+            REQUIRE(carta::decodeRawAtracPayload(
+                        carta::mdCodecModeToString(reg.codec),
+                        static_cast<const std::uint8_t*>(raw.getData()), raw.getSize(), decL, decR,
+                        decCh, err),
+                    "14 decodeRawAtracPayload failed: " + err);
+            REQUIRE(decCh == 2 && !decL.empty(), "14 decoded Hi-MD PCM must be non-empty");
+
+            double energy = 0.0;
+            for (float s : decL) {
+                energy += static_cast<double>(s) * static_cast<double>(s);
+            }
+            REQUIRE(energy > 1.0, "14 decoded Hi-MD audio must preserve non-silent tone energy");
+
+            const int targetFrames = static_cast<int>(
+                std::max<std::int64_t>(1, reg.timelineEndSample - reg.timelineStartSample));
+            std::shared_ptr<carta::Audio> decodedAudio;
+            REQUIRE(carta::createDecodedOnDiscAudioSource(
+                        "HiMD Track 1", decL.data(), decR.data(), 2, static_cast<int>(decL.size()),
+                        targetFrames, decodedAudio, err),
+                    "14 createDecodedOnDiscAudioSource failed: " + err);
+            REQUIRE(carta::applyDownloadedOnDiscRegionAudio(sess14, reg.id, decodedAudio),
+                    "14 applyDownloadedOnDiscRegionAudio must update clip and region");
+            const auto& updatedClip = sess14.tracks[0].clips[0];
+            REQUIRE(updatedClip.audio && !updatedClip.audio->onDiscPlaceholder &&
+                        updatedClip.audio->hasPcm() && updatedClip.lockedOnDisc &&
+                        updatedClip.onDiscRegionId == reg.id &&
+                        sess14.mdDisc.loadedDisc.regions[0].audioDownloaded &&
+                        carta::mdTrackUsesOnDiscAudio(sess14.mdDisc, sess14.mdDisc.tracks[0]),
+                    "14 downloaded Hi-MD clip must have PCM while staying preserved on-disc");
+        }
     }
 
     std::cout << "[HiMdBridgeTests] All Hi-MD bridge, gapless, batch PlayOrder, writeIndex, guard, and lifecycle tests passed.\n";

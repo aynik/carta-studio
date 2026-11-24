@@ -23,7 +23,9 @@
  */
 
 #include "Studio/Studio.h"
+#include "MiniDisc/NativeCodecs.h"
 
+#include <map>
 #include <set>
 
 // ============================================================================
@@ -642,6 +644,9 @@ bool Studio::applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& erro
     const bool applied = mutate(
         [&]() {
             carta::populateLoadedDiscSession(loaded, session);
+            if (deviceRate > 0) {
+                session.prepareResampling(resampling, deviceRate);
+            }
             selectedTrack = session.tracks.empty() ? -1 : 0;
             selectedClip = -1;
             selectedMarker = -1;
@@ -663,6 +668,532 @@ bool Studio::applyLoadedMiniDisc(const carta::MdDisc& loaded, juce::String& erro
     menuItemsChanged();
     repaint();
     return true;
+}
+
+bool Studio::hasUnloadedOnDiscPlaceholders() const {
+    if (!session.mdDisc.loadedDisc.active) {
+        return false;
+    }
+    for (const auto& track : session.tracks) {
+        for (const auto& clip : track.clips) {
+            if (clip.audio && clip.audio->onDiscPlaceholder && !clip.onDiscRegionId.empty()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool Studio::canDownloadDiscAudio() const {
+    if (netMdBusy.load(std::memory_order_acquire) || hiMdBusy.load(std::memory_order_acquire) ||
+        !hasUnloadedOnDiscPlaceholders()) {
+        return false;
+    }
+    if (carta::isHiMdMedium(session.mdDisc.medium)) {
+        if (cachedHiMdStatus.has_value()) {
+            return !cachedHiMdStatus->tracks.empty();
+        }
+        return !cachedHiMdDevices.empty();
+    }
+    if (cachedNetMdPreflight.has_value() && cachedNetMdPreflight->deviceConnected) {
+        const auto& st = cachedNetMdPreflight->device;
+        return st.discPresent && !st.hiMdFormatted && st.supportsAtracRecovery;
+    }
+    return !cachedNetMdDevices.empty();
+}
+
+juce::Rectangle<int> Studio::onDiscDownloadPillBounds(const juce::Rectangle<int>& clipRect,
+                                                      const juce::Rectangle<int>& visibleRect,
+                                                      bool downloading,
+                                                      bool canDownload) const noexcept {
+    if (!downloading && !canDownload) {
+        return {};
+    }
+    const int header = std::min(titleHeight, std::max(0, clipRect.getHeight() - 8));
+    const auto content = clipRect.withTrimmedTop(header);
+    const auto vis = content.getIntersection(visibleRect);
+    if (vis.getHeight() < 20 || vis.getWidth() < 92) {
+        return {};
+    }
+    const int pillW = std::min(vis.getWidth() - 12, downloading ? 136 : 124);
+    const int pillH = 20;
+    return {vis.getX() + 6, vis.getCentreY() - pillH / 2, pillW, pillH};
+}
+
+bool Studio::isClipCurrentlyDownloading(const std::string& regionId, std::int64_t clipStartSample,
+                                        std::int64_t clipEndSample) {
+    if (regionId.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(netMdMutex);
+    if (activeDownloadRegionId != regionId) {
+        return false;
+    }
+    if (activeDownloadClipStartSample < 0 || activeDownloadClipEndSample <= activeDownloadClipStartSample) {
+        return true;
+    }
+    return std::abs(activeDownloadClipStartSample - clipStartSample) <= 2 &&
+           std::abs(activeDownloadClipEndSample - clipEndSample) <= 2;
+}
+
+std::string Studio::currentDownloadingRegionId() {
+    std::lock_guard<std::mutex> lk(netMdMutex);
+    return activeDownloadRegionId;
+}
+
+double Studio::currentDownloadingRegionProgress() {
+    if (netMdBusy.load(std::memory_order_acquire)) {
+        return carta::getNetMdProgress().progress;
+    }
+    if (hiMdBusy.load(std::memory_order_acquire)) {
+        return carta::getHiMdProgress().progress;
+    }
+    std::lock_guard<std::mutex> lk(netMdMutex);
+    return activeDownloadRegionProgress;
+}
+
+void Studio::drainPendingDownloadedRegions() {
+    std::vector<PendingDownloadedRegion> ready;
+    {
+        std::lock_guard<std::mutex> lk(netMdMutex);
+        ready.swap(pendingDownloadedRegions);
+    }
+    if (ready.empty()) {
+        return;
+    }
+    bool anyApplied = false;
+    {
+        const juce::ScopedLock guard(lock);
+        for (const auto& item : ready) {
+            if (carta::applyDownloadedOnDiscRegionAudio(session, item.regionId, item.audio,
+                                                        item.clipStartSample,
+                                                        item.clipEndSample)) {
+                anyApplied = true;
+            }
+        }
+        if (anyApplied) {
+            if (deviceRate > 0) {
+                session.prepareResampling(resampling, deviceRate);
+            }
+            dirty = true;
+            ++editGeneration;
+        }
+    }
+    if (anyApplied) {
+        refreshDiscWorkspace(false);
+        repaint();
+    }
+}
+
+void Studio::startNetMdDownloadAudioJob(const std::string& devId,
+                                        std::vector<std::string> regionIdsIn, bool showAlerts,
+                                        std::optional<int> onlyUtocTrackIndex0,
+                                        std::vector<DownloadTargetClip> clipTargetsIn) {
+    struct ClipJobItem {
+        carta::MdOnDiscRegion region;
+        std::int64_t clipStartSample = -1;
+        std::int64_t clipEndSample = -1;
+        std::string label;
+        std::shared_ptr<carta::Audio> existingAudio;
+        std::vector<std::pair<int, std::int64_t>> tracksWithStartLin; // (trackIndex0, fragStartLin)
+    };
+
+    std::vector<ClipJobItem> jobs;
+    std::string prepError;
+    {
+        const juce::ScopedLock guard(lock);
+        if (!session.mdDisc.loadedDisc.active ||
+            session.mdDisc.importedUtocSectors[0].size() != carta::kUtocSectorBytes) {
+            prepError = "Load a MiniDisc UTOC first before downloading disc audio.";
+        } else {
+            carta::UtocDiscState utoc{};
+            std::string parseErr;
+            if (!carta::parseUtocSectors(session.mdDisc.importedUtocSectors[0].data(), nullptr,
+                                         nullptr, nullptr, utoc, parseErr) ||
+                !utoc.hasSector0) {
+                prepError = parseErr.empty() ? "Stored UTOC Sector 0 is invalid." : parseErr;
+            } else {
+                struct UtocTrackSpan {
+                    int trackIndex0 = 0;
+                    std::int64_t startLin = 0;
+                    std::int64_t endLin = 0;
+                };
+                std::vector<UtocTrackSpan> utocTracks;
+                for (int t = 1; t <= static_cast<int>(utoc.trackCount); ++t) {
+                    std::uint8_t slot = utoc.trackMap[static_cast<std::size_t>(t)];
+                    std::set<std::uint8_t> seen;
+                    std::int64_t minLin = std::numeric_limits<std::int64_t>::max();
+                    std::int64_t maxLin = -1;
+                    while (slot != 0 && seen.insert(slot).second) {
+                        const auto& frag = utoc.fragments[slot];
+                        if (frag.isValid()) {
+                            minLin = std::min(minLin, frag.start.toLinearGroup());
+                            maxLin = std::max(maxLin, frag.end.toLinearGroup());
+                        }
+                        slot = frag.link;
+                    }
+                    if (maxLin >= minLin) {
+                        utocTracks.push_back({t - 1, minLin, maxLin});
+                    }
+                }
+
+                std::map<std::string, const carta::MdOnDiscRegion*> regById;
+                for (const auto& reg : session.mdDisc.loadedDisc.regions) {
+                    regById[reg.id] = &reg;
+                }
+
+                std::set<std::string> regionFilter(regionIdsIn.begin(), regionIdsIn.end());
+                auto matchesClipTarget = [&](const std::string& rId, std::int64_t cStart,
+                                             std::int64_t cEnd) {
+                    if (clipTargetsIn.empty()) {
+                        return regionFilter.empty() || regionFilter.count(rId) > 0;
+                    }
+                    for (const auto& t : clipTargetsIn) {
+                        if (t.regionId != rId) {
+                            continue;
+                        }
+                        if (t.clipStartSample < 0 || t.clipEndSample <= t.clipStartSample) {
+                            return true;
+                        }
+                        if (std::abs(t.clipStartSample - cStart) <= 2 &&
+                            std::abs(t.clipEndSample - cEnd) <= 2) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                for (const auto& tr : session.tracks) {
+                    for (const auto& clip : tr.clips) {
+                        if (clip.onDiscRegionId.empty() || !clip.audio) {
+                            continue;
+                        }
+                        const auto regIt = regById.find(clip.onDiscRegionId);
+                        if (regIt == regById.end()) {
+                            continue;
+                        }
+                        const auto& reg = *regIt->second;
+                        const auto cStart = static_cast<std::int64_t>(
+                            std::llround(clip.start * carta::sessionRate));
+                        const auto cEnd = static_cast<std::int64_t>(
+                            std::llround((clip.start + clip.duration) * carta::sessionRate));
+                        if (cEnd <= cStart) {
+                            continue;
+                        }
+                        if (!matchesClipTarget(reg.id, cStart, cEnd)) {
+                            continue;
+                        }
+                        if (clipTargetsIn.empty() && regionFilter.empty() &&
+                            !onlyUtocTrackIndex0.has_value() && !clip.audio->onDiscPlaceholder) {
+                            continue;
+                        }
+
+                        // Map this clip's timeline span [cStart, cEnd) back to physical UTOC
+                        // sound-unit addresses inside `reg`.
+                        const std::int64_t samplesPerUnit = carta::mdSamplesPerUnit(reg.codec);
+                        const std::int64_t regStartLin = reg.physStart.toLinearUnits();
+                        const std::int64_t clipStartUnits =
+                            regStartLin +
+                            std::max<std::int64_t>(0, (cStart - reg.timelineStartSample) /
+                                                          std::max<std::int64_t>(1, samplesPerUnit));
+                        const std::int64_t clipEndUnits =
+                            regStartLin +
+                            std::max<std::int64_t>(0, (cEnd - reg.timelineStartSample - 1) /
+                                                          std::max<std::int64_t>(1, samplesPerUnit));
+
+                        std::vector<std::pair<int, std::int64_t>> matched;
+                        // Prefer a single UTOC track that completely covers this clip so a slight
+                        // overlap with an adjacent track does not trigger downloading two tracks.
+                        int singleCoverIdx = -1;
+                        std::int64_t singleCoverStart = 0;
+                        std::int64_t singleCoverLen = std::numeric_limits<std::int64_t>::max();
+                        for (const auto& ut : utocTracks) {
+                            if (onlyUtocTrackIndex0.has_value() &&
+                                ut.trackIndex0 != *onlyUtocTrackIndex0) {
+                                continue;
+                            }
+                            if (ut.startLin <= clipStartUnits && ut.endLin >= clipEndUnits) {
+                                const std::int64_t spanLen = ut.endLin - ut.startLin;
+                                if (spanLen < singleCoverLen) {
+                                    singleCoverLen = spanLen;
+                                    singleCoverIdx = ut.trackIndex0;
+                                    singleCoverStart = ut.startLin;
+                                }
+                            }
+                        }
+                        if (singleCoverIdx >= 0) {
+                            matched.emplace_back(singleCoverIdx, singleCoverStart);
+                        } else {
+                            for (const auto& ut : utocTracks) {
+                                if (onlyUtocTrackIndex0.has_value() &&
+                                    ut.trackIndex0 != *onlyUtocTrackIndex0) {
+                                    continue;
+                                }
+                                if (ut.startLin <= clipEndUnits && ut.endLin >= clipStartUnits) {
+                                    matched.emplace_back(ut.trackIndex0, ut.startLin);
+                                }
+                            }
+                            std::sort(matched.begin(), matched.end(),
+                                      [](const auto& a, const auto& b) {
+                                          return a.second < b.second;
+                                      });
+                        }
+                        if (!matched.empty()) {
+                            jobs.push_back({reg, cStart, cEnd,
+                                            clip.name.isNotEmpty() ? clip.name.toStdString()
+                                                                   : reg.id,
+                                            clip.audio->hasPcm() ? clip.audio : nullptr,
+                                            std::move(matched)});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!prepError.empty()) {
+        status.setText(juce::String::fromUTF8(prepError.c_str()), juce::dontSendNotification);
+        return;
+    }
+    if (jobs.empty()) {
+        status.setText("All selected on-disc clips are already downloaded.",
+                       juce::dontSendNotification);
+        return;
+    }
+
+    netMdStopRequested.store(false, std::memory_order_release);
+    carta::clearNetMdDownloadCancel();
+
+    launchNetMdWorker(
+        "download-audio", devId, "Downloading audio from MiniDisc...",
+        [this, devId, jobList = std::move(jobs), showAlerts](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody,
+            std::optional<carta::NetMdPreflightReport>&) mutable {
+            int downloadedCount = 0;
+            bool cancelled = false;
+            const int totalJobs = static_cast<int>(jobList.size());
+            const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory);
+
+            for (int ri = 0; ri < totalJobs; ++ri) {
+                if (netMdStopRequested.load(std::memory_order_acquire) ||
+                    carta::isNetMdDownloadCancelRequested()) {
+                    cancelled = true;
+                    break;
+                }
+                const auto& job = jobList[static_cast<std::size_t>(ri)];
+                const int channels = carta::mdChannelsForCodec(job.region.codec);
+                const std::int64_t targetFrames64 =
+                    std::max<std::int64_t>(1, job.clipEndSample - job.clipStartSample);
+                if (targetFrames64 > std::numeric_limits<int>::max()) {
+                    err = "On-disc clip exceeds maximum supported sample length.";
+                    break;
+                }
+                const int targetFrames = static_cast<int>(targetFrames64);
+                {
+                    std::lock_guard<std::mutex> lk(netMdMutex);
+                    activeDownloadRegionId = job.region.id;
+                    activeDownloadClipStartSample = job.clipStartSample;
+                    activeDownloadClipEndSample = job.clipEndSample;
+                    activeDownloadRegionProgress = 0.0;
+                }
+
+                std::vector<float> regL(static_cast<std::size_t>(targetFrames), 0.0f);
+                std::vector<float> regR(
+                    channels == 2 ? static_cast<std::size_t>(targetFrames) : 0u, 0.0f);
+                if (job.existingAudio && job.existingAudio->hasPcm()) {
+                    const int prevN = std::min(targetFrames, job.existingAudio->numSamples());
+                    if (const float* prevL = job.existingAudio->channelData(0)) {
+                        std::memcpy(regL.data(), prevL,
+                                    static_cast<std::size_t>(prevN) * sizeof(float));
+                    }
+                    if (channels == 2) {
+                        const float* prevR =
+                            job.existingAudio->numChannels() >= 2
+                                ? job.existingAudio->channelData(1)
+                                : job.existingAudio->channelData(0);
+                        if (prevR != nullptr) {
+                            std::memcpy(regR.data(), prevR,
+                                        static_cast<std::size_t>(prevN) * sizeof(float));
+                        }
+                    }
+                }
+                const std::string codecStr = carta::mdCodecModeToString(job.region.codec);
+                const std::int64_t samplesPerUnit = carta::mdSamplesPerUnit(job.region.codec);
+                const std::int64_t clipStartLin =
+                    job.region.physStart.toLinearUnits() +
+                    std::max<std::int64_t>(0, (job.clipStartSample - job.region.timelineStartSample) /
+                                                  std::max<std::int64_t>(1, samplesPerUnit));
+
+                bool clipOk = true;
+                for (std::size_t ti = 0; ti < job.tracksWithStartLin.size(); ++ti) {
+                    const int trackIndex0 = job.tracksWithStartLin[ti].first;
+                    const std::int64_t fragStartLin = job.tracksWithStartLin[ti].second;
+                    const auto stamp =
+                        static_cast<juce::int64>(juce::Time::getHighResolutionTicks());
+                    const juce::File tmpFile = tempDir.getChildFile(
+                        "carta_netmd_dl_" + juce::String(stamp) + "_" + juce::String(trackIndex0) +
+                        ".bin");
+                    struct TempCleaner {
+                        juce::File f;
+                        ~TempCleaner() {
+                            if (f.existsAsFile()) {
+                                f.deleteFile();
+                            }
+                        }
+                    } cleaner{tmpFile};
+
+                    std::string ext;
+                    if (!carta::downloadNetMdTrack(devId, trackIndex0,
+                                                   tmpFile.getFullPathName().toStdString(), ext,
+                                                   err)) {
+                        clipOk = false;
+                        break;
+                    }
+
+                    juce::MemoryBlock rawData;
+                    if (!tmpFile.loadFileAsData(rawData) || rawData.getSize() == 0) {
+                        err = "Downloaded NetMD track file is empty.";
+                        clipOk = false;
+                        break;
+                    }
+
+                    const auto* rawPtr = static_cast<const std::uint8_t*>(rawData.getData());
+                    const std::size_t rawLen = rawData.getSize();
+                    const std::uint8_t* payloadPtr = rawPtr;
+                    std::size_t payloadLen = rawLen;
+                    if (codecStr == "sp-stereo" || codecStr == "sp-mono") {
+                        constexpr std::size_t kAeaHdr = 2048u;
+                        if (rawLen <= kAeaHdr) {
+                            err = "Downloaded .aea track is smaller than the 2048-byte header.";
+                            clipOk = false;
+                            break;
+                        }
+                        payloadPtr = rawPtr + kAeaHdr;
+                        payloadLen = rawLen - kAeaHdr;
+                    } else if (rawLen >= 12u && std::memcmp(rawPtr, "RIFF", 4) == 0 &&
+                               std::memcmp(rawPtr + 8, "WAVE", 4) == 0) {
+                        std::size_t off = 12u;
+                        bool foundData = false;
+                        while (off + 8u <= rawLen) {
+                            const std::uint32_t sz =
+                                static_cast<std::uint32_t>(rawPtr[off + 4]) |
+                                (static_cast<std::uint32_t>(rawPtr[off + 5]) << 8) |
+                                (static_cast<std::uint32_t>(rawPtr[off + 6]) << 16) |
+                                (static_cast<std::uint32_t>(rawPtr[off + 7]) << 24);
+                            if (std::memcmp(rawPtr + off, "data", 4) == 0) {
+                                payloadPtr = rawPtr + off + 8u;
+                                payloadLen = std::min<std::size_t>(sz, rawLen - (off + 8u));
+                                foundData = true;
+                                break;
+                            }
+                            const std::size_t step = 8u + static_cast<std::size_t>(sz) + (sz & 1u);
+                            if (step == 0 || off + step > rawLen) {
+                                break;
+                            }
+                            off += step;
+                        }
+                        if (!foundData) {
+                            err = "Downloaded ATRAC3 WAV is missing a data chunk.";
+                            clipOk = false;
+                            break;
+                        }
+                    }
+
+                    std::vector<float> decL;
+                    std::vector<float> decR;
+                    int decCh = 0;
+                    if (!carta::decodeRawAtracPayload(codecStr, payloadPtr, payloadLen, decL, decR,
+                                                      decCh, err)) {
+                        clipOk = false;
+                        break;
+                    }
+
+                    const std::int64_t signedOffset = (fragStartLin - clipStartLin) * samplesPerUnit;
+                    const int srcOffset = static_cast<int>(
+                        std::clamp<std::int64_t>(-signedOffset, 0, static_cast<std::int64_t>(decL.size())));
+                    const int dstOffset = static_cast<int>(
+                        std::clamp<std::int64_t>(signedOffset, 0, targetFrames));
+                    const int copyN = std::min(static_cast<int>(decL.size()) - srcOffset,
+                                               std::max(0, targetFrames - dstOffset));
+                    for (int s = 0; s < copyN; ++s) {
+                        regL[static_cast<std::size_t>(dstOffset + s)] =
+                            decL[static_cast<std::size_t>(srcOffset + s)];
+                    }
+                    if (channels == 2) {
+                        const auto& srcR = (decCh >= 2 && decR.size() >= decL.size()) ? decR : decL;
+                        for (int s = 0; s < copyN; ++s) {
+                            regR[static_cast<std::size_t>(dstOffset + s)] =
+                                srcR[static_cast<std::size_t>(srcOffset + s)];
+                        }
+                    }
+
+                    std::shared_ptr<carta::Audio> decodedAudio;
+                    if (!carta::createDecodedOnDiscAudioSource(
+                            job.label.empty() ? job.region.id : job.label, regL.data(),
+                            channels == 2 ? regR.data() : nullptr, channels, targetFrames,
+                            targetFrames, decodedAudio, err)) {
+                        clipOk = false;
+                        break;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(netMdMutex);
+                        pendingDownloadedRegions.push_back({job.region.id, std::move(decodedAudio),
+                                                            job.clipStartSample,
+                                                            job.clipEndSample});
+                    }
+                }
+
+                if (!clipOk) {
+                    break;
+                }
+                ++downloadedCount;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(netMdMutex);
+                activeDownloadRegionId.clear();
+                activeDownloadClipStartSample = -1;
+                activeDownloadClipEndSample = -1;
+                activeDownloadRegionProgress = 0.0;
+            }
+            const bool wasCancelled = cancelled ||
+                                      netMdStopRequested.load(std::memory_order_acquire) ||
+                                      carta::isNetMdDownloadCancelRequested();
+            netMdStopRequested.store(false, std::memory_order_release);
+            carta::clearNetMdDownloadCancel();
+
+            if (wasCancelled) {
+                err.clear();
+                auto* o = new juce::DynamicObject();
+                o->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+                o->setProperty("cancelled", true);
+                o->setProperty("downloaded_regions", downloadedCount);
+                result = juce::var(o);
+                uiStatus = downloadedCount > 0
+                               ? ("Download cancelled (" + juce::String(downloadedCount) +
+                                  " track(s) kept).")
+                               : "Disc audio download cancelled.";
+                return true;
+            }
+
+            if (!err.empty()) {
+                uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Download Disc Audio Failed";
+                    alertBody = uiStatus;
+                }
+                return false;
+            }
+
+            auto* o = new juce::DynamicObject();
+            o->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+            o->setProperty("downloaded_regions", downloadedCount);
+            result = juce::var(o);
+            uiStatus = "Downloaded audio for " + juce::String(downloadedCount) +
+                       " on-disc track(s).";
+            return true;
+        });
 }
 
 void Studio::startNetMdEraseJob(const std::string& devId, bool confirmHardware, bool showAlerts) {
@@ -895,6 +1426,7 @@ void Studio::startNetMdRecordJob(carta::Session&& snapshotIn, const std::string&
 // ============================================================================
 
 void Studio::pollNetMdJobProgress() {
+    drainPendingDownloadedRegions();
     const bool busy = netMdBusy.load(std::memory_order_acquire);
     if (netMdDonePending.exchange(false, std::memory_order_acq_rel)) {
         if (!busy) {
@@ -997,6 +1529,9 @@ void Studio::pollNetMdJobProgress() {
 
     if (busy) {
         refreshRecordWorkspace(false);
+        if (!currentDownloadingRegionId().empty()) {
+            repaint();
+        }
     }
 }
 
@@ -1145,6 +1680,203 @@ void Studio::startHiMdLoadDiscJob(const std::string& devId, bool showAlerts) {
                                   : ("'" + juce::String::fromUTF8(discName.c_str()) + "'")) +
                 " (" + juce::String(static_cast<int>(loadedDisc.tracks.size())) + " track(s), " +
                 juce::String(static_cast<int>(loadedDisc.groups.size())) + " group(s)).";
+            return true;
+        });
+}
+
+void Studio::startHiMdDownloadAudioJob(const std::string& devId,
+                                       std::vector<std::string> regionIdsIn, bool showAlerts) {
+    struct HiMdRegionJobItem {
+        carta::MdOnDiscRegion region;
+        std::string label;
+    };
+
+    std::vector<HiMdRegionJobItem> jobs;
+    {
+        const juce::ScopedLock guard(lock);
+        if (!session.mdDisc.loadedDisc.active) {
+            status.setText("Load a Hi-MD disc first before downloading disc audio.",
+                           juce::dontSendNotification);
+            return;
+        }
+        std::set<std::string> filter(regionIdsIn.begin(), regionIdsIn.end());
+        std::set<std::string> placeholderRegionIds;
+        std::map<std::string, std::string> regionLabels;
+        for (const auto& tr : session.tracks) {
+            for (const auto& clip : tr.clips) {
+                if (!clip.onDiscRegionId.empty()) {
+                    if (clip.audio && clip.audio->onDiscPlaceholder) {
+                        placeholderRegionIds.insert(clip.onDiscRegionId);
+                    }
+                    if (regionLabels[clip.onDiscRegionId].empty() && clip.name.isNotEmpty()) {
+                        regionLabels[clip.onDiscRegionId] = clip.name.toStdString();
+                    }
+                }
+            }
+        }
+        for (const auto& reg : session.mdDisc.loadedDisc.regions) {
+            if (reg.hiMdSlot <= 0) {
+                continue;
+            }
+            if (!filter.empty() && filter.count(reg.id) == 0) {
+                continue;
+            }
+            if (filter.empty() && placeholderRegionIds.count(reg.id) == 0) {
+                continue;
+            }
+            jobs.push_back({reg, regionLabels[reg.id]});
+        }
+    }
+
+    if (jobs.empty()) {
+        status.setText("All selected Hi-MD regions are already downloaded.",
+                       juce::dontSendNotification);
+        return;
+    }
+
+    netMdStopRequested.store(false, std::memory_order_release);
+    launchHiMdWorker(
+        "download-audio", devId, "Downloading audio from Hi-MD disc...",
+        [this, devId, jobList = std::move(jobs), showAlerts](
+            std::string& err, juce::var& result, juce::String& uiStatus, juce::String& alertTitle,
+            juce::String& alertBody, std::optional<carta::HiMdDeviceStatus>& afterStatus) mutable {
+            carta::HiMdDeviceStatus devStatus{};
+            if (!carta::probeHiMdDevice(devId, devStatus, err)) {
+                uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Download Hi-MD Audio Failed";
+                    alertBody = uiStatus;
+                }
+                return false;
+            }
+            afterStatus = devStatus;
+
+            std::map<int, int> slotToTrackIndex;
+            for (const auto& tr : devStatus.tracks) {
+                if (tr.slot > 0 && slotToTrackIndex.find(tr.slot) == slotToTrackIndex.end()) {
+                    slotToTrackIndex[tr.slot] = tr.index;
+                }
+            }
+
+            int downloadedCount = 0;
+            bool cancelled = false;
+            const auto tempDir = juce::File::getSpecialLocation(juce::File::tempDirectory);
+            for (const auto& job : jobList) {
+                if (netMdStopRequested.load(std::memory_order_acquire)) {
+                    cancelled = true;
+                    break;
+                }
+                const auto it = slotToTrackIndex.find(job.region.hiMdSlot);
+                if (it == slotToTrackIndex.end()) {
+                    err = "Hi-MD track slot " + std::to_string(job.region.hiMdSlot) +
+                          " is no longer present on the inserted disc.";
+                    break;
+                }
+                const int trackIndex0 = it->second;
+                const std::int64_t targetFrames64 =
+                    std::max<std::int64_t>(1, job.region.timelineEndSample -
+                                                  job.region.timelineStartSample);
+                if (targetFrames64 > std::numeric_limits<int>::max()) {
+                    err = "Hi-MD region exceeds maximum supported sample length.";
+                    break;
+                }
+                const int targetFrames = static_cast<int>(targetFrames64);
+
+                {
+                    std::lock_guard<std::mutex> lk(netMdMutex);
+                    activeDownloadRegionId = job.region.id;
+                    activeDownloadRegionProgress = 0.0;
+                }
+
+                const auto stamp =
+                    static_cast<juce::int64>(juce::Time::getHighResolutionTicks());
+                const juce::File tmpFile = tempDir.getChildFile(
+                    "carta_himd_dl_" + juce::String(stamp) + "_" + juce::String(trackIndex0) +
+                    ".raw");
+                struct TempCleaner {
+                    juce::File f;
+                    ~TempCleaner() {
+                        if (f.existsAsFile()) {
+                            f.deleteFile();
+                        }
+                    }
+                } cleaner{tmpFile};
+
+                if (!carta::dumpHiMdTrack(devId, trackIndex0,
+                                          tmpFile.getFullPathName().toStdString(),
+                                          /*rawAudio=*/true, err)) {
+                    break;
+                }
+
+                juce::MemoryBlock rawData;
+                if (!tmpFile.loadFileAsData(rawData) || rawData.getSize() == 0) {
+                    err = "Dumped Hi-MD audio file is empty.";
+                    break;
+                }
+
+                std::vector<float> decL;
+                std::vector<float> decR;
+                int decCh = 0;
+                if (!carta::decodeRawAtracPayload(
+                        carta::mdCodecModeToString(job.region.codec),
+                        static_cast<const std::uint8_t*>(rawData.getData()), rawData.getSize(),
+                        decL, decR, decCh, err)) {
+                    break;
+                }
+
+                const int channels = std::max(1, std::min(2, decCh));
+                std::shared_ptr<carta::Audio> decodedAudio;
+                if (!carta::createDecodedOnDiscAudioSource(
+                        job.label.empty() ? job.region.id : job.label, decL.data(),
+                        channels == 2 ? decR.data() : nullptr, channels,
+                        static_cast<int>(decL.size()), targetFrames, decodedAudio, err)) {
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(netMdMutex);
+                    pendingDownloadedRegions.push_back({job.region.id, std::move(decodedAudio)});
+                }
+                ++downloadedCount;
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(netMdMutex);
+                activeDownloadRegionId.clear();
+                activeDownloadClipStartSample = -1;
+                activeDownloadClipEndSample = -1;
+                activeDownloadRegionProgress = 0.0;
+            }
+            const bool wasCancelled = cancelled || netMdStopRequested.load(std::memory_order_acquire);
+            netMdStopRequested.store(false, std::memory_order_release);
+            if (wasCancelled) {
+                err.clear();
+                auto* o = new juce::DynamicObject();
+                o->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+                o->setProperty("cancelled", true);
+                o->setProperty("downloaded_regions", downloadedCount);
+                result = juce::var(o);
+                uiStatus = downloadedCount > 0
+                               ? ("Download cancelled (" + juce::String(downloadedCount) +
+                                  " track(s) kept).")
+                               : "Hi-MD audio download cancelled.";
+                return true;
+            }
+
+            if (!err.empty()) {
+                uiStatus = juce::String::fromUTF8(err.c_str());
+                if (showAlerts) {
+                    alertTitle = "Download Hi-MD Audio Failed";
+                    alertBody = uiStatus;
+                }
+                return false;
+            }
+
+            auto* o = new juce::DynamicObject();
+            o->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+            o->setProperty("downloaded_regions", downloadedCount);
+            result = juce::var(o);
+            uiStatus = "Downloaded audio for " + juce::String(downloadedCount) +
+                       " Hi-MD region(s).";
             return true;
         });
 }
@@ -1479,6 +2211,7 @@ void Studio::startHiMdWipeJob(const std::string& devId, bool reformat, bool conf
 }
 
 void Studio::pollHiMdJobProgress() {
+    drainPendingDownloadedRegions();
     const bool busy = hiMdBusy.load(std::memory_order_acquire);
     if (hiMdDonePending.exchange(false, std::memory_order_acq_rel)) {
         if (!busy) {
@@ -1533,6 +2266,9 @@ void Studio::pollHiMdJobProgress() {
 
     if (busy) {
         refreshRecordWorkspace(false);
+        if (!currentDownloadingRegionId().empty()) {
+            repaint();
+        }
     }
 }
 
@@ -1668,6 +2404,16 @@ void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt)
     snap.activeDeviceIsHiMd = preferredIsHiMd;
     snap.utocSummaryText = utocSummary;
     snap.busy = busy;
+    {
+        std::lock_guard<std::mutex> lk(netMdMutex);
+        snap.downloadingAudio =
+            (netMdBusy.load(std::memory_order_acquire) && netMdActiveOp == "download-audio");
+    }
+    if (!snap.downloadingAudio) {
+        std::lock_guard<std::mutex> lk(hiMdMutex);
+        snap.downloadingAudio =
+            (hiMdBusy.load(std::memory_order_acquire) && hiMdActiveOp == "download-audio");
+    }
     if (hiMdBusy.load(std::memory_order_acquire)) {
         const auto hp = carta::getHiMdProgress();
         snap.progress.active = true;
@@ -1700,6 +2446,8 @@ void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt)
                              juce::String(st.datanum);
             const bool loadedActive = session.mdDisc.loadedDisc.active;
             snap.canLoadDisc = true;
+            snap.canDownloadAudio = discIsHiMd && loadedActive && !st.tracks.empty() &&
+                                    hasUnloadedOnDiscPlaceholders();
             snap.canDumpTrack = !st.tracks.empty();
             snap.canErase = true;
             snap.canManageHiMd = true;
@@ -1794,6 +2542,9 @@ void Studio::refreshRecordWorkspace(bool scanDevices, bool allowElevationPrompt)
                 plan.freeClustersAfterReclaim < plan.newUploadClusters;
 
             snap.canLoadDisc = st.discPresent && !st.hiMdFormatted && st.supportsForceTocEdit;
+            snap.canDownloadAudio = !discIsHiMd && loadedActive && st.discPresent &&
+                                    !st.hiMdFormatted && st.supportsAtracRecovery &&
+                                    hasUnloadedOnDiscPlaceholders();
             snap.canReadToc = st.discPresent && st.supportsForceTocEdit;
             snap.canErase = st.discPresent && !st.writeProtected;
             const bool baseWritable = compiled && budget.fits() && st.discPresent && st.writable &&
@@ -1946,6 +2697,73 @@ void Studio::triggerLoadDiscFromUi() {
                 safe->startNetMdLoadDiscJob(devId, true);
             }
         });
+}
+
+void Studio::triggerDownloadDiscAudioFromUi(std::vector<std::string> regionIds,
+                                            std::optional<int> onlyUtocTrackIndex0,
+                                            std::vector<DownloadTargetClip> clipTargets) {
+    if (netMdBusy.load() || hiMdBusy.load()) {
+        status.setText("Wait for the current MiniDisc operation to finish.",
+                       juce::dontSendNotification);
+        return;
+    }
+    if (!onlyUtocTrackIndex0.has_value() && clipTargets.empty() &&
+        !hasUnloadedOnDiscPlaceholders()) {
+        status.setText("All on-disc audio regions are already downloaded.",
+                       juce::dontSendNotification);
+        return;
+    }
+
+    const bool discIsHiMd = carta::isHiMdMedium(session.mdDisc.medium);
+    std::string devId = session.mdDisc.loadedDisc.sourceDeviceId;
+    if (discIsHiMd) {
+        if (discWorkspace.selectedRecordDeviceIsHiMd() &&
+            discWorkspace.selectedRecordDeviceId().isNotEmpty()) {
+            devId = discWorkspace.selectedRecordDeviceId().toStdString();
+        } else if (cachedHiMdStatus.has_value() && !cachedHiMdStatus->deviceId.empty()) {
+            devId = cachedHiMdStatus->deviceId;
+        } else if (!cachedHiMdDevices.empty()) {
+            devId = cachedHiMdDevices.front().id;
+        }
+        if (devId.empty()) {
+            status.setText("Connect a Hi-MD device and click Refresh first.",
+                           juce::dontSendNotification);
+            return;
+        }
+        if (regionIds.empty() && !clipTargets.empty()) {
+            for (const auto& t : clipTargets) {
+                regionIds.push_back(t.regionId);
+            }
+        }
+        startHiMdDownloadAudioJob(devId, std::move(regionIds), true);
+    } else {
+        if (!discWorkspace.selectedRecordDeviceIsHiMd() &&
+            discWorkspace.selectedRecordDeviceId().isNotEmpty()) {
+            devId = discWorkspace.selectedRecordDeviceId().toStdString();
+        } else if (cachedNetMdPreflight.has_value() && cachedNetMdPreflight->deviceConnected &&
+                   !cachedNetMdPreflight->device.deviceId.empty()) {
+            devId = cachedNetMdPreflight->device.deviceId;
+        } else if (!cachedNetMdDevices.empty()) {
+            devId = cachedNetMdDevices.front().id;
+        }
+        if (devId.empty()) {
+            status.setText("Connect a NetMD device and click Refresh first.",
+                           juce::dontSendNotification);
+            return;
+        }
+        startNetMdDownloadAudioJob(devId, std::move(regionIds), true, onlyUtocTrackIndex0,
+                                   std::move(clipTargets));
+    }
+}
+
+void Studio::cancelActiveDiscDownload() {
+    if (!netMdBusy.load(std::memory_order_acquire) && !hiMdBusy.load(std::memory_order_acquire)) {
+        return;
+    }
+    netMdStopRequested.store(true, std::memory_order_release);
+    carta::requestNetMdDownloadCancel();
+    status.setText("Cancelling disc audio download...", juce::dontSendNotification);
+    repaint();
 }
 
 void Studio::triggerEraseDiscFromUi() {

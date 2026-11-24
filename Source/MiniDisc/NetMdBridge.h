@@ -90,6 +90,7 @@ struct NetMdDeviceStatus {
     std::string versionCode;
     bool supportsSpUpload = false;
     bool supportsForceTocEdit = false;
+    bool supportsAtracRecovery = false;
     bool discPresent = false;
     bool writable = false;
     bool writeProtected = false;
@@ -203,6 +204,18 @@ bool writeNetMdUtoc(
  */
 bool recordNetMdDisc(const Session& session, const MdDisc& disc, const std::string& deviceId,
                      bool confirmHardware, NetMdRecordResult& outResult, std::string& error);
+
+/**
+ * Downloads 0-based track `trackIndex` from `deviceId` via `AtracRecovery` to `outPath`
+ * (`.aea` for SP-Stereo/SP-Mono, `.wav` for LP2/LP4). Sets `outExtension` ("aea" or "wav").
+ */
+bool downloadNetMdTrack(const std::string& deviceId, int trackIndex, const std::string& outPath,
+                        std::string& outExtension, std::string& error);
+
+/** Requests graceful cancellation of an active `downloadNetMdTrack` call (sends SIGTERM on POSIX). */
+void requestNetMdDownloadCancel();
+void clearNetMdDownloadCancel();
+bool isNetMdDownloadCancelRequested() noexcept;
 
 // ============================================================================
 // Helper Path & Out-of-Process Mock Test Session Controls

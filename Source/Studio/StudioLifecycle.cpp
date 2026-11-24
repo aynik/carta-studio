@@ -109,6 +109,8 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     discWorkspace.onRefreshRecord = [this] { refreshRecordWorkspace(true, true); };
     discWorkspace.onRecordPreflight = [this] { triggerRecordProbeFromUi(); };
     discWorkspace.onLoadDisc = [this] { triggerLoadDiscFromUi(); };
+    discWorkspace.onDownloadDiscAudio = [this] { triggerDownloadDiscAudioFromUi({}); };
+    discWorkspace.onCancelDownloadAudio = [this] { cancelActiveDiscDownload(); };
     discWorkspace.onReadDiscToc = [this] { triggerReadDiscTocFromUi(); };
     discWorkspace.onEraseDisc = [this] { triggerEraseDiscFromUi(); };
     discWorkspace.onRecordWriteUtoc = [this] { triggerRecordWriteUtocFromUi(); };

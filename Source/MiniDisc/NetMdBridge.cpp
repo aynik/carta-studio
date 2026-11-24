@@ -53,6 +53,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <csignal>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -72,6 +73,10 @@ NetMdProgressSnapshot g_progress{};
 std::mutex g_helperConfigMutex;
 std::string g_helperPathOverride;
 std::atomic<bool> g_mockGuardEnabled{false};
+std::atomic<bool> g_netmdDownloadCancel{false};
+#if !defined(_WIN32)
+std::atomic<pid_t> g_activeNetmdDownloadPid{-1};
+#endif
 
 } // namespace
 
@@ -630,9 +635,21 @@ bool runOneShotHelperCommand(const std::vector<std::string>& args, const HelperP
         return false;
     }
 
+    const bool isDownloadTrack = !args.empty() && args[0] == "download-track";
+    if (isDownloadTrack) {
+        g_activeNetmdDownloadPid.store(child);
+        if (g_netmdDownloadCancel.load()) {
+            (void)::kill(child, SIGTERM);
+        }
+    }
+
     const bool gotResult =
         readNdjsonUntilResult(outStream, win, outResultObj, outRawResultLine, error);
     std::fclose(outStream);
+
+    if (isDownloadTrack) {
+        g_activeNetmdDownloadPid.store(-1);
+    }
 
     int status = 0;
     ::waitpid(child, &status, 0);
@@ -1095,6 +1112,10 @@ bool parseProbeStatusObject(const juce::DynamicObject* obj, NetMdDeviceStatus& o
     out.versionCode = obj->getProperty("versionCode").toString().toStdString();
     out.supportsSpUpload = static_cast<bool>(obj->getProperty("supportsSpUpload"));
     out.supportsForceTocEdit = static_cast<bool>(obj->getProperty("supportsForceTocEdit"));
+    out.supportsAtracRecovery =
+        obj->hasProperty("supportsAtracRecovery")
+            ? static_cast<bool>(obj->getProperty("supportsAtracRecovery"))
+            : false;
     out.discPresent = static_cast<bool>(obj->getProperty("discPresent"));
     out.writable = static_cast<bool>(obj->getProperty("writable"));
     out.writeProtected = static_cast<bool>(obj->getProperty("writeProtected"));
@@ -3019,6 +3040,57 @@ bool readNetMdDiscUtoc(const std::string& deviceId,
     return readDeviceUtocSectorsUnlocked(resolvedId, rawSectors, outState, readWin, error);
 }
 
+bool downloadNetMdTrack(const std::string& deviceId, int trackIndex, const std::string& outPath,
+                        std::string& outExtension, std::string& error) {
+    outExtension.clear();
+    error.clear();
+    if (trackIndex < 0) {
+        error = "NetMD track index must be >= 0.";
+        return false;
+    }
+    if (outPath.empty()) {
+        error = "Output path for NetMD track download must not be empty.";
+        return false;
+    }
+
+    const std::lock_guard<std::mutex> guard(netMdBridgeMutex());
+
+    std::string resolvedId;
+    if (!resolveTargetDeviceIdUnlocked(deviceId, resolvedId, error)) {
+        return false;
+    }
+
+    ScopedNetMdProgress progressScope;
+    setNetMdProgress("download", "Downloading track " + std::to_string(trackIndex + 1) + "...",
+                     0.02);
+
+    HelperProgressWindow win;
+    win.active = true;
+    win.operation = "download";
+    win.fallbackPhase = "Downloading track " + std::to_string(trackIndex + 1) + " from MiniDisc...";
+    win.baseProgress = 0.02;
+    win.spanProgress = 0.96;
+
+    juce::var resObj;
+    const std::string sessLine = "download-track\t" + percentEncode(resolvedId) + "\t" +
+                                 std::to_string(trackIndex) + "\t" + percentEncode(outPath);
+    if (!invokeNetMdHelperUnlocked(
+            {"download-track", resolvedId, "--track", std::to_string(trackIndex), "--out", outPath},
+            sessLine, win, resObj, error)) {
+        return false;
+    }
+
+    if (const auto* root = resObj.getDynamicObject()) {
+        if (const auto* dl = root->getProperty("download").getDynamicObject()) {
+            outExtension = dl->getProperty("extension").toString().toStdString();
+        }
+    }
+    if (outExtension.empty()) {
+        outExtension = "aea";
+    }
+    return true;
+}
+
 bool loadNetMdDisc(const std::string& deviceId, MdDisc& outDisc, NetMdDeviceStatus* outStatus,
                    std::string& error) {
     outDisc = {};
@@ -3869,6 +3941,24 @@ bool runNetMdHelperStackSelftest(std::string& error) {
     juce::var resObj;
     std::string raw;
     return runOneShotHelperCommand({"selftest-stack"}, HelperProgressWindow{}, resObj, raw, error);
+}
+
+void requestNetMdDownloadCancel() {
+    g_netmdDownloadCancel.store(true);
+#if !defined(_WIN32)
+    const pid_t pid = g_activeNetmdDownloadPid.load();
+    if (pid > 0) {
+        (void)::kill(pid, SIGTERM);
+    }
+#endif
+}
+
+void clearNetMdDownloadCancel() {
+    g_netmdDownloadCancel.store(false);
+}
+
+bool isNetMdDownloadCancelRequested() noexcept {
+    return g_netmdDownloadCancel.load();
 }
 
 } // namespace carta

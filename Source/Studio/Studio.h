@@ -986,6 +986,15 @@ class Studio final : public juce::AudioAppComponent,
     void startNetMdReadUtocJob(const std::string& devId, const juce::File& outFile,
                                const juce::String& outPath, bool showPopup);
     void startNetMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
+    struct DownloadTargetClip {
+        std::string regionId;
+        std::int64_t clipStartSample = -1;
+        std::int64_t clipEndSample = -1;
+    };
+    void startNetMdDownloadAudioJob(const std::string& devId, std::vector<std::string> regionIds,
+                                    bool showAlerts = true,
+                                    std::optional<int> onlyUtocTrackIndex0 = std::nullopt,
+                                    std::vector<DownloadTargetClip> clipTargets = {});
     void startNetMdEraseJob(const std::string& devId, bool confirmHardware, bool showAlerts = true);
     void startNetMdWriteUtocJob(const carta::Session& snapshot, const std::string& devId,
                                 bool confirmHardware, bool showAlerts = true);
@@ -997,6 +1006,21 @@ class Studio final : public juce::AudioAppComponent,
     void triggerRecordProbeFromUi();
     void triggerReadDiscTocFromUi();
     void triggerLoadDiscFromUi();
+    void triggerDownloadDiscAudioFromUi(std::vector<std::string> regionIds = {},
+                                        std::optional<int> onlyUtocTrackIndex0 = std::nullopt,
+                                        std::vector<DownloadTargetClip> clipTargets = {});
+    void cancelActiveDiscDownload();
+    bool canDownloadDiscAudio() const;
+    bool hasUnloadedOnDiscPlaceholders() const;
+    void drainPendingDownloadedRegions();
+    juce::Rectangle<int> onDiscDownloadPillBounds(const juce::Rectangle<int>& clipRect,
+                                                  const juce::Rectangle<int>& visibleRect,
+                                                  bool downloading,
+                                                  bool canDownload) const noexcept;
+    bool isClipCurrentlyDownloading(const std::string& regionId, std::int64_t clipStartSample,
+                                    std::int64_t clipEndSample);
+    std::string currentDownloadingRegionId();
+    double currentDownloadingRegionProgress();
     void triggerEraseDiscFromUi();
     void triggerRecordWriteUtocFromUi();
     void triggerRecordStartFromUi();
@@ -1062,6 +1086,8 @@ class Studio final : public juce::AudioAppComponent,
 
     void startHiMdProbeJob(const std::string& devId, bool allowElevationPrompt = true);
     void startHiMdLoadDiscJob(const std::string& devId, bool showAlerts = true);
+    void startHiMdDownloadAudioJob(const std::string& devId, std::vector<std::string> regionIds,
+                                   bool showAlerts = true);
     void startHiMdRecordJob(carta::Session&& snapshotIn, const std::string& devId,
                             bool confirmHardware, bool showAlerts = true);
     void startHiMdWriteIndexJob(const carta::Session& snapshot, const std::string& devId,
@@ -1545,6 +1571,19 @@ class Studio final : public juce::AudioAppComponent,
     std::string netMdPendingCommittedHash;
     bool netMdPendingNeedsReload = false;
     bool netMdPendingShowLoadAlerts = true;
+    struct PendingDownloadedRegion {
+        std::string regionId;
+        std::shared_ptr<carta::Audio> audio;
+        std::int64_t clipStartSample = -1;
+        std::int64_t clipEndSample = -1;
+    };
+    std::vector<PendingDownloadedRegion> pendingDownloadedRegions;
+    std::string activeDownloadRegionId;
+    std::int64_t activeDownloadClipStartSample = -1;
+    std::int64_t activeDownloadClipEndSample = -1;
+    double activeDownloadRegionProgress = 0.0;
+    std::string hoveredDownloadRegionId;
+    std::int64_t hoveredDownloadClipStartSample = -1;
     std::vector<carta::HiMdDeviceEntry> cachedHiMdDevices;
     std::optional<carta::HiMdDeviceStatus> cachedHiMdStatus;
     bool hiMdScannedOnce = false;

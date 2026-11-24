@@ -54,6 +54,7 @@ constexpr int removeTrack = 8;
 constexpr int syncFromClips = 9;
 constexpr int makeUnique = 10;
 constexpr int toggleForceGap = 11;
+constexpr int downloadTrackAudio = 12;
 } // namespace MdRibbonMenuId
 
 } // namespace
@@ -275,6 +276,15 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
         menu.addItem(MdRibbonMenuId::toggleForceGap, "Force Gapped Break Here", true,
                      currentlyForcedGap);
     }
+    const bool isOnDiscRibbonTrack =
+        hasTrack && session.mdDisc.loadedDisc.active &&
+        carta::mdTrackUsesOnDiscAudio(
+            session.mdDisc, session.mdDisc.tracks[static_cast<size_t>(info.trackIndex)]);
+    if (isOnDiscRibbonTrack) {
+        menu.addItem(MdRibbonMenuId::downloadTrackAudio,
+                     "Download Track " + juce::String(info.trackIndex + 1) + " Audio from Disc",
+                     !netMdBusy.load() && !hiMdBusy.load());
+    }
     menu.addSeparator();
     menu.addItem(MdRibbonMenuId::auditionTrack, "Audition Track", hasTrack);
     menu.addItem(MdRibbonMenuId::auditionFromHere, "Audition from Here", hasTrack);
@@ -356,6 +366,25 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
                 if (safe->discWorkspace.onCommand) {
                     safe->discWorkspace.onCommand(
                         {"disc", "preview", "from", juce::String(trackIdx)}, revision);
+                }
+                break;
+            case MdRibbonMenuId::downloadTrackAudio:
+                if (trackIdx >= 0 &&
+                    trackIdx < static_cast<int>(safe->session.mdDisc.tracks.size())) {
+                    std::vector<std::string> regionIds;
+                    const auto& tr = safe->session.mdDisc.tracks[static_cast<size_t>(trackIdx)];
+                    if (!tr.parts.empty()) {
+                        const int rIdx = carta::findMdOnDiscRegionForPart(
+                            safe->session.mdDisc.loadedDisc, tr.parts.front());
+                        if (rIdx >= 0 &&
+                            rIdx < static_cast<int>(
+                                       safe->session.mdDisc.loadedDisc.regions.size())) {
+                            regionIds.push_back(
+                                safe->session.mdDisc.loadedDisc.regions[static_cast<size_t>(rIdx)]
+                                    .id);
+                        }
+                    }
+                    safe->triggerDownloadDiscAudioFromUi(std::move(regionIds), trackIdx);
                 }
                 break;
             case MdRibbonMenuId::renameTrack:
@@ -1466,6 +1495,75 @@ void Studio::mouseDown(const juce::MouseEvent& e) {
         return;
     }
 
+    // 9b. Inline "Download Audio" / "Downloading XX% ×" pill inside unloaded placeholder clips.
+    if (!e.mods.isPopupMenu() && !e.mods.isAnyModifierKeyDown()) {
+        const bool canDl = canDownloadDiscAudio();
+        const bool dlActive = !currentDownloadingRegionId().empty();
+        if (canDl || dlActive) {
+            const auto& trClips = session.tracks[static_cast<size_t>(t)].clips;
+            const auto row = trackArea(t);
+            const double span = viewLength();
+            for (int ci = static_cast<int>(trClips.size()) - 1; ci >= 0; --ci) {
+                const auto& c = trClips[static_cast<size_t>(ci)];
+                if (!c.audio || !c.audio->onDiscPlaceholder || c.onDiscRegionId.empty()) {
+                    continue;
+                }
+                const auto s0 =
+                    static_cast<std::int64_t>(std::llround(c.start * carta::sessionRate));
+                const auto s1 = static_cast<std::int64_t>(
+                    std::llround((c.start + c.duration) * carta::sessionRate));
+                const bool isDownloading = isClipCurrentlyDownloading(c.onDiscRegionId, s0, s1);
+                const auto rect = clipRect(c, row, area, span);
+                const auto vis = rect.getIntersection(area.withTrimmedLeft(labelWidth));
+                const auto pill = onDiscDownloadPillBounds(rect, vis, isDownloading, canDl);
+                if (!pill.isEmpty() && pill.contains(e.getPosition())) {
+                    timelineClipSelection = std::move(previousClipSelection);
+                    dragMode = kDragNone;
+                    dragged = false;
+                    if (isDownloading) {
+                        const juce::ScopedUnlock unlock(lock);
+                        cancelActiveDiscDownload();
+                        repaint();
+                        return;
+                    }
+                    std::vector<DownloadTargetClip> targets;
+                    auto pushClipTarget = [&](const carta::Clip& sc) {
+                        if (sc.audio && sc.audio->onDiscPlaceholder &&
+                            !sc.onDiscRegionId.empty()) {
+                            const auto ts0 = static_cast<std::int64_t>(
+                                std::llround(sc.start * carta::sessionRate));
+                            const auto ts1 = static_cast<std::int64_t>(
+                                std::llround((sc.start + sc.duration) * carta::sessionRate));
+                            targets.push_back({sc.onDiscRegionId, ts0, ts1});
+                        }
+                    };
+                    if (previousClipSelection.contains(t, ci, editGeneration)) {
+                        for (const auto& ref : previousClipSelection.get(editGeneration)) {
+                            if (ref.track >= 0 &&
+                                ref.track < static_cast<int>(session.tracks.size())) {
+                                const auto& selClips =
+                                    session.tracks[static_cast<size_t>(ref.track)].clips;
+                                if (ref.clip >= 0 &&
+                                    ref.clip < static_cast<int>(selClips.size())) {
+                                    pushClipTarget(selClips[static_cast<size_t>(ref.clip)]);
+                                }
+                            }
+                        }
+                    }
+                    if (targets.empty()) {
+                        pushClipTarget(c);
+                    }
+                    {
+                        const juce::ScopedUnlock unlock(lock);
+                        triggerDownloadDiscAudioFromUi({}, std::nullopt, std::move(targets));
+                    }
+                    repaint();
+                    return;
+                }
+            }
+        }
+    }
+
     selectionBeforeTracks.clear();
     for (int track : selectedTimelineTracks()) {
         selectionBeforeTracks.insert(track);
@@ -2465,10 +2563,60 @@ void Studio::mouseUp(const juce::MouseEvent& e) {
 }
 
 void Studio::mouseMove(const juce::MouseEvent& e) {
+    std::string nextHoveredRegion;
+    std::int64_t nextHoveredStart = -1;
+    const bool canDl = canDownloadDiscAudio();
+    const bool dlActive = !currentDownloadingRegionId().empty();
+    if (canDl || dlActive) {
+        const auto area = timeline();
+        if (e.y >= area.getY() + timelineHeaderHeight() && e.x >= area.getX() + labelWidth) {
+            const int t = trackAt(e.y);
+            if (t >= 0 && t < static_cast<int>(session.tracks.size())) {
+                const auto& trClips = session.tracks[static_cast<size_t>(t)].clips;
+                const auto row = trackArea(t);
+                const double span = viewLength();
+                for (int ci = static_cast<int>(trClips.size()) - 1; ci >= 0; --ci) {
+                    const auto& c = trClips[static_cast<size_t>(ci)];
+                    if (!c.audio || !c.audio->onDiscPlaceholder || c.onDiscRegionId.empty()) {
+                        continue;
+                    }
+                    const auto s0 =
+                        static_cast<std::int64_t>(std::llround(c.start * carta::sessionRate));
+                    const auto s1 = static_cast<std::int64_t>(
+                        std::llround((c.start + c.duration) * carta::sessionRate));
+                    const bool isDownloading =
+                        isClipCurrentlyDownloading(c.onDiscRegionId, s0, s1);
+                    const auto rect = clipRect(c, row, area, span);
+                    const auto vis = rect.getIntersection(area.withTrimmedLeft(labelWidth));
+                    const auto pill = onDiscDownloadPillBounds(rect, vis, isDownloading, canDl);
+                    if (!pill.isEmpty() && pill.contains(e.getPosition())) {
+                        nextHoveredRegion = c.onDiscRegionId;
+                        nextHoveredStart = s0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (nextHoveredRegion != hoveredDownloadRegionId ||
+        nextHoveredStart != hoveredDownloadClipStartSample) {
+        hoveredDownloadRegionId = std::move(nextHoveredRegion);
+        hoveredDownloadClipStartSample = nextHoveredStart;
+        repaint();
+    }
+    if (!hoveredDownloadRegionId.empty()) {
+        setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        return;
+    }
     updateCursor(e.getPosition());
 }
 
 void Studio::mouseExit(const juce::MouseEvent&) {
+    if (!hoveredDownloadRegionId.empty()) {
+        hoveredDownloadRegionId.clear();
+        hoveredDownloadClipStartSample = -1;
+        repaint();
+    }
     setMouseCursor(juce::MouseCursor::NormalCursor);
 }
 

@@ -326,6 +326,88 @@ bool decodeAtracContainer(const std::string& modeOrCodec, const std::uint8_t* da
     return true;
 }
 
+bool decodeRawAtracPayload(const std::string& mode, const std::uint8_t* data, std::size_t length,
+                           std::vector<float>& outLeft, std::vector<float>& outRight,
+                           int& outChannels, std::string& error) {
+    outLeft.clear();
+    outRight.clear();
+    outChannels = 0;
+
+    std::string normalized = normalizeAsciiLower(mode);
+    if (normalized == "hisp") {
+        normalized = "hi-sp";
+    } else if (normalized == "hilp") {
+        normalized = "hi-lp";
+    }
+
+    if (normalized == "pcm" || normalized == "lpcm") {
+        if (length > 0 && data == nullptr) {
+            error = "Missing raw LPCM buffer.";
+            return false;
+        }
+        const std::size_t frames = length / 4u;
+        outLeft.resize(frames, 0.0f);
+        outRight.resize(frames, 0.0f);
+        constexpr float kInv32768 = 1.0f / 32768.0f;
+        for (std::size_t i = 0; i < frames; ++i) {
+            const auto l = static_cast<std::int16_t>(
+                (static_cast<std::uint16_t>(data[i * 4u + 0u]) << 8) | data[i * 4u + 1u]);
+            const auto r = static_cast<std::int16_t>(
+                (static_cast<std::uint16_t>(data[i * 4u + 2u]) << 8) | data[i * 4u + 3u]);
+            outLeft[i] = static_cast<float>(l) * kInv32768;
+            outRight[i] = static_cast<float>(r) * kInv32768;
+        }
+        outChannels = 2;
+        error.clear();
+        return true;
+    }
+
+    const AtracModeSpec* spec = findAtracModeSpec(normalized);
+    if (!spec) {
+        error = "Unsupported ATRAC mode for raw decode: " + mode;
+        return false;
+    }
+    if (length > 0 && data == nullptr) {
+        error = "Missing raw ATRAC payload buffer.";
+        return false;
+    }
+
+    NativeAtracStreamDecoder decoder;
+    if (!decoder.open(spec->id, error)) {
+        return false;
+    }
+
+    const std::size_t frameBytes = static_cast<std::size_t>(spec->bytesPerFrame);
+    const std::size_t frameCount = length / frameBytes;
+    const int frameSamples = spec->samplesPerFrame;
+    outLeft.reserve(frameCount * static_cast<std::size_t>(frameSamples));
+    if (spec->channels == 2) {
+        outRight.reserve(frameCount * static_cast<std::size_t>(frameSamples));
+    }
+
+    std::vector<float> tmpL(static_cast<std::size_t>(frameSamples), 0.0f);
+    std::vector<float> tmpR(static_cast<std::size_t>(frameSamples), 0.0f);
+    for (std::size_t f = 0; f < frameCount; ++f) {
+        const int decoded =
+            decoder.decodeFrame(data + f * frameBytes, frameBytes, tmpL.data(),
+                                spec->channels == 2 ? tmpR.data() : nullptr, error);
+        if (decoded < 0) {
+            outLeft.clear();
+            outRight.clear();
+            outChannels = 0;
+            return false;
+        }
+        outLeft.insert(outLeft.end(), tmpL.begin(), tmpL.begin() + decoded);
+        if (spec->channels == 2) {
+            outRight.insert(outRight.end(), tmpR.begin(), tmpR.begin() + decoded);
+        }
+    }
+
+    outChannels = spec->channels;
+    error.clear();
+    return true;
+}
+
 bool extractNetMdWirePayload(const std::string& mode, const std::vector<std::uint8_t>& container,
                              std::vector<std::uint8_t>& outWireBytes, std::string& error) {
     outWireBytes.clear();

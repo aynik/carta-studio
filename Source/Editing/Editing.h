@@ -1043,6 +1043,25 @@ bool preservesOnDiscAudio(const Session& before, const Session& after, juce::Str
  */
 void populateLoadedDiscSession(const MdDisc& loadedDisc, Session& session);
 
+/**
+ * Wraps decoded 44.1 kHz planar float PCM in a temp-WAV-backed `Audio` source fitted to exact
+ * `targetFrames` samples, with `sourceHash`, `sourceOwner`, and waveform peaks ready for playback
+ * and `.carta` package saving.
+ */
+bool createDecodedOnDiscAudioSource(const std::string& label, const float* left, const float* right,
+                                    int channels, int sourceFrames, int targetFrames,
+                                    std::shared_ptr<Audio>& outAudio, std::string& error);
+
+/**
+ * Replaces placeholder `clip.audio` for all clips referencing `regionId` with `decodedAudio`,
+ * preserving `lockedOnDisc`, `onDiscRegionId`, and timeline geometry, and marks
+ * `MdOnDiscRegion::audioDownloaded = true`.
+ */
+bool applyDownloadedOnDiscRegionAudio(Session& session, const std::string& regionId,
+                                      const std::shared_ptr<Audio>& decodedAudio,
+                                      std::int64_t clipStartSample = -1,
+                                      std::int64_t clipEndSample = -1);
+
 // Preserve linked group identities across a prepared timeline edit. The
 // candidate may be adjusted when an implicit first track gains a marker.
 /** Split all clips crossing either range endpoint on the selected tracks. */

@@ -842,6 +842,20 @@ MdWorkspace::MdWorkspace()
         }
     };
 
+    addChildComponent(downloadAudioButton);
+    downloadAudioButton.setTooltip(
+        "Download on-disc audio into placeholder timeline clips for playback and waveform editing");
+    downloadAudioButton.onClick = [this] {
+        commitPendingEdits();
+        if (recordUiState.downloadingAudio) {
+            if (onCancelDownloadAudio) {
+                onCancelDownloadAudio();
+            }
+        } else if (onDownloadDiscAudio) {
+            onDownloadDiscAudio();
+        }
+    };
+
     addChildComponent(readDiscTocButton);
     readDiscTocButton.setTooltip("Read physical UTOC Sectors 0/1/2/4 from the inserted MiniDisc");
     readDiscTocButton.onClick = [this] {
@@ -1680,6 +1694,21 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
     }
     refreshRecordButton.setEnabled(!recordBusy);
     loadDiscButton.setEnabled(!recordBusy && snapshot.canLoadDisc);
+    if (snapshot.downloadingAudio) {
+        downloadAudioButton.setButtonText("Cancel");
+        downloadAudioButton.setEnabled(true);
+        downloadAudioButton.setTooltip("Stop the active disc audio download cleanly");
+    } else {
+        downloadAudioButton.setButtonText("Download Audio");
+        downloadAudioButton.setEnabled(!recordBusy && snapshot.canDownloadAudio);
+        downloadAudioButton.setTooltip(
+            snapshot.canDownloadAudio
+                ? "Download on-disc audio into placeholder timeline clips"
+                : (snapshot.activeDeviceIsHiMd
+                       ? "Load a Hi-MD disc first to download on-disc audio into the timeline"
+                       : "Load a MiniDisc with a Type-R/Type-S/Hi-MD NetMD recorder to download "
+                         "on-disc audio"));
+    }
     readDiscTocButton.setEnabled(
         !recordBusy && (snapshot.activeDeviceIsHiMd ? snapshot.canDumpTrack : snapshot.canReadToc));
     eraseDiscButton.setEnabled(!recordBusy && snapshot.canErase);
@@ -2212,8 +2241,10 @@ void MdWorkspace::layoutDeviceCard(juce::Rectangle<int> area) {
 
     auto btnRow = area.removeFromBottom(22);
     area.removeFromBottom(4);
-    const int btnW = std::max(0, (btnRow.getWidth() - 8) / 3);
+    const int btnW = std::max(0, (btnRow.getWidth() - 12) / 4);
     loadDiscButton.setBounds(btnRow.removeFromLeft(btnW));
+    btnRow.removeFromLeft(4);
+    downloadAudioButton.setBounds(btnRow.removeFromLeft(btnW));
     btnRow.removeFromLeft(4);
     readDiscTocButton.setBounds(btnRow.removeFromLeft(btnW));
     btnRow.removeFromLeft(4);
@@ -2331,6 +2362,7 @@ void MdWorkspace::updateTabVisibility() {
           !recordUiState.deviceStatus.tracks.empty()));
     deviceTrackList.setVisible(showDeviceTracks);
     loadDiscButton.setVisible(isRecord);
+    downloadAudioButton.setVisible(isRecord);
     readDiscTocButton.setVisible(isRecord);
     eraseDiscButton.setVisible(isRecord);
     planCardTitle.setVisible(isRecord);

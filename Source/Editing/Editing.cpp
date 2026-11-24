@@ -6695,26 +6695,224 @@ void populateLoadedDiscSession(const MdDisc& loadedDisc, Session& session) {
         if (frames64 <= 0 || frames64 > std::numeric_limits<int>::max()) {
             continue;
         }
-        auto audio = std::make_shared<Audio>();
-        audio->onDiscPlaceholder = true;
-        audio->placeholderChannels = mdChannelsForCodec(reg.codec);
-        audio->placeholderFrames = static_cast<int>(frames64);
-        audio->sampleRate = sessionRate;
 
-        Clip clip;
-        clip.audio = std::move(audio);
-        clip.start = static_cast<double>(reg.timelineStartSample) / sessionRate;
-        clip.offset = 0.0;
-        clip.duration = static_cast<double>(frames64) / sessionRate;
-        clip.lockedOnDisc = true;
-        clip.onDiscRegionId = reg.id;
-        const auto& lbl = regionLabels[i];
-        clip.name = lbl.empty() ? ("On-Disc Region " + juce::String(static_cast<int>(i + 1)))
-                                : juce::String::fromUTF8(lbl.c_str());
-        track.clips.push_back(std::move(clip));
+        // Split a multi-track coalesced region into one placeholder clip per track part
+        // so users can view and download individual tracks while keeping the underlying
+        // MdOnDiscRegion contiguous for gapless split editing.
+        struct TrackSlice {
+            std::int64_t start = 0;
+            std::int64_t end = 0;
+            std::string label;
+        };
+        std::vector<TrackSlice> slices;
+        for (const auto& tr : loadedDisc.tracks) {
+            const auto title = tr.displayTitle();
+            for (const auto& p : tr.parts) {
+                const std::int64_t s = std::max(p.startSample, reg.timelineStartSample);
+                const std::int64_t e = std::min(p.endSample, reg.timelineEndSample);
+                if (e > s) {
+                    slices.push_back({s, e, title});
+                }
+            }
+        }
+        std::sort(slices.begin(), slices.end(), [](const TrackSlice& a, const TrackSlice& b) {
+            return std::tie(a.start, a.end) < std::tie(b.start, b.end);
+        });
+
+        auto emitClip = [&](std::int64_t startSample, std::int64_t endSample,
+                            const std::string& lbl) {
+            const std::int64_t len = endSample - startSample;
+            if (len <= 0 || len > std::numeric_limits<int>::max()) {
+                return;
+            }
+            auto audio = std::make_shared<Audio>();
+            audio->onDiscPlaceholder = true;
+            audio->placeholderChannels = mdChannelsForCodec(reg.codec);
+            audio->placeholderFrames = static_cast<int>(len);
+            audio->sampleRate = sessionRate;
+
+            Clip clip;
+            clip.audio = std::move(audio);
+            clip.start = static_cast<double>(startSample) / sessionRate;
+            clip.offset = 0.0;
+            clip.duration = static_cast<double>(len) / sessionRate;
+            clip.lockedOnDisc = true;
+            clip.onDiscRegionId = reg.id;
+            clip.name = lbl.empty() ? ("On-Disc Region " + juce::String(static_cast<int>(i + 1)))
+                                    : juce::String::fromUTF8(lbl.c_str());
+            track.clips.push_back(std::move(clip));
+        };
+
+        if (slices.size() > 1) {
+            std::int64_t cursor = reg.timelineStartSample;
+            for (const auto& sl : slices) {
+                const std::int64_t s = std::max(sl.start, cursor);
+                if (sl.end <= s) {
+                    continue;
+                }
+                if (s > cursor) {
+                    emitClip(cursor, s, regionLabels[i]);
+                }
+                emitClip(s, sl.end, sl.label.empty() ? regionLabels[i] : sl.label);
+                cursor = sl.end;
+            }
+            if (cursor < reg.timelineEndSample) {
+                emitClip(cursor, reg.timelineEndSample, regionLabels[i]);
+            }
+        } else {
+            emitClip(reg.timelineStartSample, reg.timelineEndSample, regionLabels[i]);
+        }
     }
 
     session.tracks.push_back(std::move(track));
+}
+
+bool createDecodedOnDiscAudioSource(const std::string& label, const float* left, const float* right,
+                                    int channels, int sourceFrames, int targetFrames,
+                                    std::shared_ptr<Audio>& outAudio, std::string& error) {
+    outAudio.reset();
+    error.clear();
+    if (channels < 1 || channels > 2 || sourceFrames < 0 || targetFrames <= 0) {
+        error = "Invalid decoded on-disc audio geometry.";
+        return false;
+    }
+
+    const auto stamp = static_cast<juce::int64>(juce::Time::getHighResolutionTicks());
+    const auto baseTemp = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                              .getChildFile("carta_md_dl_" + juce::String(stamp) + "_" +
+                                            juce::String(juce::Random::getSystemRandom().nextInt(
+                                                1000000)));
+    if (!baseTemp.createDirectory()) {
+        error = "Failed creating temporary directory for downloaded disc audio.";
+        return false;
+    }
+    std::shared_ptr<void> owner(new juce::File(baseTemp), [](void* p) {
+        auto* dir = static_cast<juce::File*>(p);
+        if (dir->isDirectory()) {
+            dir->deleteRecursively();
+        }
+        delete dir;
+    });
+
+    juce::String safeName;
+    for (char rawCh : label) {
+        const auto ch = static_cast<unsigned char>(rawCh);
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '_') {
+            safeName += rawCh;
+        } else if (ch == ' ') {
+            safeName += '_';
+        }
+    }
+    safeName = safeName.substring(0, 48).trim();
+    if (safeName.isEmpty()) {
+        safeName = "disc_region";
+    }
+    const juce::File wavFile = baseTemp.getChildFile(safeName + ".wav");
+
+    auto audio = std::make_shared<Audio>();
+    audio->file = wavFile;
+    audio->sourceOwner = owner;
+    audio->sampleRate = sessionRate;
+    audio->sourceFormat = "WAV (Downloaded from Disc)";
+    audio->sourceBitsPerSample = 24;
+    audio->onDiscPlaceholder = false;
+    audio->samples.setSize(channels, targetFrames, false, true, false);
+
+    const int copyFrames = std::min(sourceFrames, targetFrames);
+    if (left != nullptr && copyFrames > 0) {
+        auto* dstL = audio->samples.getWritePointer(0);
+        for (int i = 0; i < copyFrames; ++i) {
+            const float v = left[i];
+            dstL[i] = std::isfinite(v) ? juce::jlimit(-1.0f, 1.0f, v) : 0.0f;
+        }
+        if (channels == 2) {
+            const float* srcR = (right != nullptr) ? right : left;
+            auto* dstR = audio->samples.getWritePointer(1);
+            for (int i = 0; i < copyFrames; ++i) {
+                const float v = srcR[i];
+                dstR[i] = std::isfinite(v) ? juce::jlimit(-1.0f, 1.0f, v) : 0.0f;
+            }
+        }
+    }
+
+    {
+        auto outStream = std::make_unique<juce::FileOutputStream>(wavFile);
+        if (!outStream->openedOk()) {
+            error = "Failed opening temporary WAV file for downloaded disc audio.";
+            return false;
+        }
+        juce::WavAudioFormat wav;
+        const auto options = juce::AudioFormatWriterOptions()
+                                 .withSampleRate(sessionRate)
+                                 .withNumChannels(channels)
+                                 .withBitsPerSample(24);
+        std::unique_ptr<juce::OutputStream> baseStream(outStream.release());
+        auto writer = wav.createWriterFor(baseStream, options);
+        if (!writer) {
+            error = "Failed creating WAV writer for downloaded disc audio.";
+            return false;
+        }
+        if (!writer->writeFromAudioSampleBuffer(audio->samples, 0, targetFrames)) {
+            error = "Failed writing temporary WAV file for downloaded disc audio.";
+            return false;
+        }
+        writer->flush();
+    }
+
+    juce::String hashErr;
+    if (!hashSourceFile(wavFile, audio->sourceHash, hashErr)) {
+        error = hashErr.isNotEmpty() ? hashErr.toStdString()
+                                     : "Failed hashing downloaded disc audio WAV.";
+        return false;
+    }
+
+    buildWaveformPeaks(*audio);
+    outAudio = std::move(audio);
+    return true;
+}
+
+bool applyDownloadedOnDiscRegionAudio(Session& session, const std::string& regionId,
+                                      const std::shared_ptr<Audio>& decodedAudio,
+                                      std::int64_t clipStartSample, std::int64_t clipEndSample) {
+    if (regionId.empty() || !decodedAudio || decodedAudio->onDiscPlaceholder) {
+        return false;
+    }
+    const bool matchClipSpan = (clipStartSample >= 0 && clipEndSample > clipStartSample);
+    bool changed = false;
+    bool anyPlaceholderLeftInRegion = false;
+    for (auto& track : session.tracks) {
+        for (auto& clip : track.clips) {
+            if (clip.onDiscRegionId != regionId) {
+                continue;
+            }
+            bool target = !matchClipSpan;
+            if (matchClipSpan) {
+                const auto cStart =
+                    static_cast<std::int64_t>(std::llround(clip.start * sessionRate));
+                const auto cEnd = static_cast<std::int64_t>(
+                    std::llround((clip.start + clip.duration) * sessionRate));
+                target = std::abs(cStart - clipStartSample) <= 2 &&
+                         std::abs(cEnd - clipEndSample) <= 2;
+            }
+            if (target) {
+                clip.audio = decodedAudio;
+                changed = true;
+            }
+            if (clip.audio && clip.audio->onDiscPlaceholder) {
+                anyPlaceholderLeftInRegion = true;
+            }
+        }
+    }
+    if (!anyPlaceholderLeftInRegion) {
+        for (auto& reg : session.mdDisc.loadedDisc.regions) {
+            if (reg.id == regionId) {
+                reg.audioDownloaded = true;
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 namespace {

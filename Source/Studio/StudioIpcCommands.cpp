@@ -4863,6 +4863,33 @@ struct Studio::IpcRouter {
             root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
             return ipcReply(true, juce::var(root));
         }
+        if (sub == "download-audio") {
+            if (args.size() > 4) {
+                return ipcReply(false, "Usage: netmd download-audio [REGION_ID|all] [DEVICE_ID]");
+            }
+            if (studio.netMdBusy.load() || studio.hiMdBusy.load()) {
+                return ipcReply(false, "Wait for the active MiniDisc hardware operation to finish.");
+            }
+            std::vector<std::string> regionIds;
+            juce::String explicitDev;
+            if (args.size() >= 3 && args[2] != "all") {
+                regionIds.push_back(args[2].toStdString());
+            }
+            if (args.size() == 4) {
+                explicitDev = args[3];
+            }
+            std::string resolveErr;
+            const std::string devId = studio.resolveActiveNetMdDeviceId(explicitDev, resolveErr);
+            if (devId.empty()) {
+                return ipcReply(false, juce::String::fromUTF8(resolveErr.c_str()));
+            }
+            studio.startNetMdDownloadAudioJob(devId, std::move(regionIds), false);
+            auto* root = new juce::DynamicObject();
+            root->setProperty("started", studio.netMdBusy.load());
+            root->setProperty("operation", "download-audio");
+            root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+            return ipcReply(true, juce::var(root));
+        }
         if (sub == "read-utoc") {
             if (studio.netMdBusy.load()) {
                 return ipcReply(false, "Wait for the active NetMD hardware operation to finish.");
@@ -5134,6 +5161,33 @@ struct Studio::IpcRouter {
             auto* root = new juce::DynamicObject();
             root->setProperty("started", true);
             root->setProperty("operation", "load-disc");
+            root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
+            return ipcReply(true, juce::var(root));
+        }
+        if (sub == "download-audio") {
+            if (args.size() > 4) {
+                return ipcReply(false, "Usage: himd download-audio [REGION_ID|all] [DEVICE_ID]");
+            }
+            if (studio.hiMdBusy.load() || studio.netMdBusy.load()) {
+                return ipcReply(false, "Wait for the active MiniDisc hardware operation to finish.");
+            }
+            std::vector<std::string> regionIds;
+            juce::String explicitDev;
+            if (args.size() >= 3 && args[2] != "all") {
+                regionIds.push_back(args[2].toStdString());
+            }
+            if (args.size() == 4) {
+                explicitDev = args[3];
+            }
+            std::string resolveErr;
+            const std::string devId = studio.resolveActiveHiMdDeviceId(explicitDev, resolveErr);
+            if (devId.empty()) {
+                return ipcReply(false, juce::String::fromUTF8(resolveErr.c_str()));
+            }
+            studio.startHiMdDownloadAudioJob(devId, std::move(regionIds), false);
+            auto* root = new juce::DynamicObject();
+            root->setProperty("started", studio.hiMdBusy.load());
+            root->setProperty("operation", "download-audio");
             root->setProperty("device_id", juce::String::fromUTF8(devId.c_str()));
             return ipcReply(true, juce::var(root));
         }

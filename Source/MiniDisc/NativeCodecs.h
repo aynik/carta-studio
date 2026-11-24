@@ -78,6 +78,14 @@ bool decodeAtracContainer(const std::string& modeOrCodec, const std::uint8_t* da
                           std::vector<float>& outRight, int& outChannels, std::string& error);
 
 /**
+ * Decodes raw frame-aligned ATRAC1/ATRAC3/ATRAC3plus payload bytes (or 16-bit big-endian stereo
+ * LPCM for `"pcm"` / `"lpcm"`) into 44.1 kHz planar float PCM.
+ */
+bool decodeRawAtracPayload(const std::string& mode, const std::uint8_t* data, std::size_t length,
+                           std::vector<float>& outLeft, std::vector<float>& outRight,
+                           int& outChannels, std::string& error);
+
+/**
  * Strips `.aea` (2048-byte) or RIFF/WAVE headers to obtain frame-aligned raw wire bytes.
  * Clears `outWireBytes` and populates `error` on failure.
  */

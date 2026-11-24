@@ -2744,7 +2744,76 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
                 (dark ? juce::Colour(0xff4dd0e1) : juce::Colour(0xff00695c)).withAlpha(0.28f));
             g.drawHorizontalLine(midY, static_cast<float>(visible.getX()),
                                  static_cast<float>(visible.getRight()));
-            if (visible.getWidth() > 54 && content.getHeight() > 14) {
+
+            const auto clipStartSmp =
+                static_cast<std::int64_t>(std::llround(c.start * carta::sessionRate));
+            const auto clipEndSmp = static_cast<std::int64_t>(
+                std::llround((c.start + c.duration) * carta::sessionRate));
+            const bool isDownloading =
+                isClipCurrentlyDownloading(c.onDiscRegionId, clipStartSmp, clipEndSmp);
+            const bool canDl = !c.onDiscRegionId.empty() && canDownloadDiscAudio();
+            const auto pill = onDiscDownloadPillBounds(rect, visible, isDownloading, canDl);
+            if (!pill.isEmpty()) {
+                const bool hovered =
+                    !isDownloading && hoveredDownloadRegionId == c.onDiscRegionId &&
+                    std::abs(hoveredDownloadClipStartSample - clipStartSmp) <= 2;
+                const auto fillCol =
+                    isDownloading
+                        ? (dark ? juce::Colour(0xff1b3a3f) : juce::Colour(0xffd7f0ee))
+                        : (hovered
+                               ? (dark ? juce::Colour(0xff235258) : juce::Colour(0xffccece8))
+                               : (dark ? juce::Colour(0xff1b3c40) : juce::Colour(0xffe2f4f2)));
+                const auto borderCol =
+                    dark ? juce::Colour(0xff4dd0e1).withAlpha(hovered ? 0.90f : 0.65f)
+                         : juce::Colour(0xff00695c).withAlpha(hovered ? 0.85f : 0.55f);
+                g.setColour(fillCol);
+                g.fillRoundedRectangle(pill.toFloat(), 4.0f);
+                if (isDownloading) {
+                    const double frac =
+                        std::clamp(currentDownloadingRegionProgress(), 0.0, 1.0);
+                    const int fillW = static_cast<int>(std::lround(pill.getWidth() * frac));
+                    if (fillW > 0) {
+                        g.setColour((dark ? juce::Colour(0xff26a69a) : juce::Colour(0xff26a69a))
+                                        .withAlpha(0.38f));
+                        g.fillRoundedRectangle(pill.withWidth(fillW).toFloat(), 4.0f);
+                    }
+                }
+                g.setColour(borderCol);
+                g.drawRoundedRectangle(pill.toFloat().reduced(0.5f), 4.0f, 1.0f);
+                g.setColour(dark ? juce::Colour(0xffe0f7fa) : juce::Colour(0xff004d40));
+                g.setFont(juce::FontOptions(10.5f, juce::Font::bold));
+                juce::String pillText;
+                if (isDownloading) {
+                    if (netMdStopRequested.load(std::memory_order_acquire)) {
+                        pillText = "Cancelling...";
+                    } else {
+                        const int pct = static_cast<int>(
+                            std::lround(std::clamp(currentDownloadingRegionProgress(), 0.0, 1.0) *
+                                        100.0));
+                        pillText = "Downloading " + juce::String(pct) +
+                                   juce::String::fromUTF8("%  \xc3\x97");
+                    }
+                } else {
+                    pillText = pill.getWidth() >= 112
+                                   ? juce::String::fromUTF8("\xe2\x86\x93 Download Audio")
+                                   : juce::String::fromUTF8("\xe2\x86\x93 Download");
+                }
+                g.drawText(pillText, pill.reduced(4, 0), juce::Justification::centred, true);
+
+                const auto remaining =
+                    content.getIntersection(visible).withTrimmedLeft(pill.getRight() -
+                                                                     content.getIntersection(visible)
+                                                                         .getX() +
+                                                                     8);
+                if (remaining.getWidth() >= 110 && !isDownloading) {
+                    g.setColour(
+                        (dark ? juce::Colour(0xffb2ebf2) : juce::Colour(0xff004d40))
+                            .withAlpha(0.72f));
+                    g.setFont(juce::FontOptions(10.0f));
+                    g.drawText("On-Disc Audio", remaining.reduced(2, 0),
+                               juce::Justification::centredLeft, true);
+                }
+            } else if (visible.getWidth() > 54 && content.getHeight() > 14) {
                 g.setColour(
                     (dark ? juce::Colour(0xffb2ebf2) : juce::Colour(0xff004d40)).withAlpha(0.85f));
                 g.setFont(juce::FontOptions(10.5f));

@@ -843,6 +843,7 @@ std::string g_lastError;
 std::atomic<bool> g_mockEnabled{false};
 std::atomic<bool> g_simulateRealGuardOnMock{false};
 std::atomic<bool> g_hardwareWriteConfirmed{false};
+std::atomic<bool> g_cancelRequested{false};
 MockDeviceState g_mock;
 bool g_mockInitialized = false;
 
@@ -1926,6 +1927,9 @@ bool isHardwareWriteConfirmed() noexcept {
     return g_hardwareWriteConfirmed.load();
 }
 
+void setNetMdCancelRequested(bool cancelled) noexcept { g_cancelRequested.store(cancelled); }
+bool isNetMdCancelRequested() noexcept { return g_cancelRequested.load(); }
+
 ScopedHardwareWriteConfirmation::ScopedHardwareWriteConfirmation(bool confirm)
     : previous_(g_hardwareWriteConfirmed.exchange(confirm)) {
 }
@@ -2428,28 +2432,52 @@ CARTA_NETMD_HOST_EXPORT void carta_netmd_host_sleep_ms(int ms) {
 
     const int totalMs = std::clamp(ms, 0, 120000);
     if (totalMs >= 5000) {
+        std::string activeOp;
         double baseP = 0.0;
         double endP = 1.0;
+        double curFrac = 0.0;
         {
             std::lock_guard<std::mutex> pLock(carta::g_progressMutex);
-            baseP = carta::g_progress.progress;
-            endP = std::max(baseP, carta::g_progressBase + carta::g_progressSpan);
-            carta::g_progressBase = baseP;
-            carta::g_progressSpan = std::max(0.0, endP - baseP);
+            activeOp = carta::g_progress.operation;
+            if (activeOp == "download") {
+                curFrac = (carta::g_progressSpan > 0.0)
+                              ? std::clamp((carta::g_progress.progress - carta::g_progressBase) /
+                                               carta::g_progressSpan,
+                                           0.0, 1.0)
+                              : 0.0;
+            } else {
+                baseP = carta::g_progress.progress;
+                endP = std::max(baseP, carta::g_progressBase + carta::g_progressSpan);
+                carta::g_progressBase = baseP;
+                carta::g_progressSpan = std::max(0.0, endP - baseP);
+            }
         }
         int elapsed = 0;
         while (elapsed < totalMs) {
+            if (activeOp == "download" && carta::g_cancelRequested.load()) {
+                return;
+            }
             const int remMs = totalMs - elapsed;
             const int remSec = std::max(1, (remMs + 999) / 1000);
-            const double frac = static_cast<double>(elapsed) / static_cast<double>(totalMs);
-            carta::updateNetMdProgressPhase("Committing UTOC to disc (TOCWRT — " +
-                                                std::to_string(remSec) + "s remaining)...",
-                                            frac);
+            if (activeOp == "download") {
+                carta::updateNetMdProgressPhase("Waiting for disc to buffer (" +
+                                                    std::to_string(remSec) + "s)...",
+                                                curFrac);
+            } else {
+                const double frac = static_cast<double>(elapsed) / static_cast<double>(totalMs);
+                carta::updateNetMdProgressPhase("Committing UTOC to disc (TOCWRT — " +
+                                                    std::to_string(remSec) + "s remaining)...",
+                                                frac);
+            }
             const int slice = std::min(250, remMs);
             std::this_thread::sleep_for(std::chrono::milliseconds(slice));
             elapsed += slice;
         }
-        carta::updateNetMdProgressPhase("Committing UTOC to disc (TOCWRT)...", 1.0);
+        if (activeOp == "download") {
+            carta::updateNetMdProgressPhase("Downloading track audio from MiniDisc...", curFrac);
+        } else {
+            carta::updateNetMdProgressPhase("Committing UTOC to disc (TOCWRT)...", 1.0);
+        }
         return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(totalMs));
@@ -2924,9 +2952,186 @@ CARTA_NETMD_HOST_EXPORT int carta_netmd_host_usb_bulk_in(int handle, int endpoin
     return transferred;
 }
 
+namespace {
+std::map<int, FILE*> g_netmdFiles;
+int g_nextNetmdFileId = 1;
+} // namespace
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_file_open(const char* path_ptr, int path_len,
+                                                       int write_mode) {
+    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+    if (!path_ptr || path_len <= 0) {
+        carta::setErrorLocked("Invalid file path for NetMD host file open.");
+        return -1;
+    }
+    const std::string path(path_ptr, static_cast<std::size_t>(path_len));
+    FILE* fp = std::fopen(path.c_str(), write_mode ? "wb" : "rb");
+    if (!fp) {
+        carta::setErrorLocked("Failed opening file '" + path + "': " + std::strerror(errno));
+        return -1;
+    }
+    const int fd = g_nextNetmdFileId++;
+    g_netmdFiles[fd] = fp;
+    return fd;
+}
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_file_write(int fd, const std::uint8_t* data, int len) {
+    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+    auto it = g_netmdFiles.find(fd);
+    if (it == g_netmdFiles.end() || !it->second || len < 0 || (len > 0 && !data)) {
+        carta::setErrorLocked("Invalid file write arguments for NetMD host file.");
+        return -1;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    const std::size_t written = std::fwrite(data, 1, static_cast<std::size_t>(len), it->second);
+    if (written != static_cast<std::size_t>(len)) {
+        carta::setErrorLocked("Short write on NetMD host file.");
+        return -1;
+    }
+    return static_cast<int>(written);
+}
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_file_close(int fd) {
+    std::lock_guard<std::mutex> lock(carta::g_hostMutex);
+    auto it = g_netmdFiles.find(fd);
+    if (it == g_netmdFiles.end()) {
+        return -1;
+    }
+    FILE* fp = it->second;
+    g_netmdFiles.erase(it);
+    if (fp && std::fclose(fp) != 0) {
+        carta::setErrorLocked("Failed closing NetMD host file.");
+        return -1;
+    }
+    return 0;
+}
+
+CARTA_NETMD_HOST_EXPORT int carta_netmd_host_is_cancelled(void) {
+    return carta::g_cancelRequested.load() ? 1 : 0;
+}
+
 CARTA_NETMD_HOST_EXPORT const char* carta_netmd_host_last_error(void) {
     std::lock_guard<std::mutex> lock(carta::g_hostMutex);
     return carta::g_lastError.c_str();
 }
 
 } // extern "C"
+
+namespace carta {
+
+bool exportMockNetMdTrackContainer(int trackIndex, const std::string& outPath,
+                                   std::string& outExtension, std::int64_t& outBytesWritten,
+                                   std::string& error) {
+    error.clear();
+    outExtension.clear();
+    outBytesWritten = 0;
+
+    std::string mode;
+    std::string title;
+    std::vector<std::uint8_t> payload;
+    int unitCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_hostMutex);
+        if (!g_mockEnabled.load()) {
+            error = "Mock NetMD device is not enabled.";
+            return false;
+        }
+        if (trackIndex < 0 || trackIndex >= static_cast<int>(g_mock.uploadedTracks.size())) {
+            error = "Mock NetMD track index out of range: " + std::to_string(trackIndex);
+            return false;
+        }
+        const auto& tr = g_mock.uploadedTracks[static_cast<std::size_t>(trackIndex)];
+        mode = tr.mode;
+        title = tr.halfWidthTitle;
+        payload = tr.decryptedAudioBytes;
+        const std::int64_t spanUnits = tr.endAddr.toLinearGroup() - tr.startAddr.toLinearGroup() + 1;
+        unitCount = spanUnits > 0 ? static_cast<int>(spanUnits) : 11;
+    }
+
+    auto writeU16LE = [](std::vector<std::uint8_t>& buf, std::size_t off, std::uint16_t v) {
+        buf[off] = static_cast<std::uint8_t>(v & 0xFFu);
+        buf[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+    };
+    auto writeU32LE = [](std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t v) {
+        buf[off] = static_cast<std::uint8_t>(v & 0xFFu);
+        buf[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+        buf[off + 2] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);
+        buf[off + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFFu);
+    };
+
+    std::vector<std::uint8_t> out;
+    if (mode == "lp2" || mode == "lp4") {
+        const bool isLp2 = (mode == "lp2");
+        const std::uint16_t blockAlign = isLp2 ? 384u : 192u;
+        const std::uint32_t bytesPerSec = isLp2 ? 16537u : 8268u;
+        if (payload.empty()) {
+            const int frames = std::max(1, unitCount);
+            payload.assign(static_cast<std::size_t>(frames) * blockAlign, 0);
+        }
+        outExtension = "wav";
+        const std::uint32_t dataSize = static_cast<std::uint32_t>(payload.size());
+        const std::uint32_t riffSize = 4u + (8u + 32u) + (8u + dataSize);
+        out.assign(60u + payload.size(), 0);
+        std::memcpy(out.data() + 0, "RIFF", 4);
+        writeU32LE(out, 4, riffSize);
+        std::memcpy(out.data() + 8, "WAVE", 4);
+        std::memcpy(out.data() + 12, "fmt ", 4);
+        writeU32LE(out, 16, 32u);
+        writeU16LE(out, 20, 0x0270u); // WAVE_FORMAT_SONY_SCX (ATRAC3)
+        writeU16LE(out, 22, 2u);
+        writeU32LE(out, 24, 44100u);
+        writeU32LE(out, 28, bytesPerSec);
+        writeU16LE(out, 32, blockAlign);
+        writeU16LE(out, 34, 0u);
+        writeU16LE(out, 36, 14u); // cbSize
+        writeU16LE(out, 38, 1u);
+        writeU32LE(out, 40, 4096u);
+        writeU16LE(out, 44, isLp2 ? 0u : 1u); // joint stereo flag
+        writeU16LE(out, 46, isLp2 ? 0u : 1u);
+        writeU16LE(out, 48, 1u);
+        writeU16LE(out, 50, 0u);
+        std::memcpy(out.data() + 52, "data", 4);
+        writeU32LE(out, 56, dataSize);
+        std::memcpy(out.data() + 60, payload.data(), payload.size());
+    } else {
+        const std::uint8_t channels = (mode == "sp-mono") ? 1u : 2u;
+        const std::size_t frameBytes = static_cast<std::size_t>(channels) * 212u;
+        if (payload.empty()) {
+            const int frames = std::max(1, unitCount / (channels == 2 ? 2 : 1));
+            payload.assign(static_cast<std::size_t>(frames) * frameBytes, 0);
+        }
+        outExtension = "aea";
+        const std::uint32_t soundGroups = static_cast<std::uint32_t>(payload.size() / 212u);
+        out.assign(2048u + payload.size(), 0);
+        out[0] = 0x00;
+        out[1] = 0x08;
+        out[2] = 0x00;
+        out[3] = 0x00;
+        const std::size_t titleLen = std::min<std::size_t>(title.size(), 255u);
+        if (titleLen > 0) {
+            std::memcpy(out.data() + 4, title.data(), titleLen);
+        }
+        writeU32LE(out, 260, soundGroups);
+        out[264] = channels;
+        std::memcpy(out.data() + 2048, payload.data(), payload.size());
+    }
+
+    FILE* fp = std::fopen(outPath.c_str(), "wb");
+    if (!fp) {
+        error = "Failed opening output file '" + outPath + "': " + std::strerror(errno);
+        return false;
+    }
+    const std::size_t written = std::fwrite(out.data(), 1, out.size(), fp);
+    const int closeRc = std::fclose(fp);
+    if (written != out.size() || closeRc != 0) {
+        error = "Failed writing mock NetMD track container to '" + outPath + "'.";
+        return false;
+    }
+    outBytesWritten = static_cast<std::int64_t>(written);
+    setNetMdProgress("download", "Downloaded mock track", 1.0, outBytesWritten, outBytesWritten);
+    return true;
+}
+
+} // namespace carta

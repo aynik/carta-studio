@@ -451,6 +451,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
         juce::String badgeText;
         juce::String statusText;
         bool canLoadDisc = false;
+        bool canDownloadAudio = false;
+        bool downloadingAudio = false;
         bool canReadToc = false;
         bool canDumpTrack = false;
         bool canErase = false;
@@ -484,6 +486,8 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     std::function<void()> onRefreshRecord;
     std::function<void()> onRecordPreflight;
     std::function<void()> onLoadDisc;
+    std::function<void()> onDownloadDiscAudio;
+    std::function<void()> onCancelDownloadAudio;
     std::function<void()> onReadDiscToc;
     std::function<void()> onEraseDisc;
     std::function<void()> onRecordWriteUtoc;
@@ -720,6 +724,7 @@ class MdWorkspace final : public juce::Component, public juce::TooltipClient {
     DeviceTrackListModel deviceTrackModel;
     juce::ListBox deviceTrackList;
     juce::TextButton loadDiscButton{"Load Disc"};
+    juce::TextButton downloadAudioButton{"Download Audio"};
     juce::TextButton readDiscTocButton{"Read Disc TOC..."};
     juce::TextButton eraseDiscButton{"Erase Disc..."};
     juce::Label planCardTitle;

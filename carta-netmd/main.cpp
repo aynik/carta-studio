@@ -29,6 +29,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <csignal>
 #endif
 #include <sstream>
 #include <string>
@@ -45,6 +46,8 @@ int netmd_pf_read_utoc_sectors(const char* device_id_ptr, int device_id_len);
 int netmd_pf_write_utoc_sectors(const char* device_id_ptr, int device_id_len,
                                 const unsigned char* sectors5_ptr, int sectors5_len,
                                 int sectors_mask);
+int netmd_pf_download_track(const char* device_id_ptr, int device_id_len, int track_index,
+                            const char* out_file_ptr, int out_file_len);
 const unsigned char* netmd_pf_output_ptr(void);
 std::size_t netmd_pf_output_len(void);
 const char* netmd_pf_last_error(void);
@@ -368,6 +371,58 @@ int cmdUpload(const std::string& deviceId, int modeCode, const std::string& inPa
     return 0;
 }
 
+int cmdDownloadTrack(const std::string& deviceId, int trackIndex, const std::string& outPath) {
+    if (deviceId.empty() || trackIndex < 0 || outPath.empty()) {
+        emitErrorResult("download-track requires <deviceId>, --track <idx>, and --out <path>");
+        return 1;
+    }
+    if (carta::isNetMdMockDeviceId(deviceId)) {
+        std::string ext;
+        std::int64_t bytesWritten = 0;
+        std::string mockErr;
+        carta::setNetMdProgress("download", "Downloading track from mock NetMD...", 0.0, 0, 1);
+        const bool ok = carta::exportMockNetMdTrackContainer(trackIndex, outPath, ext,
+                                                             bytesWritten, mockErr);
+        carta::clearNetMdProgress();
+        if (!ok) {
+            emitErrorResult(mockErr);
+            return 1;
+        }
+        emitJsonLine("{\"event\":\"result\",\"ok\":true,\"download\":{\"trackIndex\":" +
+                     std::to_string(trackIndex) + ",\"extension\":\"" + jsonEscape(ext) +
+                     "\",\"bytesWritten\":" + std::to_string(bytesWritten) + "}}");
+        return 0;
+    }
+
+    // AtracRecovery only executes temporary RAM read patches and never writes to EEPROM or disc.
+    carta::setNetMdCancelRequested(false);
+#if !defined(_WIN32)
+    auto handleCancelSig = [](int) { carta::setNetMdCancelRequested(true); };
+    auto prevTerm = std::signal(SIGTERM, handleCancelSig);
+    auto prevInt = std::signal(SIGINT, handleCancelSig);
+#endif
+    carta::ScopedHardwareWriteConfirmation guard(true);
+    carta::setNetMdProgressWindow("download", "Downloading track audio from MiniDisc...", 0.0, 1.0,
+                                  0, 1);
+    const int rc = netmd_pf_download_track(deviceId.c_str(), static_cast<int>(deviceId.size()),
+                                           trackIndex, outPath.c_str(),
+                                           static_cast<int>(outPath.size()));
+    carta::clearNetMdProgress();
+#if !defined(_WIN32)
+    std::signal(SIGTERM, prevTerm);
+    std::signal(SIGINT, prevInt);
+#endif
+    carta::setNetMdCancelRequested(false);
+    if (rc < 0) {
+        emitErrorResult(porfforErrorString("Failed downloading track from NetMD device"));
+        return 1;
+    }
+    const std::string raw = copyPorfforOutputString();
+    emitJsonLine("{\"event\":\"result\",\"ok\":true,\"download\":" +
+                 (raw.empty() ? std::string("{}") : raw) + "}");
+    return 0;
+}
+
 int cmdSelftestStack() {
     carta::setMockNetMdEnabled(true);
     carta::resetMockNetMdState();
@@ -547,6 +602,9 @@ int runSessionLoop(bool enableMock) {
         } else if (op == "upload" && tok.size() >= 7) {
             cmdUpload(percentDecode(tok[1]), std::atoi(tok[2].c_str()), percentDecode(tok[3]),
                       percentDecode(tok[4]), percentDecode(tok[5]), tok[6] == "1");
+        } else if (op == "download-track" && tok.size() >= 4) {
+            cmdDownloadTrack(percentDecode(tok[1]), std::atoi(tok[2].c_str()),
+                             percentDecode(tok[3]));
         } else if (op == "mock-reset" && enableMock) {
             carta::resetMockNetMdState();
             emitJsonLine("{\"event\":\"result\",\"ok\":true}");
@@ -592,7 +650,8 @@ void printUsage() {
               << "  carta-netmd write-utoc <device-id> --in <sectors5.bin> [--mask 23] "
                  "[--confirm-hardware]\n"
               << "  carta-netmd upload <device-id> --mode <0..3> --in <wire.bin> [--hw-title T] "
-                 "[--fw-title T] [--confirm-hardware]\n";
+                 "[--fw-title T] [--confirm-hardware]\n"
+              << "  carta-netmd download-track <device-id> --track <idx> --out <path>\n";
 }
 
 } // namespace
@@ -701,6 +760,23 @@ int main(int argc, char** argv) {
             }
         }
         return cmdUpload(argv[2], modeCode, inPath, hwTitle, fwTitle, confirm);
+    }
+    if (cmd == "download-track") {
+        if (argc < 3) {
+            emitErrorResult(
+                "Usage: carta-netmd download-track <device-id> --track <idx> --out <path>");
+            return 2;
+        }
+        int trackIndex = -1;
+        std::string outPath;
+        for (int i = 3; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--track") == 0 && i + 1 < argc) {
+                trackIndex = std::atoi(argv[++i]);
+            } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+                outPath = argv[++i];
+            }
+        }
+        return cmdDownloadTrack(argv[2], trackIndex, outPath);
     }
     if (cmd == "selftest-stack") {
         return cmdSelftestStack();
