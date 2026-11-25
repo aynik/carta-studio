@@ -1271,6 +1271,127 @@ int main() {
                         sess14.mdDisc.loadedDisc.regions[0].audioDownloaded &&
                         carta::mdTrackUsesOnDiscAudio(sess14.mdDisc, sess14.mdDisc.tracks[0]),
                     "14 downloaded Hi-MD clip must have PCM while staying preserved on-disc");
+
+            // 15. Issue #1 regression: splitting a downloaded on-disc Hi-MD track into multiple
+            // tracks must rewrite them as distinct Hi-MD TrackInfo slots with distinct titles,
+            // NOT preserve them as aliases of the single unsplit slot.
+            REQUIRE(carta::resetHiMdTestMockSession(err), "15 mock reset failed: " + err);
+            {
+                constexpr int kBigSamples = 264600; // 6.0 s at 44.1 kHz
+                std::vector<float> bigL, bigR;
+                fillTestTone(kBigSamples, 2, bigL, bigR);
+                carta::Session srcSess{};
+                carta::Track srcTrack;
+                srcTrack.name = "L1";
+                carta::Clip srcClip;
+                srcClip.name = "Big Track";
+                srcClip.start = 0.0;
+                srcClip.duration = static_cast<double>(kBigSamples) / carta::sessionRate;
+                srcClip.audio = std::make_shared<carta::Audio>();
+                srcClip.audio->sampleRate = carta::sessionRate;
+                srcClip.audio->samples.setSize(2, kBigSamples);
+                std::memcpy(srcClip.audio->samples.getWritePointer(0), bigL.data(),
+                            static_cast<std::size_t>(kBigSamples) * sizeof(float));
+                std::memcpy(srcClip.audio->samples.getWritePointer(1), bigR.data(),
+                            static_cast<std::size_t>(kBigSamples) * sizeof(float));
+                srcTrack.clips.push_back(std::move(srcClip));
+                srcSess.tracks.push_back(std::move(srcTrack));
+
+                carta::MdDisc initDisc{};
+                initDisc.medium = carta::MdMedium::himd300;
+                initDisc.defaultCodec = carta::MdCodecMode::hiSp;
+                initDisc.halfWidthTitle = "Issue 1 Disc";
+                carta::MdTrack bigTrk;
+                bigTrk.id = carta::makeMdTrackId();
+                bigTrk.halfWidthTitle = "Full Album";
+                bigTrk.parts = {{0, kBigSamples}};
+                initDisc.tracks.push_back(std::move(bigTrk));
+
+                carta::HiMdRecordResult initRec{};
+                REQUIRE(carta::recordHiMdDisc(srcSess, initDisc, "mock:mz-rh1", true, initRec, err),
+                        "15 initial recordHiMdDisc failed: " + err);
+
+                carta::MdDisc loaded15{};
+                carta::HiMdDeviceStatus st15{};
+                REQUIRE(carta::loadHiMdDiscIntoSession("mock:mz-rh1", loaded15, &st15, err),
+                        "15 loadHiMdDiscIntoSession failed: " + err);
+                carta::Session sess15{};
+                carta::populateLoadedDiscSession(loaded15, sess15);
+                REQUIRE(sess15.mdDisc.tracks.size() == 1u &&
+                            sess15.mdDisc.loadedDisc.regions.size() == 1u,
+                        "15 expected 1 loaded Hi-MD track and region");
+
+                // Split BEFORE downloading audio: recordHiMdDisc must reject unloaded placeholder.
+                const auto& r15 = sess15.mdDisc.loadedDisc.regions[0];
+                const std::int64_t rLen = r15.timelineEndSample - r15.timelineStartSample;
+                const std::int64_t split1 = r15.timelineStartSample + rLen / 3;
+                const std::int64_t split2 = r15.timelineStartSample + (2 * rLen) / 3;
+                REQUIRE(carta::splitMdTrackAtSample(sess15.mdDisc, 0, split1, err),
+                        "15 splitMdTrackAtSample #1 failed: " + err);
+                REQUIRE(carta::splitMdTrackAtSample(sess15.mdDisc, 1, split2, err),
+                        "15 splitMdTrackAtSample #2 failed: " + err);
+                REQUIRE(sess15.mdDisc.tracks.size() == 3u, "15 expected 3 split tracks");
+                sess15.mdDisc.tracks[0].halfWidthTitle = "Track A";
+                sess15.mdDisc.tracks[1].halfWidthTitle = "Track B";
+                sess15.mdDisc.tracks[2].halfWidthTitle = "Track C";
+
+                const auto pre15 = carta::preflightHiMdRecording(sess15.mdDisc, &st15);
+                REQUIRE(pre15.valid && pre15.preservedOnDiscTracks == 0 &&
+                            pre15.newUniqueAudioTracks == 3,
+                        "15 preflight must classify 3 split tracks as 3 new uploads, 0 preserved: " +
+                            pre15.error);
+
+                carta::HiMdRecordResult idxFail{};
+                REQUIRE(!carta::writeHiMdIndex(sess15.mdDisc, "mock:mz-rh1", true, idxFail, err),
+                        "15 writeHiMdIndex must reject split on-disc Hi-MD tracks");
+
+                carta::HiMdRecordResult phFail{};
+                REQUIRE(!carta::recordHiMdDisc(sess15, sess15.mdDisc, "mock:mz-rh1", true, phFail,
+                                               err),
+                        "15 recordHiMdDisc must reject split tracks whose audio is not downloaded");
+
+                // Now download & apply PCM audio onto the timeline, then Record Hi-MD.
+                const juce::File tmp15 =
+                    juce::File::getSpecialLocation(juce::File::tempDirectory)
+                        .getChildFile("carta_himd_15_" +
+                                      juce::String(juce::Time::getHighResolutionTicks()) + ".raw");
+                REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", 0, tmp15.getFullPathName().toStdString(),
+                                             /*rawAudio=*/true, err),
+                        "15 dumpHiMdTrack failed: " + err);
+                juce::MemoryBlock raw15;
+                REQUIRE(tmp15.loadFileAsData(raw15) && raw15.getSize() > 0,
+                        "15 dumped Hi-MD track must be non-empty");
+                tmp15.deleteFile();
+
+                std::vector<float> dec15L, dec15R;
+                int dec15Ch = 0;
+                REQUIRE(carta::decodeRawAtracPayload(
+                            carta::mdCodecModeToString(r15.codec),
+                            static_cast<const std::uint8_t*>(raw15.getData()), raw15.getSize(),
+                            dec15L, dec15R, dec15Ch, err),
+                        "15 decodeRawAtracPayload failed: " + err);
+                std::shared_ptr<carta::Audio> decoded15;
+                REQUIRE(carta::createDecodedOnDiscAudioSource(
+                            "Full Album", dec15L.data(), dec15R.data(), 2,
+                            static_cast<int>(dec15L.size()), static_cast<int>(rLen), decoded15, err),
+                        "15 createDecodedOnDiscAudioSource failed: " + err);
+                REQUIRE(carta::applyDownloadedOnDiscRegionAudio(sess15, r15.id, decoded15),
+                        "15 applyDownloadedOnDiscRegionAudio failed");
+
+                carta::HiMdRecordResult splitRec{};
+                REQUIRE(carta::recordHiMdDisc(sess15, sess15.mdDisc, "mock:mz-rh1", true, splitRec,
+                                              err),
+                        "15 recordHiMdDisc for split tracks failed: " + err);
+
+                carta::HiMdDeviceStatus after15{};
+                REQUIRE(carta::probeHiMdDevice("mock:mz-rh1", after15, err),
+                        "15 probeHiMdDevice after split failed: " + err);
+                REQUIRE(after15.trackCount == 3 && after15.tracks.size() == 3u &&
+                            after15.tracks[0].title == "Track A" &&
+                            after15.tracks[1].title == "Track B" &&
+                            after15.tracks[2].title == "Track C",
+                        "15 Hi-MD device must have 3 distinct split tracks with distinct titles");
+            }
         }
     }
 

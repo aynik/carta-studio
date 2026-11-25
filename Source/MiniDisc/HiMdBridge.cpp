@@ -1626,32 +1626,62 @@ std::string extractExpectedHiMdDiscId(const MdDisc& disc) {
                : disc.loadedDisc.baselineSector0Hash.substr(0, colonPos);
 }
 
-int resolveOnDiscHiMdSlot(const MdDisc& disc, const MdTrack& track) {
-    if (!disc.loadedDisc.active || track.parts.empty()) {
-        return 0;
-    }
-    if (track.parts.size() == 1u) {
-        const int rIdx = findMdOnDiscRegionForPart(disc.loadedDisc, track.parts.front());
-        if (rIdx >= 0 && rIdx < static_cast<int>(disc.loadedDisc.regions.size())) {
-            const int slot = disc.loadedDisc.regions[static_cast<std::size_t>(rIdx)].hiMdSlot;
-            if (slot > 0) {
-                return slot;
+bool trackIntersectsUnloadedPlaceholder(const Session& session, const MdTrack& track) {
+    for (const auto& part : track.parts) {
+        if (part.endSample <= part.startSample) {
+            continue;
+        }
+        for (const auto& tr : session.tracks) {
+            for (const auto& clip : tr.clips) {
+                if (!clip.audio || !clip.audio->onDiscPlaceholder) {
+                    continue;
+                }
+                const auto cStart =
+                    static_cast<std::int64_t>(std::llround(clip.start * sessionRate));
+                const auto cEnd = static_cast<std::int64_t>(
+                    std::llround((clip.start + clip.duration) * sessionRate));
+                if (cEnd > part.startSample && cStart < part.endSample) {
+                    return true;
+                }
             }
         }
     }
-    static constexpr const char* kSlotPrefix = "himd-slot-";
-    const std::size_t prefixLen = std::strlen(kSlotPrefix);
-    if (track.audioId.rfind(kSlotPrefix, 0) == 0 && track.audioId.size() > prefixLen) {
-        const std::string suffix = track.audioId.substr(prefixLen);
-        char* endp = nullptr;
-        const long parsed = std::strtol(suffix.c_str(), &endp, 10);
-        if (endp != suffix.c_str() && *endp == '\0' && parsed >= 1 &&
-            parsed <= kHiMdMaxAudioSlots) {
-            return static_cast<int>(parsed);
-        }
-    }
-    return 0;
+    return false;
 }
+
+} // namespace
+
+bool isHiMdTrackPreservedInPlace(const MdDisc& disc, const MdTrack& track, int* outSlot) {
+    if (outSlot) {
+        *outSlot = 0;
+    }
+    if (!disc.loadedDisc.active || track.parts.size() != 1u) {
+        return false;
+    }
+    const auto& part = track.parts.front();
+    const int rIdx = findMdOnDiscRegionForPart(disc.loadedDisc, part);
+    if (rIdx < 0 || rIdx >= static_cast<int>(disc.loadedDisc.regions.size())) {
+        return false;
+    }
+    const auto& reg = disc.loadedDisc.regions[static_cast<std::size_t>(rIdx)];
+    if (reg.hiMdSlot <= 0) {
+        return false;
+    }
+    // Hi-MD TrackInfo slots are encrypted per-slot with hardware MACs; a slot can only be
+    // preserved in-place when the track covers the exact original region span and codec.
+    if (part.startSample != reg.timelineStartSample || part.endSample != reg.timelineEndSample) {
+        return false;
+    }
+    if (effectiveTrackCodec(disc, track) != reg.codec) {
+        return false;
+    }
+    if (outSlot) {
+        *outSlot = reg.hiMdSlot;
+    }
+    return true;
+}
+
+namespace {
 
 struct HiMdBatchUploadManifestItem {
     std::string id;
@@ -1950,6 +1980,7 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
     }
 
     std::set<std::string> seenNewAudioKeys;
+    std::set<int> preservedSlots;
     std::int64_t newAudioBytes = 0;
     for (std::size_t i = 0; i < disc.tracks.size(); ++i) {
         const auto& tr = disc.tracks[i];
@@ -1961,13 +1992,29 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
                            "PCM).";
             return report;
         }
-        if (disc.loadedDisc.active && mdTrackUsesOnDiscAudio(disc, tr)) {
+        int preservedSlot = 0;
+        if (isHiMdTrackPreservedInPlace(disc, tr, &preservedSlot)) {
             ++report.preservedOnDiscTracks;
+            preservedSlots.insert(preservedSlot);
         } else {
             const std::string key = effectiveMdAudioId(tr);
             if (seenNewAudioKeys.insert(key).second) {
                 ++report.newUniqueAudioTracks;
                 newAudioBytes += estimateHiMdTrackBytes(codec, tr.totalSamples());
+            }
+        }
+    }
+
+    // commit-batch frees unreferenced on-disc slots in ATDATA01.HMA before writing new uploads.
+    std::int64_t reclaimedOnDiscBytes = 0;
+    if (disc.loadedDisc.active) {
+        std::set<int> countedReclaimedSlots;
+        for (const auto& reg : disc.loadedDisc.regions) {
+            if (reg.hiMdSlot > 0 && !preservedSlots.count(reg.hiMdSlot) &&
+                countedReclaimedSlots.insert(reg.hiMdSlot).second) {
+                const std::int64_t regSamples =
+                    std::max<std::int64_t>(0, reg.timelineEndSample - reg.timelineStartSample);
+                reclaimedOnDiscBytes += estimateHiMdTrackBytes(reg.codec, regSamples);
             }
         }
     }
@@ -2009,10 +2056,12 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
                                ? deviceStatus->fsFreeBytes
                                : report.discTotalBytes;
 
-    if (report.requiredBytes > report.discFreeBytes) {
+    const std::int64_t effectiveFreeBytes =
+        std::min(report.discTotalBytes, report.discFreeBytes + reclaimedOnDiscBytes);
+    if (report.requiredBytes > effectiveFreeBytes) {
         report.error = "Hi-MD disc does not have enough free space (need " +
                        std::to_string(report.requiredBytes) + " bytes, available " +
-                       std::to_string(report.discFreeBytes) + " bytes).";
+                       std::to_string(effectiveFreeBytes) + " bytes).";
         return report;
     }
 
@@ -2119,27 +2168,28 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
 
     for (std::size_t idx = 0; idx < disc.tracks.size(); ++idx) {
         const auto& trk = disc.tracks[idx];
-        if (disc.loadedDisc.active && mdTrackUsesOnDiscAudio(disc, trk)) {
-            const int slot = resolveOnDiscHiMdSlot(disc, trk);
-            if (slot <= 0) {
-                error = "Track " + std::to_string(idx + 1) +
-                        " references on-disc audio without a Hi-MD TrackInfo slot; reload the "
-                        "Hi-MD disc.";
-                return false;
-            }
-            if (!keptSlotMetaMap.count(slot)) {
+        int preservedSlot = 0;
+        if (isHiMdTrackPreservedInPlace(disc, trk, &preservedSlot)) {
+            if (!keptSlotMetaMap.count(preservedSlot)) {
                 HiMdBatchSlotMetaItem sm;
-                sm.slot = slot;
+                sm.slot = preservedSlot;
                 sm.title = preferredTrackTitle(trk);
                 sm.artist = trk.artist;
                 sm.album = trk.album;
-                keptSlotMetaMap.emplace(slot, std::move(sm));
+                keptSlotMetaMap.emplace(preservedSlot, std::move(sm));
             }
             HiMdBatchPlayOrderEntry po;
-            po.existingSlot = slot;
+            po.existingSlot = preservedSlot;
             playOrderEntries.push_back(std::move(po));
             poKeyByTrack.emplace_back();
             continue;
+        }
+
+        if (trackIntersectsUnloadedPlaceholder(session, trk)) {
+            error = "Track " + std::to_string(idx + 1) +
+                    " is a split, trimmed, or re-encoded section of on-disc Hi-MD audio that has "
+                    "not been downloaded yet. Download its audio first before recording.";
+            return false;
         }
 
         const std::int64_t totalTrackSamples = trk.totalSamples();
@@ -2455,16 +2505,17 @@ bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confir
 
     for (std::size_t idx = 0; idx < disc.tracks.size(); ++idx) {
         const auto& trk = disc.tracks[idx];
-        if (!mdTrackUsesOnDiscAudio(disc, trk)) {
-            error = "Hi-MD Write Index Only cannot upload new local audio on track " +
-                    std::to_string(idx + 1) + "; use Record Hi-MD instead.";
-            return false;
-        }
-        const int slot = resolveOnDiscHiMdSlot(disc, trk);
-        if (slot <= 0) {
-            error = "Track " + std::to_string(idx + 1) +
-                    " references on-disc audio without a Hi-MD TrackInfo slot; reload the Hi-MD "
-                    "disc.";
+        int slot = 0;
+        if (!isHiMdTrackPreservedInPlace(disc, trk, &slot)) {
+            if (mdTrackUsesOnDiscAudio(disc, trk)) {
+                error = "Track " + std::to_string(idx + 1) +
+                        " is split, trimmed, or re-encoded from its original on-disc Hi-MD track; "
+                        "use Record Hi-MD (after downloading its audio) instead of Write Index "
+                        "Only.";
+            } else {
+                error = "Hi-MD Write Index Only cannot upload new local audio on track " +
+                        std::to_string(idx + 1) + "; use Record Hi-MD instead.";
+            }
             return false;
         }
         if (!keptSlotMetaMap.count(slot)) {

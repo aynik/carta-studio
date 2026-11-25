@@ -228,6 +228,13 @@ bool deleteHiMdTracks(const std::string& deviceId, const std::vector<int>& track
 bool wipeHiMdDisc(const std::string& deviceId, bool reformat, bool confirmHardware,
                   std::string& error);
 
+/**
+ * Returns true when `track` maps 1:1 to an unmodified, unsplit, un-reencoded on-disc Hi-MD
+ * `TrackInfo` slot (exact full-region span and matching codec) that can be preserved in-place
+ * without re-uploading audio. Optionally writes the 1-based slot number to `outSlot`.
+ */
+bool isHiMdTrackPreservedInPlace(const MdDisc& disc, const MdTrack& track, int* outSlot = nullptr);
+
 /** Probes `deviceId` and populates `outDisc` (`loadedDisc.active = true`, tracks, metadata, groups). */
 bool loadHiMdDiscIntoSession(const std::string& deviceId, MdDisc& outDisc,
                              HiMdDeviceStatus* outStatus, std::string& error);
