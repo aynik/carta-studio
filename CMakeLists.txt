@@ -287,6 +287,7 @@ if(APPLE)
         VERBATIM)
 elseif(WIN32)
     target_link_libraries(CartaStudio PRIVATE shell32)
+    target_sources(CartaStudio PRIVATE Source/Platform/NativePopupMenu_win.cpp)
     add_custom_command(TARGET CartaStudio POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:carta-netmd>"

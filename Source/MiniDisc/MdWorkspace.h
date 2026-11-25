@@ -25,6 +25,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "Editing/Editing.h"
 #include "MiniDisc/MdAuthoring.h"
+#include "Studio/StudioTheme.h"
 #include "MiniDisc/NetMdBridge.h"
 #include "MiniDisc/HiMdBridge.h"
 #include "Core/Session.h"
@@ -114,33 +115,12 @@ inline juce::String codecLongLabel(MdCodecMode mode) {
 
 /** Returns theme-aware accent colour for `mode`. */
 inline juce::Colour codecColour(MdCodecMode mode, bool dark) {
-    switch (mode) {
-    case MdCodecMode::spStereo:
-        return dark ? juce::Colour(0xff2d8f8b) : juce::Colour(0xff0f766e);
-    case MdCodecMode::spMono:
-        return dark ? juce::Colour(0xff5b70d6) : juce::Colour(0xff3b4cca);
-    case MdCodecMode::lp2:
-        return dark ? juce::Colour(0xffcf872c) : juce::Colour(0xffb45309);
-    case MdCodecMode::lp4:
-        return dark ? juce::Colour(0xffcc5959) : juce::Colour(0xffbe123c);
-    case MdCodecMode::hiSp:
-        return dark ? juce::Colour(0xff2c82c9) : juce::Colour(0xff1d4ed8);
-    case MdCodecMode::hiLp:
-        return dark ? juce::Colour(0xff8e5bd6) : juce::Colour(0xff6d28d9);
-    case MdCodecMode::pcm:
-        return dark ? juce::Colour(0xff3ba55d) : juce::Colour(0xff15803d);
-    }
-    return juce::Colour(0xff0f766e);
+    return carta::theme::codecColour(mode, dark);
 }
 
 /** Returns rotating 8-colour group accent palette entry for `groupIndex`. */
 inline juce::Colour groupColour(int groupIndex, bool dark) {
-    static constexpr juce::uint32 darkPalette[] = {0xff3b82f6, 0xff10b981, 0xfff59e0b, 0xffec4899,
-                                                   0xff8b5cf6, 0xff06b6d4, 0xfff97316, 0xff84cc16};
-    static constexpr juce::uint32 lightPalette[] = {0xff1d4ed8, 0xff047857, 0xffb45309, 0xffbe185d,
-                                                    0xff6d28d9, 0xff0e7490, 0xffc2410c, 0xff4d7c0f};
-    const int slot = ((groupIndex % 8) + 8) % 8;
-    return juce::Colour(dark ? darkPalette[slot] : lightPalette[slot]);
+    return carta::theme::groupColour(groupIndex, dark);
 }
 
 /** Maps `MdCodecMode` to 1-based JUCE ComboBox/PopupMenu item ID. */

@@ -226,3 +226,115 @@ void showNativeSavePrompt(juce::Component* component, std::function<void(int)> c
 }
 
 } // namespace carta
+
+@interface CartaNativeMenuTarget : NSObject
+@property(nonatomic, assign) int chosenId;
+- (void)itemPicked:(NSMenuItem*)sender;
+@end
+
+@implementation CartaNativeMenuTarget
+- (void)itemPicked:(NSMenuItem*)sender {
+    self.chosenId = static_cast<int>([sender tag]);
+}
+@end
+
+namespace carta {
+namespace {
+
+NSMenu* buildNativeMenuFromJuce(const juce::PopupMenu& source, CartaNativeMenuTarget* target) {
+    NSMenu* nsMenu = [[NSMenu alloc] initWithTitle:@""];
+    [nsMenu setAutoenablesItems:NO];
+
+    juce::PopupMenu::MenuItemIterator it(source);
+    bool lastWasSeparator = true;
+    while (it.next()) {
+        const auto& item = it.getItem();
+        if (item.isSeparator) {
+            if (!lastWasSeparator) {
+                [nsMenu addItem:[NSMenuItem separatorItem]];
+                lastWasSeparator = true;
+            }
+            continue;
+        }
+        if (item.isSectionHeader) {
+            NSMenuItem* hdr = [[NSMenuItem alloc] initWithTitle:nativeString(item.text)
+                                                         action:nil
+                                                  keyEquivalent:@""];
+            [hdr setEnabled:NO];
+            [nsMenu addItem:hdr];
+#if !__has_feature(objc_arc)
+            [hdr release];
+#endif
+            lastWasSeparator = false;
+            continue;
+        }
+        if (item.subMenu != nullptr) {
+            NSMenuItem* subItem = [[NSMenuItem alloc] initWithTitle:nativeString(item.text)
+                                                             action:nil
+                                                      keyEquivalent:@""];
+            [subItem setEnabled:item.isEnabled ? YES : NO];
+            NSMenu* child = buildNativeMenuFromJuce(*item.subMenu, target);
+            [subItem setSubmenu:child];
+            [nsMenu addItem:subItem];
+#if !__has_feature(objc_arc)
+            [child release];
+            [subItem release];
+#endif
+            lastWasSeparator = false;
+            continue;
+        }
+
+        NSMenuItem* mi = [[NSMenuItem alloc] initWithTitle:nativeString(item.text)
+                                                    action:@selector(itemPicked:)
+                                             keyEquivalent:@""];
+        [mi setTarget:target];
+        [mi setTag:static_cast<NSInteger>(item.itemID)];
+        [mi setEnabled:(item.isEnabled && item.itemID != 0) ? YES : NO];
+        [mi setState:item.isTicked ? NSControlStateValueOn : NSControlStateValueOff];
+        [nsMenu addItem:mi];
+#if !__has_feature(objc_arc)
+        [mi release];
+#endif
+        lastWasSeparator = false;
+    }
+
+    // Trim any trailing separator.
+    while ([nsMenu numberOfItems] > 0 && [[nsMenu itemAtIndex:[nsMenu numberOfItems] - 1] isSeparatorItem]) {
+        [nsMenu removeItemAtIndex:[nsMenu numberOfItems] - 1];
+    }
+    return nsMenu;
+}
+
+} // namespace
+
+bool showNativePopupMenu(const juce::PopupMenu& menu, juce::Component* target,
+                         juce::Point<int> screenPos, std::function<void(int)> callback) {
+    auto* top = target != nullptr ? target->getTopLevelComponent() : nullptr;
+    auto* peer = top != nullptr ? top->getPeer() : nullptr;
+    auto* view = peer != nullptr ? static_cast<NSView*>(peer->getNativeHandle()) : nil;
+    if (view == nil || [view window] == nil) {
+        return false;
+    }
+
+    const auto local = top->getLocalPoint(nullptr, screenPos);
+    const NSPoint pt = NSMakePoint(static_cast<CGFloat>(local.x), static_cast<CGFloat>(local.y));
+
+    CartaNativeMenuTarget* menuTarget = [[CartaNativeMenuTarget alloc] init];
+    menuTarget.chosenId = 0;
+    NSMenu* nsMenu = buildNativeMenuFromJuce(menu, menuTarget);
+
+    [nsMenu popUpMenuPositioningItem:nil atLocation:pt inView:view];
+    const int chosen = menuTarget.chosenId;
+
+#if !__has_feature(objc_arc)
+    [nsMenu release];
+    [menuTarget release];
+#endif
+
+    if (callback) {
+        juce::MessageManager::callAsync([cb = std::move(callback), chosen]() mutable { cb(chosen); });
+    }
+    return true;
+}
+
+} // namespace carta

@@ -362,4 +362,121 @@ bool showGtkFileChooser(juce::Component* parent, const juce::String& title,
     return true;
 }
 
+namespace {
+
+class GtkPopupMenuHost final : private juce::Timer {
+  public:
+    GtkPopupMenuHost(GtkWidget* m, std::function<void(int)> cb)
+        : menu(m), done(std::move(cb)) {
+        g_signal_connect(menu, "deactivate", G_CALLBACK(onDeactivate), this);
+        startTimer(10);
+    }
+
+    void itemActivated(int id) { chosenId = id; }
+
+  private:
+    static void onDeactivate(GtkMenuShell*, gpointer ctx) {
+        static_cast<GtkPopupMenuHost*>(ctx)->finish();
+    }
+
+    void timerCallback() override {
+        for (int i = 0; i < 32 && !finished && g_main_context_pending(nullptr); ++i) {
+            g_main_context_iteration(nullptr, FALSE);
+        }
+    }
+
+    void finish() {
+        if (finished) {
+            return;
+        }
+        finished = true;
+        stopTimer();
+        auto* display = gtk_widget_get_display(menu);
+        gtk_widget_destroy(menu);
+        menu = nullptr;
+        if (display) {
+            gdk_display_flush(display);
+        }
+        const int result = chosenId;
+        auto cb = std::move(done);
+        juce::MessageManager::callAsync([this, deliver = std::move(cb), result]() mutable {
+            if (deliver) {
+                deliver(result);
+            }
+            delete this;
+        });
+    }
+
+    GtkWidget* menu = nullptr;
+    std::function<void(int)> done;
+    int chosenId = 0;
+    bool finished = false;
+};
+
+void populateGtkMenu(GtkWidget* gtkMenu, const juce::PopupMenu& source, GtkPopupMenuHost* host) {
+    juce::PopupMenu::MenuItemIterator it(source);
+    bool lastWasSeparator = true;
+    while (it.next()) {
+        const auto& item = it.getItem();
+        if (item.isSeparator) {
+            if (!lastWasSeparator) {
+                gtk_menu_shell_append(GTK_MENU_SHELL(gtkMenu), gtk_separator_menu_item_new());
+                lastWasSeparator = true;
+            }
+            continue;
+        }
+        if (item.isSectionHeader) {
+            GtkWidget* hdr = gtk_menu_item_new_with_label(item.text.toRawUTF8());
+            gtk_widget_set_sensitive(hdr, FALSE);
+            gtk_menu_shell_append(GTK_MENU_SHELL(gtkMenu), hdr);
+            lastWasSeparator = false;
+            continue;
+        }
+        if (item.subMenu != nullptr) {
+            GtkWidget* subItem = gtk_menu_item_new_with_label(item.text.toRawUTF8());
+            gtk_widget_set_sensitive(subItem, item.isEnabled ? TRUE : FALSE);
+            GtkWidget* childMenu = gtk_menu_new();
+            populateGtkMenu(childMenu, *item.subMenu, host);
+            gtk_menu_item_set_submenu(GTK_MENU_ITEM(subItem), childMenu);
+            gtk_menu_shell_append(GTK_MENU_SHELL(gtkMenu), subItem);
+            lastWasSeparator = false;
+            continue;
+        }
+
+        GtkWidget* mi = item.isTicked ? gtk_check_menu_item_new_with_label(item.text.toRawUTF8())
+                                      : gtk_menu_item_new_with_label(item.text.toRawUTF8());
+        if (item.isTicked) {
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi), TRUE);
+        }
+        gtk_widget_set_sensitive(mi, (item.isEnabled && item.itemID != 0) ? TRUE : FALSE);
+        g_object_set_data(G_OBJECT(mi), "carta-item-id",
+                          GINT_TO_POINTER(static_cast<gint>(item.itemID)));
+        g_signal_connect(
+            mi, "activate",
+            G_CALLBACK(+[](GtkMenuItem* w, gpointer ctx) {
+                const int id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "carta-item-id"));
+                static_cast<GtkPopupMenuHost*>(ctx)->itemActivated(id);
+            }),
+            host);
+        gtk_menu_shell_append(GTK_MENU_SHELL(gtkMenu), mi);
+        lastWasSeparator = false;
+    }
+}
+
+} // namespace
+
+bool showNativePopupMenu(const juce::PopupMenu& menu, juce::Component* target,
+                         juce::Point<int>, std::function<void(int)> callback) {
+    GdkWindow* foreign = gtkParent(target);
+    if (!foreign) {
+        return false;
+    }
+    GtkWidget* gtkMenu = gtk_menu_new();
+    auto* host = new GtkPopupMenuHost(gtkMenu, std::move(callback));
+    populateGtkMenu(gtkMenu, menu, host);
+    gtk_widget_show_all(gtkMenu);
+    gtk_menu_popup_at_pointer(GTK_MENU(gtkMenu), nullptr);
+    return true;
+}
+
 } // namespace carta

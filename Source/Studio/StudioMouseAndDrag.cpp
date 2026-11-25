@@ -252,14 +252,6 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
                         stackedMenu);
         menu.addSeparator();
     }
-    menu.addItem(MdRibbonMenuId::splitHere, "Split Track Here", canSplitHere);
-    menu.addItem(MdRibbonMenuId::splitPlayhead, "Split Track at Playhead", canSplitPlayhead);
-    menu.addItem(MdRibbonMenuId::merge,
-                 info.gesture == MdRibbonGesture::sharedSplit ? "Merge Split"
-                                                              : "Merge with Next Track",
-                 canMerge);
-    menu.addItem(MdRibbonMenuId::duplicateShared, "Insert Play Order Alias", hasTrack);
-    menu.addItem(MdRibbonMenuId::makeUnique, "Make Unique (Detach Alias)", isAliased);
     const int gapTargetIdx =
         (info.gesture == MdRibbonGesture::sharedSplit && info.rightTrackIndex >= 0 &&
          info.rightTrackIndex < static_cast<int>(session.mdDisc.tracks.size()))
@@ -272,32 +264,44 @@ void Studio::showMdRibbonContextMenu(const juce::MouseEvent& event,
     const bool currentlyForcedGap =
         canToggleForceGap &&
         session.mdDisc.tracks[static_cast<size_t>(gapTargetIdx)].forceGapBefore;
-    if (canToggleForceGap) {
-        menu.addItem(MdRibbonMenuId::toggleForceGap, "Force Gapped Break Here", true,
-                     currentlyForcedGap);
-    }
     const bool isOnDiscRibbonTrack =
         hasTrack && session.mdDisc.loadedDisc.active &&
         carta::mdTrackUsesOnDiscAudio(
             session.mdDisc, session.mdDisc.tracks[static_cast<size_t>(info.trackIndex)]);
+
     if (isOnDiscRibbonTrack) {
         menu.addItem(MdRibbonMenuId::downloadTrackAudio,
-                     "Download Track " + juce::String(info.trackIndex + 1) + " Audio from Disc",
+                     "Download Track " + juce::String(info.trackIndex + 1) + " Audio",
                      !netMdBusy.load() && !hiMdBusy.load());
+        menu.addSeparator();
     }
+    menu.addItem(MdRibbonMenuId::splitHere, "Split Track Here", canSplitHere);
+    menu.addItem(MdRibbonMenuId::splitPlayhead, "Split at Playhead", canSplitPlayhead);
+    menu.addItem(MdRibbonMenuId::merge,
+                 info.gesture == MdRibbonGesture::sharedSplit ? "Merge Split"
+                                                              : "Merge with Next Track",
+                 canMerge);
+    menu.addItem(MdRibbonMenuId::renameTrack, "Rename Track...", hasTrack);
     menu.addSeparator();
     menu.addItem(MdRibbonMenuId::auditionTrack, "Audition Track", hasTrack);
     menu.addItem(MdRibbonMenuId::auditionFromHere, "Audition from Here", hasTrack);
     menu.addSeparator();
-    menu.addItem(MdRibbonMenuId::renameTrack, "Rename Track...", hasTrack);
-    menu.addItem(MdRibbonMenuId::removeTrack, "Remove Track", hasTrack);
+    menu.addItem(MdRibbonMenuId::duplicateShared, "Insert Alias", hasTrack);
+    if (isAliased) {
+        menu.addItem(MdRibbonMenuId::makeUnique, "Make Unique");
+    }
+    if (canToggleForceGap) {
+        menu.addItem(MdRibbonMenuId::toggleForceGap, "Force Gapped Break", true,
+                     currentlyForcedGap);
+    }
     menu.addSeparator();
-    menu.addItem(MdRibbonMenuId::syncFromClips, "Tracks from Clips", session.length() > 0);
+    menu.addItem(MdRibbonMenuId::removeTrack, "Remove Track", hasTrack);
 
     const auto revision = editGeneration;
     const int trackIdx = info.trackIndex;
     const auto trackId = info.trackId;
-    menu.showMenuAsync(
+    showStudioPopupMenu(
+        menu,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), revision, trackIdx, trackId,

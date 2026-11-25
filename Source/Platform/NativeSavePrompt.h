@@ -14,6 +14,8 @@
 namespace juce {
 class Component;
 class MessageBoxOptions;
+class PopupMenu;
+template <typename ValueType> class Point;
 } // namespace juce
 
 namespace carta {
@@ -86,5 +88,16 @@ bool showGtkAlert(const juce::MessageBoxOptions&, std::function<void(int)>);
 bool showGtkFileChooser(juce::Component*, const juce::String& title, const juce::File& initial,
                         const juce::String& filters, int flags,
                         std::function<void(juce::Array<juce::File>)>);
+
+/**
+ * Present a platform-native popup menu (AppKit `NSMenu` on macOS, GTK3 `GtkMenu` on Linux,
+ * Win32 `HMENU` on Windows) populated from `menu` at `screenPos`.
+ *
+ * Returns `true` when presented natively (callback is invoked asynchronously with the
+ * selected item ID or `0` on dismissal); returns `false` without invoking the callback
+ * when no native window peer or backend is available so the caller can fall back to JUCE.
+ */
+bool showNativePopupMenu(const juce::PopupMenu& menu, juce::Component* target,
+                         juce::Point<int> screenPos, std::function<void(int)> callback);
 
 } // namespace carta

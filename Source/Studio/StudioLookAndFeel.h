@@ -14,6 +14,7 @@
 #include "Core/Session.h"
 #include "IO/SessionIO.h"
 #include "Platform/NativeSavePrompt.h"
+#include "Studio/StudioTheme.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <atomic>
 #include <cstdint>
@@ -136,25 +137,177 @@ struct StudioFileSelection {
     const juce::Array<juce::File>& getResults() const { return files; }
 };
 
+inline void showStudioPopupMenu(juce::PopupMenu& menu, const juce::PopupMenu::Options& options,
+                                std::function<void(int)> callback) {
+#if !CARTA_STUDIO_COMPONENT_TEST && (JUCE_MAC || JUCE_WINDOWS || (JUCE_LINUX && CARTA_STUDIO_GTK_PROMPTS))
+    auto* target = options.getTargetComponent();
+    if (target == nullptr) {
+        target = options.getParentComponent();
+    }
+    const auto area = options.getTargetScreenArea();
+    const juce::Point<int> screenPos =
+        !area.isEmpty() ? juce::Point<int>(area.getX(), area.getBottom())
+                        : juce::Desktop::getInstance().getMainMouseSource().getScreenPosition().roundToInt();
+    if (target != nullptr && carta::showNativePopupMenu(menu, target, screenPos, callback)) {
+        return;
+    }
+#endif
+    menu.showMenuAsync(options, std::move(callback));
+}
+
 /**
- * @brief Neutral monochrome `LookAndFeel_V4` customization supporting dark and light modes.
+ * @brief Neutral monochrome `LookAndFeel_V4` customization supporting dark and light modes,
+ * with explicit visual grammar for push buttons, primary CTAs, destructive actions,
+ * toolbar controls, tabs, and segmented controls.
  */
 struct StudioNeutralLook final : juce::LookAndFeel_V4 {
     void drawButtonBackground(juce::Graphics& g, juce::Button& button, const juce::Colour&,
                               bool over, bool down) override {
         const bool dark = juce::Desktop::getInstance().isDarkModeActive();
-        if (over || down || button.getToggleState()) {
-            g.setColour(dark ? juce::Colour(0xff404040) : juce::Colour(0xffd2d2d2));
-            g.fillRoundedRectangle(button.getLocalBounds().toFloat().reduced(1), 3);
+        const auto pal = carta::theme::palette(dark);
+        const auto bounds = button.getLocalBounds().toFloat().reduced(0.5f);
+        const auto role = button.getProperties()[carta::theme::kButtonRoleProp].toString();
+        const bool active = carta::theme::isButtonActive(button);
+        const bool enabled = button.isEnabled();
+        const float alpha = enabled ? 1.0f : 0.42f;
+
+        if (role == carta::theme::kRoleTab) {
+            if (over && enabled && !active) {
+                g.setColour(pal.controlHoverBg.withAlpha(0.55f));
+                g.fillRoundedRectangle(bounds.reduced(1.0f, 2.0f), 4.0f);
+            }
+            if (active) {
+                g.setColour(pal.accentBg.withAlpha(alpha));
+                g.fillRoundedRectangle(
+                    juce::Rectangle<float>(bounds.getX() + 4.0f, bounds.getBottom() - 2.5f,
+                                           std::max(0.0f, bounds.getWidth() - 8.0f), 2.5f),
+                    1.25f);
+            }
+            return;
+        }
+
+        if (role == carta::theme::kRoleSegment) {
+            const auto segBounds = bounds.reduced(1.5f);
+            if (active) {
+                g.setColour(pal.controlBg.withAlpha(alpha));
+                g.fillRoundedRectangle(segBounds, 4.0f);
+                g.setColour(pal.controlBorder.withAlpha(alpha));
+                g.drawRoundedRectangle(segBounds, 4.0f, 1.0f);
+            } else if (over && enabled) {
+                g.setColour(pal.controlHoverBg.withAlpha(0.45f));
+                g.fillRoundedRectangle(segBounds, 4.0f);
+            }
+            return;
+        }
+
+        if (role == carta::theme::kRolePrimary) {
+            auto fill = down ? pal.accentBg.darker(0.12f)
+                             : (over ? pal.accentHoverBg : pal.accentBg);
+            g.setColour(fill.withAlpha(alpha));
+            g.fillRoundedRectangle(bounds, 4.0f);
+            return;
+        }
+
+        if (role == carta::theme::kRoleDestructive) {
+            auto fill = down ? pal.dangerBg.darker(0.1f)
+                             : (over ? pal.dangerBg : pal.controlBg);
+            auto border = over ? pal.danger : pal.danger.withAlpha(0.55f);
+            g.setColour(fill.withAlpha(alpha));
+            g.fillRoundedRectangle(bounds, 4.0f);
+            g.setColour(border.withAlpha(alpha));
+            g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
+            return;
+        }
+
+        if (role == carta::theme::kRoleTabBarAction) {
+            const auto actBounds = bounds.reduced(0.5f, 1.0f);
+            const auto fill = down ? pal.controlDownBg
+                                   : (over ? pal.controlHoverBg : pal.panelBg);
+            const auto border = over ? pal.controlHoverBorder : pal.controlBorder.withAlpha(0.75f);
+            g.setColour(fill.withAlpha(alpha));
+            g.fillRoundedRectangle(actBounds, 4.0f);
+            g.setColour(border.withAlpha(alpha));
+            g.drawRoundedRectangle(actBounds, 4.0f, 1.0f);
+            return;
+        }
+
+        if (role == carta::theme::kRoleToolbar) {
+            const auto tbBounds = bounds.reduced(0.5f, 1.0f);
+            if (active) {
+                g.setColour(pal.accentBg.withAlpha(alpha));
+                g.fillRoundedRectangle(tbBounds, 4.0f);
+            } else {
+                const auto fill = down ? pal.controlDownBg
+                                       : (over ? pal.controlHoverBg : pal.controlBg);
+                const auto border = over ? pal.controlHoverBorder : pal.controlBorder;
+                g.setColour(fill.withAlpha(alpha));
+                g.fillRoundedRectangle(tbBounds, 4.0f);
+                g.setColour(border.withAlpha(alpha * 0.85f));
+                g.drawRoundedRectangle(tbBounds, 4.0f, 1.0f);
+            }
+            return;
+        }
+
+        // Standard push button: unmistakable bordered surface at rest.
+        const auto fill = active ? pal.selectionBg
+                                 : (down ? pal.controlDownBg
+                                         : (over ? pal.controlHoverBg : pal.controlBg));
+        const auto border = active ? pal.focusOutline
+                                   : (over ? pal.controlHoverBorder : pal.controlBorder);
+        g.setColour(fill.withAlpha(alpha));
+        g.fillRoundedRectangle(bounds, 4.0f);
+        g.setColour(border.withAlpha(alpha));
+        g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
+    }
+
+    void drawButtonText(juce::Graphics& g, juce::TextButton& button, bool over,
+                        bool down) override {
+        juce::ignoreUnused(over, down);
+        const bool dark = juce::Desktop::getInstance().isDarkModeActive();
+        const auto pal = carta::theme::palette(dark);
+        const auto role = button.getProperties()[carta::theme::kButtonRoleProp].toString();
+        const bool active = carta::theme::isButtonActive(button);
+        const bool enabled = button.isEnabled();
+
+        juce::Colour textCol = pal.textPrimary;
+        if (role == carta::theme::kRolePrimary || (role == carta::theme::kRoleToolbar && active)) {
+            textCol = pal.accentText;
+        } else if (role == carta::theme::kRoleDestructive) {
+            textCol = pal.danger;
+        } else if (role == carta::theme::kRoleTab || role == carta::theme::kRoleSegment) {
+            textCol = active ? pal.textPrimary : pal.textSecondary;
+        }
+
+        auto font = getTextButtonFont(button, button.getHeight());
+        if ((role == carta::theme::kRoleTab || role == carta::theme::kRoleSegment ||
+             role == carta::theme::kRolePrimary) &&
+            (active || role == carta::theme::kRolePrimary)) {
+            font = font.boldened();
+        }
+        g.setFont(font);
+        g.setColour(textCol.withAlpha(enabled ? 1.0f : 0.42f));
+
+        const int yIndent = std::min(4, button.proportionOfHeight(0.3f));
+        const int cornerSize = std::min(button.getHeight(), button.getWidth()) / 2;
+        const int fontHeight = juce::roundToInt(font.getHeight() * 0.6f);
+        const int leftIndent = std::min(fontHeight, 2 + cornerSize / (button.isConnectedOnLeft() ? 4 : 2));
+        const int rightIndent = std::min(fontHeight, 2 + cornerSize / (button.isConnectedOnRight() ? 4 : 2));
+        const int textWidth = button.getWidth() - leftIndent - rightIndent;
+        if (textWidth > 0) {
+            g.drawFittedText(button.getButtonText(), leftIndent, yIndent, textWidth,
+                             button.getHeight() - yIndent * 2, juce::Justification::centred, 2);
         }
     }
 
     juce::Font getPopupMenuFont() override { return withDefaultMetrics(juce::FontOptions(12.5f)); }
 
     void drawPopupMenuBackground(juce::Graphics& g, int width, int height) override {
-        g.fillAll(findColour(juce::PopupMenu::backgroundColourId));
-        g.setColour(findColour(juce::ComboBox::outlineColourId).withAlpha(0.55f));
-        g.drawRect(0, 0, width, height, 1);
+        const auto bounds = juce::Rectangle<float>(0.0f, 0.0f, static_cast<float>(width),
+                                                   static_cast<float>(height));
+        g.setColour(findColour(juce::PopupMenu::backgroundColourId));
+        g.fillRoundedRectangle(bounds, 6.0f);
+        g.setColour(findColour(juce::ComboBox::outlineColourId).withAlpha(0.65f));
+        g.drawRoundedRectangle(bounds.reduced(0.5f), 6.0f, 1.0f);
     }
 
     juce::Font getComboBoxFont(juce::ComboBox& box) override {

@@ -13,6 +13,7 @@
  */
 
 #include "MiniDisc/MdWorkspace.h"
+#include "Studio/StudioLookAndFeel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -253,7 +254,7 @@ void MdWorkspace::ReorderableListBox::paintOverChildren(juce::Graphics& g) {
     }
     lineY = juce::jlimit(1, std::max(1, getHeight() - 3), lineY);
     const bool dark = juce::Desktop::getInstance().isDarkModeActive();
-    const auto accent = dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e);
+    const auto accent = carta::theme::palette(dark).accentBg;
     const int barW = std::max(16, getVisibleContentWidth() - 4);
     g.setColour(accent);
     g.fillRect(2, lineY, barW, 2);
@@ -526,10 +527,12 @@ MdWorkspace::MdWorkspace()
     // --- Tab & Sync Bar ---
     addAndMakeVisible(tracksTabButton);
     tracksTabButton.setClickingTogglesState(false);
+    carta::theme::setButtonRole(tracksTabButton, carta::theme::kRoleTab);
     tracksTabButton.onClick = [this] { setActiveTab("tracks", true); };
 
     addAndMakeVisible(recordTabButton);
     recordTabButton.setClickingTogglesState(false);
+    carta::theme::setButtonRole(recordTabButton, carta::theme::kRoleTab);
     recordTabButton.onClick = [this] { setActiveTab("record", true); };
 
     addAndMakeVisible(syncClipsButton);
@@ -882,14 +885,12 @@ MdWorkspace::MdWorkspace()
 
     addChildComponent(planModePlaybackButton);
     planModePlaybackButton.setClickingTogglesState(false);
-    planModePlaybackButton.setTooltip(
-        "Show logical playback track order mapped onto physical cluster ranges (drag to reorder)");
+    carta::theme::setButtonRole(planModePlaybackButton, carta::theme::kRoleSegment);
     planModePlaybackButton.onClick = [this] { setPlanViewMode("playback"); };
 
     addChildComponent(planModeBankButton);
     planModeBankButton.setClickingTogglesState(false);
-    planModeBankButton.setTooltip(
-        "Show physical Audio Bank regions & spans mapped back to referencing tracks");
+    carta::theme::setButtonRole(planModeBankButton, carta::theme::kRoleSegment);
     planModeBankButton.onClick = [this] { setPlanViewMode("bank"); };
 
     addChildComponent(utocSummaryLabel);
@@ -921,9 +922,7 @@ MdWorkspace::MdWorkspace()
     };
 
     addChildComponent(recordDiscButton);
-    recordDiscButton.setTooltip(
-        "Sync edited MiniDisc UTOC and upload any new audio spans without erasing preserved "
-        "on-disc audio");
+    carta::theme::setButtonRole(recordDiscButton, carta::theme::kRolePrimary);
     recordDiscButton.onClick = [this] {
         commitPendingEdits();
         if (onRecordStart) {
@@ -931,6 +930,11 @@ MdWorkspace::MdWorkspace()
         }
     };
 
+    carta::theme::setButtonRole(eraseDiscButton, carta::theme::kRoleDestructive);
+    for (auto* b : {&syncClipsButton, &previewTrackButton, &previewFromButton, &reviewWavButton,
+                    &inspectUtocButton, &importUtocButton, &exportUtocButton}) {
+        carta::theme::setButtonRole(*b, carta::theme::kRoleTabBarAction);
+    }
     setActiveTab("tracks", false);
     updateButtonStates();
 }
@@ -977,7 +981,7 @@ void MdWorkspace::syncCodecDropdownsForMedium(bool isHiMd) {
 }
 
 juce::String MdWorkspace::getTooltip() {
-    return lastHoverTooltip;
+    return {};
 }
 
 void MdWorkspace::syncAppearance() {
@@ -1676,7 +1680,34 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
             "on-disc audio");
     }
 
-    utocSummaryLabel.setText(snapshot.utocSummaryText, juce::dontSendNotification);
+    const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
+    juce::String capSummary;
+    if (carta::isHiMdMedium(discState.medium)) {
+        const std::int64_t capBytes =
+            hiMdTotalBytes > 0 ? hiMdTotalBytes : carta::hiMdMediumCapacityBytes(discState.medium);
+        const int pct =
+            capBytes > 0
+                ? static_cast<int>(std::llround((static_cast<double>(hiMdUsedBytes) * 100.0) /
+                                                static_cast<double>(capBytes)))
+                : 0;
+        capSummary = formatMegabytes(hiMdUsedBytes) + " / " + formatMegabytes(capBytes) + " (" +
+                     juce::String(pct) + "%)";
+    } else {
+        const int totalClu =
+            std::max(1, discState.loadedDisc.active ? discState.loadedDisc.physicalTotalClusters()
+                                                    : carta::mdTotalClusters(discState.medium));
+        const int pct = static_cast<int>(std::llround(
+            (static_cast<double>(physicalPlan.usedClusters) * 100.0) / static_cast<double>(totalClu)));
+        capSummary = juce::String(physicalPlan.usedClusters) + "/" + juce::String(totalClu) +
+                     " clu (" + juce::String(pct) + "%)";
+        if (discState.loadedDisc.active && physicalPlan.reclaimedClusters > 0) {
+            capSummary += dot + "reclaim " + juce::String(physicalPlan.reclaimedClusters);
+        }
+    }
+    const auto mergedSummary = snapshot.utocSummaryText.isNotEmpty()
+                                   ? (capSummary + dot + snapshot.utocSummaryText)
+                                   : capSummary;
+    utocSummaryLabel.setText(mergedSummary, juce::dontSendNotification);
     recordBadgeLabel.setText(snapshot.badgeText, juce::dontSendNotification);
     recordBadgeLabel.setTooltip(snapshot.badgeText);
     recordStatusLabel.setText(snapshot.statusText, juce::dontSendNotification);
@@ -1765,8 +1796,8 @@ void MdWorkspace::handleDeviceTrackClick(int row, const juce::MouseEvent& event)
     menu.addItem(4, "Move Track Down", row + 1 < nTracks);
     menu.addSeparator();
     menu.addItem(5, "Delete Track...");
-    menu.showMenuAsync(
-        juce::PopupMenu::Options(),
+    showStudioPopupMenu(
+        menu, juce::PopupMenu::Options().withTargetComponent(&deviceTrackList),
         [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
             if (safe == nullptr || choice <= 0 || safe->recordBusy) {
                 return;
@@ -1847,9 +1878,7 @@ void MdWorkspace::paint(juce::Graphics& g) {
     const auto panelBg = dark ? juce::Colour(0xff1f1f1f) : juce::Colour(0xffeeeeee);
     const auto headerBg = dark ? juce::Colour(0xff282828) : juce::Colour(0xfff7f7f7);
     const auto border = dark ? juce::Colour(0xff3c3c3c) : juce::Colour(0xffcfcfcf);
-    const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
     const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
-    const auto tabAccent = dark ? juce::Colour(0xffd0d0d0) : juce::Colour(0xff444444);
 
     g.fillAll(panelBg);
 
@@ -1866,35 +1895,23 @@ void MdWorkspace::paint(juce::Graphics& g) {
     g.fillRect(0, 40, getWidth(), 1);
 
     // Sub-header tab bar background
-    g.setColour(dark ? juce::Colour(0xff232323) : juce::Colour(0xffe8e8e8));
+    const auto pal = carta::theme::palette(dark);
+    g.setColour(pal.panelBg);
     g.fillRect(0, 41, getWidth(), 30);
     g.setColour(border);
     g.fillRect(0, 71, getWidth(), 1);
 
-    // Active tab indicator underline
-    const auto activeTabBounds =
-        (activeTab == "record") ? recordTabButton.getBounds() : tracksTabButton.getBounds();
-    if (!activeTabBounds.isEmpty()) {
-        g.setColour(tabAccent);
-        g.fillRect(activeTabBounds.getX() + 4, 69, std::max(0, activeTabBounds.getWidth() - 8), 2);
-    }
-
-    // UTOC / Hi-MD capacity budget pill in header
+    // UTOC / Hi-MD capacity status chip in header (read-only badge, no button border)
     if (!budgetPillBounds.isEmpty()) {
         const bool isHiMd = carta::isHiMdMedium(discState.medium);
         const bool over =
             isHiMd ? (!planValid || (hiMdTotalBytes > 0 && hiMdUsedBytes > hiMdTotalBytes))
                    : (!utocValid || !budget.fits() || !planValid);
-        const auto pillFill = over ? (dark ? juce::Colour(0xff4a2326) : juce::Colour(0xfffee2e2))
-                                   : (dark ? juce::Colour(0xff303030) : juce::Colour(0xffeaeaea));
-        const auto pillStroke = over ? (dark ? juce::Colour(0xffd9534f) : juce::Colour(0xffb91c1c))
-                                     : (dark ? juce::Colour(0xff555555) : juce::Colour(0xffb8b8b8));
-        g.setColour(pillFill);
+        const auto chipFill = over ? pal.dangerBg : pal.panelBg;
+        g.setColour(chipFill);
         g.fillRoundedRectangle(budgetPillBounds.toFloat(), 4.0f);
-        g.setColour(pillStroke);
-        g.drawRoundedRectangle(budgetPillBounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
-        g.setColour(over ? pillStroke.brighter(dark ? 0.3f : 0.0f) : textPrimary);
-        g.setFont(juce::FontOptions(11.3f, juce::Font::bold));
+        g.setColour(over ? pal.danger : pal.textSecondary);
+        g.setFont(juce::FontOptions(11.1f, over ? juce::Font::bold : juce::Font::plain));
         g.drawText(budgetPillText, budgetPillBounds.reduced(8, 0), juce::Justification::centred,
                    true);
     }
@@ -1934,6 +1951,17 @@ void MdWorkspace::paint(juce::Graphics& g) {
                 : (recordUiState.hasDeviceStatus && !recordUiState.deviceStatus.deviceId.empty());
         carta::md_ui::paintPanelCard(g, deviceCardBounds, dark, devConnected);
         carta::md_ui::paintPanelCard(g, planCardBounds, dark);
+        // Segmented-control recessed track behind Playback / Audio Bank switcher
+        if (planModePlaybackButton.isVisible() && planModeBankButton.isVisible()) {
+            const auto segTrack =
+                planModePlaybackButton.getBounds().getUnion(planModeBankButton.getBounds()).expanded(1, 0);
+            if (!segTrack.isEmpty()) {
+                g.setColour(pal.inputBg);
+                g.fillRoundedRectangle(segTrack.toFloat(), 5.0f);
+                g.setColour(pal.hairline);
+                g.drawRoundedRectangle(segTrack.toFloat().reduced(0.5f), 5.0f, 1.0f);
+            }
+        }
         paintPhysicalDiscMeter(g, deviceDiscMeterBounds, dark);
         const auto devListBounds = deviceTrackList.getBounds();
         if (!devListBounds.isEmpty()) {
@@ -2377,15 +2405,10 @@ void MdWorkspace::updateTabVisibility() {
         cancelInlineTrackEdit();
     }
 
-    const auto baseBtnCol = getLookAndFeel().findColour(juce::TextButton::buttonColourId);
-    tracksTabButton.setColour(juce::TextButton::buttonColourId,
-                              baseBtnCol.withAlpha(isTracks ? 1.0f : 0.65f));
-    recordTabButton.setColour(juce::TextButton::buttonColourId,
-                              baseBtnCol.withAlpha(isRecord ? 1.0f : 0.65f));
-    planModePlaybackButton.setColour(juce::TextButton::buttonColourId,
-                                     baseBtnCol.withAlpha(planViewMode == "playback" ? 1.0f : 0.62f));
-    planModeBankButton.setColour(juce::TextButton::buttonColourId,
-                                 baseBtnCol.withAlpha(planViewMode == "bank" ? 1.0f : 0.62f));
+    carta::theme::setButtonActive(tracksTabButton, isTracks);
+    carta::theme::setButtonActive(recordTabButton, isRecord);
+    carta::theme::setButtonActive(planModePlaybackButton, planViewMode == "playback");
+    carta::theme::setButtonActive(planModeBankButton, planViewMode == "bank");
 }
 
 void MdWorkspace::refreshPlanSummaryLabels() {
@@ -2981,41 +3004,60 @@ void MdWorkspace::promptMoveTrackToPosition(int row) {
     if (row < 0 || row >= count || !onCommand) {
         return;
     }
-    auto* dialog = new juce::AlertWindow(
-        "Move Track to Position",
-        "Enter destination track number (1 to " + juce::String(count) + "):",
-        juce::MessageBoxIconType::NoIcon, this);
+    const auto msg = "Enter destination track number (1 to " + juce::String(count) + "):";
+    auto onResult = [safe = juce::Component::SafePointer<MdWorkspace>(this), row](
+                        bool accepted, const juce::String& value) {
+        if (safe == nullptr || !accepted || !safe->onCommand) {
+            return;
+        }
+        const auto raw = value.trim();
+        const int maxCount = static_cast<int>(safe->trackRows.size());
+        const int pos1 = raw.getIntValue();
+        if (raw.isEmpty() || !raw.containsOnly("0123456789") || pos1 < 1 || pos1 > maxCount) {
+            if (safe->onFeedback) {
+                safe->onFeedback("Track position must be between 1 and " +
+                                 juce::String(maxCount) + ".");
+            }
+            return;
+        }
+        const int dest0 = pos1 - 1;
+        if (dest0 != row) {
+            safe->onCommand({"disc", "track", "move", juce::String(row), juce::String(dest0)},
+                            safe->revision);
+        }
+    };
+
+#if !CARTA_STUDIO_COMPONENT_TEST && JUCE_MAC
+    carta::showNativeTextPrompt(this, "Move Track to Position", msg, "Position:",
+                                juce::String(row + 1), "Move", std::move(onResult));
+#else
+#if !CARTA_STUDIO_COMPONENT_TEST && JUCE_LINUX && CARTA_STUDIO_GTK_PROMPTS
+    if (carta::showGtkTextFieldsPrompt(
+            this, "Move Track to Position", msg, {{"pos", "Position:", juce::String(row + 1)}},
+            "Move", {},
+            [cb = onResult](int choice, juce::StringArray values) mutable {
+                cb(choice == 1 && !values.isEmpty(), values.isEmpty() ? juce::String{} : values[0]);
+            })) {
+        return;
+    }
+#endif
+
+    auto* dialog = new juce::AlertWindow("Move Track to Position", msg,
+                                         juce::MessageBoxIconType::NoIcon, this);
     dialog->addTextEditor("pos", juce::String(row + 1), "Position:");
     dialog->addButton("Move", 1, juce::KeyPress(juce::KeyPress::returnKey));
     dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
     dialog->enterModalState(
         true,
         juce::ModalCallbackFunction::create(
-            [safe = juce::Component::SafePointer<MdWorkspace>(this),
-             safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog),
-             row](int answer) {
-                if (safe == nullptr || safeDialog == nullptr || answer != 1 || !safe->onCommand) {
-                    return;
-                }
-                const auto raw = safeDialog->getTextEditorContents("pos").trim();
-                const int maxCount = static_cast<int>(safe->trackRows.size());
-                const int pos1 = raw.getIntValue();
-                if (raw.isEmpty() || !raw.containsOnly("0123456789") || pos1 < 1 ||
-                    pos1 > maxCount) {
-                    if (safe->onFeedback) {
-                        safe->onFeedback("Track position must be between 1 and " +
-                                         juce::String(maxCount) + ".");
-                    }
-                    return;
-                }
-                const int dest0 = pos1 - 1;
-                if (dest0 != row) {
-                    safe->onCommand(
-                        {"disc", "track", "move", juce::String(row), juce::String(dest0)},
-                        safe->revision);
+            [safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog),
+             cb = std::move(onResult)](int answer) mutable {
+                if (safeDialog != nullptr && answer == 1) {
+                    cb(true, safeDialog->getTextEditorContents("pos"));
                 }
             }),
         true);
+#endif
 }
 
 void MdWorkspace::handleTrackReorderDrag(int fromRow, int insertBeforeRow) {
@@ -3223,8 +3265,8 @@ void MdWorkspace::showInsertAliasMenu() {
     const int insertDest = !sel.empty() ? (sel.back() + 1) : static_cast<int>(trackRows.size());
     juce::PopupMenu menu;
     populateAudioPoolSubmenu(menu, 100, 30);
-    menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(&insertAliasButton),
+    showStudioPopupMenu(
+        menu, juce::PopupMenu::Options().withTargetComponent(&insertAliasButton),
         [safe = juce::Component::SafePointer<MdWorkspace>(this), insertDest,
          rev = revision](int choice) {
             if (safe == nullptr || choice < 100 || !safe->onCommand) {
@@ -3280,39 +3322,34 @@ void MdWorkspace::showTrackContextMenu(int row) {
     }
     const bool isAliased = trackRows[static_cast<std::size_t>(row)].aliasRefCount > 1;
     juce::PopupMenu menu;
-    menu.addItem(1, "Rename Audio Item...");
-    menu.addItem(2, "ASCII & Full-Width Titles...");
-    menu.addItem(3, "Flags & Timestamp...");
-    menu.addSeparator();
-    menu.addItem(4, "Insert Play Order Alias After");
-    menu.addItem(14, "Make Unique (Detach Alias)", isAliased);
-    menu.addItem(11, "Copy Track(s)");
-    menu.addItem(12, "Paste Alias(es) After", !copiedTrackClipboard.empty());
-    menu.addItem(10, "Move Track to Position...", trackRows.size() > 1);
-    menu.addItem(8, "Merge with Next Track",
-                 !isAliased && row + 1 < static_cast<int>(trackRows.size()));
-    menu.addItem(15, "Force Gapped Break Before Track",
-                 row > 0 && !trackRows[static_cast<std::size_t>(row)].onDisc,
-                 trackRows[static_cast<std::size_t>(row)].forceGapBefore);
-    menu.addItem(5, "Remove Track");
-    {
-        menu.addSeparator();
-        juce::PopupMenu poolSub;
-        populateAudioPoolSubmenu(poolSub, 2000, 30);
-        menu.addSubMenu("Insert Alias After from Audio Pool", poolSub);
-    }
-    if (!audioBankClipEntries.empty()) {
-        juce::PopupMenu bankSub;
-        populateAudioBankSubmenu(bankSub, 1000, 30);
-        menu.addSubMenu("Insert Standalone Track from Clips", bankSub);
-    }
+    menu.addItem(1, "Rename Track...");
+    menu.addItem(2, "Edit Titles...");
+    menu.addItem(3, "Edit Flags...");
     menu.addSeparator();
     menu.addItem(6, "Preview Track");
-    menu.addItem(7, "Preview From Here to End");
-    menu.addItem(13, "Show in Audio Bank (Physical Map)", !audioBankRows.empty());
+    menu.addItem(7, "Preview from Here");
+    menu.addItem(13, "Show in Audio Bank", !audioBankRows.empty());
+    menu.addSeparator();
+    menu.addItem(4, "Insert Alias After");
+    if (isAliased) {
+        menu.addItem(14, "Make Unique");
+    }
+    menu.addItem(11, "Copy Track");
+    if (!copiedTrackClipboard.empty()) {
+        menu.addItem(12, "Paste Alias After");
+    }
+    menu.addItem(10, "Move to Position...", trackRows.size() > 1);
+    menu.addItem(8, "Merge with Next Track",
+                 !isAliased && row + 1 < static_cast<int>(trackRows.size()));
+    if (row > 0 && !trackRows[static_cast<std::size_t>(row)].onDisc) {
+        menu.addItem(15, "Force Gapped Break", true,
+                     trackRows[static_cast<std::size_t>(row)].forceGapBefore);
+    }
+    menu.addSeparator();
+    menu.addItem(5, "Remove Track");
 
-    menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(&trackList),
+    showStudioPopupMenu(
+        menu, juce::PopupMenu::Options().withTargetComponent(&trackList),
         [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
             if (safe == nullptr || choice <= 0 || row < 0 ||
                 row >= static_cast<int>(safe->trackRows.size())) {
@@ -3409,14 +3446,14 @@ void MdWorkspace::showPlanContextMenu(int row) {
         return;
     }
     juce::PopupMenu menu;
-    menu.addItem(1, "Edit Track in Tracks Tab");
-    menu.addItem(2, "Duplicate Track (Shared Audio)");
-    menu.addItem(3, "Move Track to Position...", planRows.size() > 1);
+    menu.addItem(1, "Edit in Play Order");
+    menu.addItem(2, "Insert Alias");
+    menu.addItem(3, "Move to Position...", planRows.size() > 1);
     menu.addSeparator();
     menu.addItem(4, "Preview Track");
-    menu.addItem(5, "Show Audio in Audio Bank", !audioBankRows.empty());
-    menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(&planList),
+    menu.addItem(5, "Show in Audio Bank", !audioBankRows.empty());
+    showStudioPopupMenu(
+        menu, juce::PopupMenu::Options().withTargetComponent(&planList),
         [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
             if (safe == nullptr || choice <= 0 || row < 0 ||
                 row >= static_cast<int>(safe->planRows.size())) {
@@ -3496,8 +3533,8 @@ void MdWorkspace::showAudioBankContextMenu(int row) {
         menu.addSubMenu("Jump to Referencing Track", jumpMenu);
     }
 
-    menu.showMenuAsync(
-        juce::PopupMenu::Options().withTargetComponent(&planList),
+    showStudioPopupMenu(
+        menu, juce::PopupMenu::Options().withTargetComponent(&planList),
         [safe = juce::Component::SafePointer<MdWorkspace>(this), row](int choice) {
             if (safe == nullptr || choice <= 0 || row < 0 ||
                 row >= static_cast<int>(safe->audioBankRows.size())) {
@@ -3552,8 +3589,8 @@ void MdWorkspace::showGroupMenu() {
                                                   static_cast<int>(selected.size()));
 
     juce::PopupMenu menu;
-    menu.addItem(1, "Create / Update Group from Selected Tracks...", contiguous);
-    menu.addItem(2, "Remove Group(s) on Selected Tracks", !selected.empty());
+    menu.addItem(1, "Assign Group to Selected Tracks...", contiguous);
+    menu.addItem(2, "Remove Group from Selected Tracks", !selected.empty());
     if (!discState.groups.empty()) {
         menu.addSeparator();
         for (std::size_t g = 0; g < discState.groups.size(); ++g) {
@@ -3568,8 +3605,8 @@ void MdWorkspace::showGroupMenu() {
             menu.addItem(100 + static_cast<int>(g), label);
         }
     }
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&groupMenuButton),
-                       [safe = juce::Component::SafePointer<MdWorkspace>(this)](int choice) {
+    showStudioPopupMenu(menu, juce::PopupMenu::Options().withTargetComponent(&groupMenuButton),
+                        [safe = juce::Component::SafePointer<MdWorkspace>(this)](int choice) {
                            if (safe == nullptr || choice <= 0) {
                                return;
                            }
@@ -3603,11 +3640,9 @@ void MdWorkspace::promptCreateGroupForSelection() {
     const int endTrack1 = selected.back() + 1;
     const auto rev = revision;
 
-    auto* dialog = new juce::AlertWindow("MiniDisc Group",
-                                         "Assign Tracks " + juce::String(startTrack1) +
-                                             juce::String::fromUTF8("\xe2\x80\x93") +
-                                             juce::String(endTrack1) + " to a MiniDisc group.",
-                                         juce::MessageBoxIconType::NoIcon, this);
+    const auto msg = "Assign Tracks " + juce::String(startTrack1) +
+                     juce::String::fromUTF8("\xe2\x80\x93") + juce::String(endTrack1) +
+                     " to a MiniDisc group.";
     juce::String initialHalf =
         "Group " + juce::String(static_cast<int>(discState.groups.size() + 1));
     juce::String initialFull;
@@ -3622,6 +3657,32 @@ void MdWorkspace::promptCreateGroupForSelection() {
             break;
         }
     }
+    const std::vector<carta::TextPromptField> fields = {
+        {"half", "ASCII title:", initialHalf},
+        {"full", "Full-width title (optional):", initialFull},
+    };
+    auto onResult = [safe = juce::Component::SafePointer<MdWorkspace>(this), startTrack1, endTrack1,
+                     rev](int choice, juce::StringArray values) {
+        if (safe != nullptr && choice == 1 && values.size() >= 2 && safe->onCommand) {
+            safe->onCommand({"disc", "group", "set", juce::String(startTrack1),
+                             juce::String(endTrack1), values[0].trim(), values[1].trim()},
+                            rev);
+        }
+    };
+
+#if !CARTA_STUDIO_COMPONENT_TEST && JUCE_MAC
+    carta::showNativeTextFieldsPrompt(this, "MiniDisc Group", msg, fields, "Apply", {},
+                                      std::move(onResult));
+#else
+#if !CARTA_STUDIO_COMPONENT_TEST && JUCE_LINUX && CARTA_STUDIO_GTK_PROMPTS
+    if (carta::showGtkTextFieldsPrompt(this, "MiniDisc Group", msg, fields, "Apply", {},
+                                       onResult)) {
+        return;
+    }
+#endif
+
+    auto* dialog = new juce::AlertWindow("MiniDisc Group", msg, juce::MessageBoxIconType::NoIcon,
+                                         this);
     dialog->addTextEditor("half", initialHalf, "ASCII title:");
     dialog->addTextEditor("full", initialFull, "Full-width title (optional):");
     dialog->addButton("Apply", 1);
@@ -3629,18 +3690,17 @@ void MdWorkspace::promptCreateGroupForSelection() {
     dialog->enterModalState(
         true,
         juce::ModalCallbackFunction::create(
-            [safe = juce::Component::SafePointer<MdWorkspace>(this),
-             safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog), startTrack1,
-             endTrack1, rev](int answer) {
-                if (safe != nullptr && safeDialog != nullptr && answer == 1 && safe->onCommand) {
-                    const auto half = safeDialog->getTextEditorContents("half").trim();
-                    const auto full = safeDialog->getTextEditorContents("full").trim();
-                    safe->onCommand({"disc", "group", "set", juce::String(startTrack1),
-                                     juce::String(endTrack1), half, full},
-                                    rev);
+            [safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog),
+             cb = std::move(onResult)](int answer) mutable {
+                if (safeDialog != nullptr && answer == 1) {
+                    juce::StringArray vals;
+                    vals.add(safeDialog->getTextEditorContents("half"));
+                    vals.add(safeDialog->getTextEditorContents("full"));
+                    cb(1, std::move(vals));
                 }
             }),
         true);
+#endif
 }
 
 void MdWorkspace::clearGroupsForSelection() {
@@ -3773,8 +3833,7 @@ void MdWorkspace::paintTrackRow(int row, juce::Graphics& g, int width, int heigh
 
     // Play Order uses count
     const bool aliased = tr.aliasRefCount > 1;
-    g.setColour(aliased ? (dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e))
-                        : textMuted);
+    g.setColour(aliased ? textPrimary : textMuted);
     g.setFont(juce::FontOptions(11.3f, aliased ? juce::Font::bold : juce::Font::plain));
     g.drawText(aliased ? ("x" + juce::String(tr.aliasRefCount)) : juce::String("1"), width - 104,
                0, 34, height, juce::Justification::centred, false);
@@ -3803,7 +3862,7 @@ void MdWorkspace::paintAudioSourceCard(juce::Graphics& g, bool dark) const {
     const auto cardBorder = dark ? juce::Colour(0xff3a3a3a) : juce::Colour(0xffd0d0d0);
     const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
     const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
-    const auto teal = dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e);
+    const auto teal = carta::theme::palette(dark).textPrimary;
 
     g.setColour(cardBg);
     g.fillRoundedRectangle(audioSourceCardBounds.toFloat(), 5.0f);
@@ -4055,7 +4114,7 @@ void MdWorkspace::paintPhysicalDiscMeter(juce::Graphics& g, juce::Rectangle<int>
         if (!discPresent) {
             stateLabel = "NO DISC";
         } else {
-            stateCol = dark ? juce::Colour(0xff8b5cf6) : juce::Colour(0xff6d28d9);
+            stateCol = carta::theme::palette(dark).meterFill;
             stateLabel = st.trackCount == 0 ? juce::String("BLANK")
                                             : (juce::String(st.trackCount) + " TRK");
         }
@@ -4119,22 +4178,23 @@ void MdWorkspace::paintPhysicalDiscMeter(juce::Graphics& g, juce::Rectangle<int>
 
     const auto& st = recordUiState.deviceStatus;
     auto headerRow = area.removeFromTop(16);
+    const auto pal = carta::theme::palette(dark);
     juce::String stateLabel;
-    juce::Colour stateCol = dark ? juce::Colour(0xff8a8a8a) : juce::Colour(0xff666666);
+    juce::Colour stateCol = pal.textMuted;
     if (!st.discPresent) {
         stateLabel = "NO DISC";
     } else if (st.hiMdFormatted) {
         stateLabel = "Hi-MD Format";
-        stateCol = dark ? juce::Colour(0xffcf872c) : juce::Colour(0xffb45309);
+        stateCol = pal.warning;
     } else if (st.writeProtected) {
         stateLabel = "LOCKED";
-        stateCol = dark ? juce::Colour(0xffd9534f) : juce::Colour(0xffb91c1c);
+        stateCol = pal.danger;
     } else if (st.trackCount == 0) {
         stateLabel = "BLANK";
-        stateCol = dark ? juce::Colour(0xff2d8f8b) : juce::Colour(0xff0f766e);
+        stateCol = pal.meterFill;
     } else {
-        stateLabel = juce::String(st.trackCount) + (st.trackCount == 1 ? " TRK" : " TRK");
-        stateCol = dark ? juce::Colour(0xff2d8f8b) : juce::Colour(0xff0f766e);
+        stateLabel = juce::String(st.trackCount) + " TRK";
+        stateCol = pal.meterFill;
     }
 
     const int pillW = std::min(96, static_cast<int>(stateLabel.length()) * 7 + 16);
@@ -4205,10 +4265,9 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
     if (bounds.isEmpty() || bounds.getWidth() < 40 || bounds.getHeight() < 12) {
         return;
     }
-    const auto textPrimary = dark ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff262626);
-    const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
-    const auto wellBg = dark ? juce::Colour(0xff1b1b1b) : juce::Colour(0xffe5e5e5);
-    const auto border = dark ? juce::Colour(0xff3c3c3c) : juce::Colour(0xffc6c6c6);
+    const auto pal = carta::theme::palette(dark);
+    const auto wellBg = pal.progressTrackBg;
+    const auto border = pal.controlBorder;
     const bool isHiMd = carta::isHiMdMedium(discState.medium);
     const std::int64_t hiMdCap = std::max<std::int64_t>(
         1, hiMdTotalBytes > 0 ? hiMdTotalBytes : carta::hiMdMediumCapacityBytes(discState.medium));
@@ -4242,8 +4301,8 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
             }
             const auto segRect = juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
             const auto col =
-                over ? juce::Colour(0xffdc2626)
-                     : (br.isOnDisc ? (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2))
+                over ? pal.danger
+                     : (br.isOnDisc ? pal.onDiscClipBorder
                                     : carta::md_ui::codecColour(br.codec, dark));
             g.setColour(col.withAlpha(br.isOnDisc ? 0.75f : (dark ? 0.72f : 0.65f)));
             g.fillRect(segRect);
@@ -4290,29 +4349,8 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                 }
             }
         }
-        g.setColour(over ? juce::Colour(0xffdc2626) : border);
+        g.setColour(over ? carta::theme::palette(dark).danger : border);
         g.drawRoundedRectangle(bounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
-
-        const int pct = static_cast<int>(std::llround(
-            (static_cast<double>(hiMdUsedBytes) * 100.0) / static_cast<double>(hiMdCap)));
-        const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
-        const auto capText =
-            formatMegabytes(hiMdUsedBytes) + " / " + formatMegabytes(hiMdCap) + " (" +
-            juce::String(pct) + "%)" +
-            (discState.tracks.empty()
-                 ? juce::String()
-                 : (dot + juce::String(physicalPlan.uniqueAudioTrackCount) + " uniq / " +
-                    juce::String(physicalPlan.playOrderTrackCount) + " trk"));
-        g.setFont(juce::FontOptions(10.2f, juce::Font::bold));
-        const int labelW =
-            std::min(bounds.getWidth() - 12, static_cast<int>(capText.length()) * 6 + 16);
-        const auto pill = juce::Rectangle<int>(bounds.getRight() - labelW - 4, bounds.getY() + 3,
-                                               labelW, bounds.getHeight() - 6);
-        g.setColour((dark ? juce::Colour(0xff1e1e1e) : juce::Colour(0xfff7f7f7)).withAlpha(0.84f));
-        g.fillRoundedRectangle(pill.toFloat(), 3.0f);
-        g.setColour(over ? (dark ? juce::Colour(0xfffca5a5) : juce::Colour(0xffb91c1c))
-                         : textMuted.interpolatedWith(textPrimary, 0.7f));
-        g.drawText(capText, pill.reduced(4, 0), juce::Justification::centredRight, true);
         return;
     }
 
@@ -4357,8 +4395,8 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                 }
                 const auto onDiscRect =
                     juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
-                g.setColour((over ? juce::Colour(0xffdc2626)
-                                  : (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2)))
+                g.setColour((over ? carta::theme::palette(dark).danger
+                                  : carta::theme::palette(dark).onDiscClipBorder)
                                 .withAlpha(0.75f));
                 g.fillRect(onDiscRect);
                 if (x1 > inner.getX() && br.gappedBefore) {
@@ -4381,8 +4419,8 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
                                             inner.getWidth()))));
             const auto onDiscRect =
                 juce::Rectangle<int>(x1, inner.getY(), x2 - x1, inner.getHeight());
-            g.setColour((over ? juce::Colour(0xffdc2626)
-                              : (dark ? juce::Colour(0xff0e7490) : juce::Colour(0xff0891b2)))
+            g.setColour((over ? carta::theme::palette(dark).danger
+                              : carta::theme::palette(dark).onDiscClipBorder)
                             .withAlpha(0.75f));
             g.fillRect(onDiscRect);
             if (x2 < inner.getRight()) {
@@ -4470,33 +4508,8 @@ void MdWorkspace::paintTargetCapacityBar(juce::Graphics& g, juce::Rectangle<int>
         }
     }
 
-    g.setColour(over ? juce::Colour(0xffdc2626) : border);
+    g.setColour(over ? carta::theme::palette(dark).danger : border);
     g.drawRoundedRectangle(bounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
-
-    const int pct = static_cast<int>(std::llround(
-        (static_cast<double>(physicalPlan.usedClusters) * 100.0) / static_cast<double>(totalClu)));
-    const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
-    const auto capText =
-        juce::String(physicalPlan.usedClusters) + "/" + juce::String(totalClu) +
-        " clusters (" + juce::String(pct) + "%)" +
-        (discState.tracks.empty()
-             ? juce::String()
-             : (dot + juce::String(physicalPlan.uniqueAudioTrackCount) + " uniq / " +
-                juce::String(physicalPlan.playOrderTrackCount) + " trk")) +
-        ((discState.loadedDisc.active && physicalPlan.reclaimedClusters > 0)
-             ? (dot + "reclaim " + juce::String(physicalPlan.reclaimedClusters))
-             : juce::String());
-    g.setColour(textPrimary);
-    g.setFont(juce::FontOptions(10.2f, juce::Font::bold));
-    const int labelW =
-        std::min(bounds.getWidth() - 12, static_cast<int>(capText.length()) * 6 + 16);
-    const auto pill = juce::Rectangle<int>(bounds.getRight() - labelW - 4, bounds.getY() + 3,
-                                           labelW, bounds.getHeight() - 6);
-    g.setColour((dark ? juce::Colour(0xff1e1e1e) : juce::Colour(0xfff7f7f7)).withAlpha(0.84f));
-    g.fillRoundedRectangle(pill.toFloat(), 3.0f);
-    g.setColour(over ? (dark ? juce::Colour(0xfffca5a5) : juce::Colour(0xffb91c1c))
-                     : textMuted.interpolatedWith(textPrimary, 0.7f));
-    g.drawText(capText, pill.reduced(4, 0), juce::Justification::centredRight, true);
 }
 
 void MdWorkspace::paintPlanProgressBar(juce::Graphics& g, juce::Rectangle<int> bounds,
@@ -4504,19 +4517,17 @@ void MdWorkspace::paintPlanProgressBar(juce::Graphics& g, juce::Rectangle<int> b
     if (bounds.isEmpty() || bounds.getWidth() < 40) {
         return;
     }
-    const auto wellBg = dark ? juce::Colour(0xff1b1b1b) : juce::Colour(0xffe4e4e4);
-    const auto border = dark ? juce::Colour(0xff4a4a4a) : juce::Colour(0xffb8b8b8);
-    const auto accent = dark ? juce::Colour(0xff2d8f8b) : juce::Colour(0xff0f766e);
+    const auto pal = carta::theme::palette(dark);
     const double frac = juce::jlimit(0.0, 1.0, recordUiState.progress.progress);
 
-    g.setColour(wellBg);
+    g.setColour(pal.progressTrackBg);
     g.fillRoundedRectangle(bounds.toFloat(), 4.0f);
     if (frac > 0.0) {
         const int fillW = std::max(4, static_cast<int>(std::llround(bounds.getWidth() * frac)));
-        g.setColour(accent.withAlpha(dark ? 0.65f : 0.35f));
+        g.setColour(pal.progressFill);
         g.fillRoundedRectangle(bounds.withWidth(fillW).toFloat(), 4.0f);
     }
-    g.setColour(border);
+    g.setColour(pal.controlBorder);
     g.drawRoundedRectangle(bounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
 
     juce::String label = recordUiState.progress.phase.empty()
@@ -4620,8 +4631,8 @@ void MdWorkspace::paintPlanRow(int row, juce::Graphics& g, int width, int height
     } else {
         physText = "(unplanned)";
     }
-    const auto teal = dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e);
-    g.setColour((pr.sharesPhysicalSpan || pr.onDisc) ? teal : textMuted);
+    const auto pal = carta::theme::palette(dark);
+    g.setColour((pr.sharesPhysicalSpan || pr.onDisc) ? pal.textPrimary : textMuted);
     g.setFont(juce::FontOptions(
         10.6f, (pr.sharesPhysicalSpan || pr.onDisc) ? juce::Font::bold : juce::Font::plain));
     g.drawText(physText, width - physW - 6, 0, physW, height, juce::Justification::centredRight,
@@ -4671,12 +4682,11 @@ void MdWorkspace::paintAudioBankRow(int row, juce::Graphics& g, int width, int h
     const auto textMuted = dark ? juce::Colour(0xff9e9e9e) : juce::Colour(0xff666666);
     paintAlternatingRowBackground(g, row, width, height, selected, dark);
 
-    // Origin / Reclaim pill
-    const auto statusCol =
-        br.isReclaimed
-            ? (dark ? juce::Colour(0xfff59e0b) : juce::Colour(0xffb45309))
-            : (br.isOnDisc ? (dark ? juce::Colour(0xff5eead4) : juce::Colour(0xff0f766e))
-                           : (dark ? juce::Colour(0xff60a5fa) : juce::Colour(0xff2563eb)));
+    // Origin / Reclaim pill (neutral monochrome for ON-DISC / NEW, warning amber for RECLAIM)
+    const auto bankPal = carta::theme::palette(dark);
+    const auto statusCol = br.isReclaimed
+                               ? bankPal.warning
+                               : (br.isOnDisc ? bankPal.onDiscClipBorder : bankPal.textPrimary);
     const auto statusRect = juce::Rectangle<int>(6, 4, 58, height - 8);
     g.setColour(statusCol.withAlpha(dark ? 0.24f : 0.14f));
     g.fillRoundedRectangle(statusRect.toFloat(), 3.0f);

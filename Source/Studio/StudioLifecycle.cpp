@@ -71,7 +71,6 @@ Studio::Studio(bool headless) : headlessMode(headless) {
 
 #if !CARTA_STUDIO_COMPONENT_TEST
     if (!headlessMode) {
-        tooltipWindow = std::make_unique<juce::TooltipWindow>(this, 900);
         carta::setHiMdElevationPromptEnabled(true);
     }
 #endif
@@ -278,7 +277,7 @@ Studio::Studio(bool headless) : headlessMode(headless) {
     status.setText(
         oldRecoveries.isEmpty()
             ? "Import audio to start arranging. Click the ruler to move the playhead."
-            : "Recovery snapshots are available in File > Project & Recovery > Recover autosaved "
+            : "Recovery snapshots are available in File > Recovery > Recover autosaved "
               "session.",
         juce::dontSendNotification);
 
@@ -313,6 +312,10 @@ Studio::Studio(bool headless) : headlessMode(headless) {
 
     marker.setTooltip("Add a track marker at the playhead");
     marker.setTitle("Add track marker");
+    for (auto* button : {&play, &stop, &zoomOutButton, &zoomInButton, &zoomFitButton, &add,
+                         &addLayerButton, &splitMdButton, &snapButton, &marker}) {
+        carta::theme::setButtonRole(*button, carta::theme::kRoleToolbar);
+    }
     for (auto* button : {&zoomOutButton, &zoomInButton, &zoomFitButton, &add, &addLayerButton,
                          &splitMdButton, &snapButton, &marker}) {
         button->setWantsKeyboardFocus(false);
@@ -1099,34 +1102,27 @@ void Studio::splitMdTrackAtPlayhead() {
 
 void Studio::updateAppearance() {
     darkAppearance = juce::Desktop::getInstance().isDarkModeActive();
+    const auto pal = carta::theme::palette(darkAppearance);
     neutralLook.setColourScheme(
-        darkAppearance
-            ? juce::LookAndFeel_V4::ColourScheme{juce::Colour(0xff1e1e1e), juce::Colour(0xff2d2d2d),
-                                                 juce::Colour(0xff262626), juce::Colour(0xff5a5a5a),
-                                                 juce::Colour(0xffe0e0e0), juce::Colour(0xff444444),
-                                                 juce::Colour(0xfff2f2f2), juce::Colour(0xff4f4f4f),
-                                                 juce::Colour(0xffe0e0e0)}
-            : juce::LookAndFeel_V4::ColourScheme{
-                  juce::Colour(0xffeeeeee), juce::Colour(0xfff7f7f7), juce::Colour(0xfff5f5f5),
-                  juce::Colour(0xffb4b4b4), juce::Colour(0xff222222), juce::Colour(0xffd8d8d8),
-                  juce::Colour(0xff181818), juce::Colour(0xffd4d4d4), juce::Colour(0xff222222)});
+        juce::LookAndFeel_V4::ColourScheme{
+            pal.windowBg, pal.controlBg, pal.menuBg, pal.controlBorder, pal.textPrimary,
+            pal.selectionBg, pal.selectionText, pal.controlHoverBg, pal.textPrimary});
 
-    const auto text = darkAppearance ? juce::Colour(0xffe0e0e0) : juce::Colour(0xff222222);
-    const auto control = darkAppearance ? juce::Colour(0xff2d2d2d) : juce::Colour(0xfff7f7f7);
-    const auto menuBg = darkAppearance ? juce::Colour(0xff262626) : juce::Colour(0xfff5f5f5);
-    const auto outline = darkAppearance ? juce::Colour(0xff5e5e5e) : juce::Colour(0xffaaaaaa);
-    const auto hiBg = darkAppearance ? juce::Colour(0xff4a4a4a) : juce::Colour(0xffd6d6d6);
-    const auto focusOutline = darkAppearance ? juce::Colour(0xff9a9a9a) : juce::Colour(0xff555555);
+    const auto text = pal.textPrimary;
+    const auto control = pal.controlBg;
+    const auto menuBg = pal.menuBg;
+    const auto outline = pal.controlBorder;
+    const auto hiBg = pal.selectionBg;
+    const auto focusOutline = pal.focusOutline;
 
     neutralLook.setColour(juce::TextButton::buttonColourId, control);
     neutralLook.setColour(juce::TextButton::buttonOnColourId, hiBg);
     neutralLook.setColour(juce::TextButton::textColourOffId, text);
     neutralLook.setColour(juce::TextButton::textColourOnId, text);
-    neutralLook.setColour(juce::TextEditor::backgroundColourId,
-                          darkAppearance ? juce::Colour(0xff222222) : juce::Colours::white);
+    neutralLook.setColour(juce::TextEditor::backgroundColourId, pal.inputBg);
     neutralLook.setColour(juce::TextEditor::textColourId, text);
     neutralLook.setColour(juce::TextEditor::highlightColourId, hiBg);
-    neutralLook.setColour(juce::TextEditor::highlightedTextColourId, text);
+    neutralLook.setColour(juce::TextEditor::highlightedTextColourId, pal.selectionText);
     neutralLook.setColour(juce::TextEditor::outlineColourId, outline);
     neutralLook.setColour(juce::TextEditor::focusedOutlineColourId, focusOutline);
     neutralLook.setColour(juce::Label::textColourId, text);
@@ -1144,26 +1140,22 @@ void Studio::updateAppearance() {
     neutralLook.setColour(juce::ToggleButton::tickDisabledColourId, outline);
     neutralLook.setColour(juce::PopupMenu::backgroundColourId, menuBg);
     neutralLook.setColour(juce::PopupMenu::textColourId, text);
-    neutralLook.setColour(juce::PopupMenu::headerTextColourId, text);
+    neutralLook.setColour(juce::PopupMenu::headerTextColourId, pal.textSecondary);
     neutralLook.setColour(juce::PopupMenu::highlightedBackgroundColourId, hiBg);
-    neutralLook.setColour(juce::PopupMenu::highlightedTextColourId, text);
-    neutralLook.setColour(juce::ScrollBar::thumbColourId,
-                          darkAppearance ? juce::Colour(0xff585858) : juce::Colour(0xffb8b8b8));
+    neutralLook.setColour(juce::PopupMenu::highlightedTextColourId, pal.selectionText);
+    neutralLook.setColour(juce::ScrollBar::thumbColourId, pal.scrollThumb);
     neutralLook.setColour(juce::ScrollBar::trackColourId, juce::Colours::transparentBlack);
-    neutralLook.setColour(juce::AlertWindow::backgroundColourId,
-                          darkAppearance ? juce::Colour(0xff252525) : juce::Colour(0xffeeeeee));
+    neutralLook.setColour(juce::AlertWindow::backgroundColourId, pal.dialogBg);
     neutralLook.setColour(juce::AlertWindow::textColourId, text);
     neutralLook.setColour(juce::AlertWindow::outlineColourId, outline);
-    neutralLook.setColour(juce::ResizableWindow::backgroundColourId,
-                          darkAppearance ? juce::Colour(0xff1e1e1e) : juce::Colour(0xffeeeeee));
+    neutralLook.setColour(juce::ResizableWindow::backgroundColourId, pal.windowBg);
     neutralLook.setColour(juce::TooltipWindow::backgroundColourId, menuBg);
     neutralLook.setColour(juce::TooltipWindow::textColourId, text);
     neutralLook.setColour(juce::TooltipWindow::outlineColourId, outline);
 
     syncSnapButtonAppearance();
     if (audioSettingsWindow) {
-        audioSettingsWindow->setBackgroundColour(darkAppearance ? juce::Colour(0xff252525)
-                                                                : juce::Colour(0xffeeeeee));
+        audioSettingsWindow->setBackgroundColour(pal.dialogBg);
         audioSettingsWindow->repaint();
     }
     status.setColour(juce::Label::textColourId, text.withAlpha(0.75f));

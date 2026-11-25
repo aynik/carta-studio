@@ -659,17 +659,15 @@ bool Studio::showMarkerContextMenu(const juce::MouseEvent& event) {
     repaint();
 
     juce::PopupMenu menu;
-    menu.addItem(MenuId::markerRename, "Rename marker (F2)...");
-    menu.addItem(MenuId::markerSetPosition, "Set marker position (P)...");
-    menu.addItem(MenuId::markerAuditionBoundary, "Audition marker boundary (B)");
-    menu.addItem(MenuId::markerNudgeLeft, "Move left one sample (F9)");
-    menu.addItem(MenuId::markerNudgeRight, "Move right one sample (F10)");
-    menu.addItem(MenuId::markerDelete, "Delete marker (Delete)");
+    menu.addItem(MenuId::markerRename, "Rename Marker...");
+    menu.addItem(MenuId::markerSetPosition, "Set Position...");
+    menu.addItem(MenuId::markerAuditionBoundary, "Audition Boundary");
     menu.addSeparator();
-    menu.addItem(MenuId::markerList, "Marker list and repair...");
+    menu.addItem(MenuId::markerDelete, "Delete Marker");
 
     const auto revision = editGeneration;
-    menu.showMenuAsync(
+    showStudioPopupMenu(
+        menu,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), markerIndex, revision](int result) {
@@ -722,50 +720,37 @@ bool Studio::showTrackContextMenu(const juce::MouseEvent& event) {
 
     const auto& state = session.tracks[static_cast<size_t>(track)];
     juce::PopupMenu menu;
-    menu.addItem(MenuId::layerMute, "Mute layer", true, state.muted);
-    menu.addItem(MenuId::layerSolo, "Solo layer", true, state.solo);
-    menu.addItem(MenuId::layerToggleCollapse, state.collapsed ? "Expand layer" : "Collapse layer");
-    menu.addItem(MenuId::layerSetHeight, "Set layer height...");
-    menu.addItem(MenuId::layerChannelHeights, "Channel heights...",
-                 carta::maxTrackChannels(state) >= 2 || !state.channelHeightWeights.empty());
+    menu.addItem(MenuId::layerMute, "Mute", true, state.muted);
+    menu.addItem(MenuId::layerSolo, "Solo", true, state.solo);
+    menu.addItem(MenuId::layerToggleCollapse, state.collapsed ? "Expand Layer" : "Collapse Layer");
+    menu.addSeparator();
 
     juce::PopupMenu display;
-    display.addItem(MenuId::layerViewDefault, "Use default view", true,
+    display.addItem(MenuId::layerViewDefault, "Default", true,
                     state.view == carta::TrackView::useDefault);
     display.addItem(MenuId::layerViewWaveform, "Waveform", true,
                     state.view == carta::TrackView::waveform);
     display.addItem(MenuId::layerViewSpectrogram, "Spectrogram", true,
                     state.view == carta::TrackView::spectrogram);
-    display.addItem(MenuId::layerViewCombined, "Waveform + spectrogram", true,
+    display.addItem(MenuId::layerViewCombined, "Waveform + Spectrogram", true,
                     state.view == carta::TrackView::combined);
-    menu.addSubMenu("Layer view", display);
-    addTrackWaveformZoomMenu(menu, track);
-
+    menu.addSubMenu("Layer View", display);
+    menu.addItem(MenuId::layerGainBalance, "Gain and Balance...");
+    menu.addItem(MenuId::layerChannelRouting, "Channel Routing...",
+                 carta::maxTrackChannels(state) > 0);
     menu.addSeparator();
-    menu.addItem(MenuId::layerSourceInfo, "Source information...");
-    menu.addItem(MenuId::layerGainBalance, "Gain and balance...");
-    menu.addItem(MenuId::layerVerifySources, "Verify layer source files", !activeSourceCheck);
-    menu.addItem(MenuId::layerChannelRouting, "Channel routing...",
-                 carta::maxTrackChannels(state) > 0);
-    menu.addItem(MenuId::layerSwapStereo, "Swap stereo source channels",
-                 carta::maxTrackChannels(state) > 0);
-    menu.addItem(MenuId::layerFoldStereoToMono, "Fold stereo routing to mono",
-                 carta::maxTrackChannels(state) > 0);
-    menu.addItem(MenuId::layerSplitStereo, "Split stereo channels to layers",
-                 carta::maxTrackChannels(state) > 0);
-    menu.addItem(MenuId::layerCombineChannel, "Combine with next channel layer",
+    menu.addItem(MenuId::layerRename, "Rename Layer...");
+    menu.addItem(MenuId::layerDuplicate, "Duplicate Layer");
+    menu.addItem(MenuId::layerMoveUp, "Move Up", track > 0);
+    menu.addItem(MenuId::layerMoveDown, "Move Down",
                  track + 1 < static_cast<int>(session.tracks.size()));
-
     menu.addSeparator();
-    menu.addItem(MenuId::layerRename, "Rename layer...");
-    menu.addItem(MenuId::layerDuplicate, "Duplicate layer");
-    menu.addItem(MenuId::layerRemove, "Remove layer");
-    menu.addItem(MenuId::layerMoveUp, "Move layer up", track > 0);
-    menu.addItem(MenuId::layerMoveDown, "Move layer down",
-                 track + 1 < static_cast<int>(session.tracks.size()));
+    menu.addItem(MenuId::layerSourceInfo, "Source Info...");
+    menu.addItem(MenuId::layerRemove, "Remove Layer");
 
     const auto revision = editGeneration;
-    menu.showMenuAsync(
+    showStudioPopupMenu(
+        menu,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), track, revision](int result) {
@@ -820,54 +805,27 @@ bool Studio::showSelectionContextMenu(const juce::MouseEvent& event) {
         capturedTrack >= 0 && capturedTrack < static_cast<int>(session.tracks.size());
 
     juce::PopupMenu menu;
-    menu.addItem(MenuId::editCopySelection, "Copy selection");
-    menu.addItem(MenuId::editCutSelection, "Cut selection (leave gap)");
-    menu.addItem(MenuId::editDeleteSelection, "Delete selection (leave gap)");
+    menu.addItem(MenuId::editCutSelection, "Cut");
+    menu.addItem(MenuId::editCopySelection, "Copy");
+    menu.addItem(MenuId::editDeleteSelection, "Delete");
 
     juce::PopupMenu deleteRipple;
-    deleteRipple.addItem(MenuId::editRippleDeleteFocused, "Focused layer", hasFocusedTrack);
-    deleteRipple.addItem(MenuId::editRippleDeleteSelected, "Selected layers");
-    deleteRipple.addItem(MenuId::editRippleDeleteAll, "All layers and markers");
-    menu.addSubMenu("Delete and close gap", deleteRipple);
+    deleteRipple.addItem(MenuId::editRippleDeleteFocused, "Focused Layer", hasFocusedTrack);
+    deleteRipple.addItem(MenuId::editRippleDeleteSelected, "Selected Layers");
+    deleteRipple.addItem(MenuId::editRippleDeleteAll, "All Layers");
+    menu.addSubMenu("Delete and Close Gap", deleteRipple);
 
-    juce::PopupMenu cutRipple;
-    cutRipple.addItem(MenuId::editRippleCutFocused, "Focused layer", hasFocusedTrack);
-    cutRipple.addItem(MenuId::editRippleCutSelected, "Selected layers");
-    cutRipple.addItem(MenuId::editRippleCutAll, "All layers and markers");
-    menu.addSubMenu("Cut and close gap", cutRipple);
-
-    menu.addItem(MenuId::editDuplicateSelectionAfter, "Duplicate selection after end (overlap)");
-    menu.addItem(MenuId::editMoveSelection, "Move selection to time and layer...");
-    menu.addItem(MenuId::editTrimOutsideSelection, "Trim outside selection (selected layers)");
+    menu.addItem(MenuId::editTrimOutsideSelection, "Trim Outside Selection");
+    menu.addItem(MenuId::editSplit, "Split at Boundaries");
     menu.addSeparator();
-    menu.addItem(MenuId::editSplit, "Split at selection boundaries");
-    menu.addItem(MenuId::editSplitSelToNewLayers, "Split selection to new layers");
-
-    juce::PopupMenu insertRipple;
-    insertRipple.addItem(MenuId::editInsertGapFocused, "Focused layer", hasFocusedTrack);
-    insertRipple.addItem(MenuId::editInsertGapSelected, "Selected layers");
-    insertRipple.addItem(MenuId::editInsertGapAll, "All layers and markers");
-    menu.addSubMenu("Insert selection-length gap", insertRipple);
-
+    menu.addItem(MenuId::transportPlaySelFull, "Play Selection");
+    menu.addItem(MenuId::transportLoopSelFull, "Loop Selection");
+    menu.addItem(MenuId::editZoomToSelection, "Zoom to Selection");
     menu.addSeparator();
-    menu.addItem(MenuId::transportPlaySelFull, "Play selection (full mix)");
-    menu.addItem(MenuId::transportLoopSelFull, "Loop selection (full mix)");
-    menu.addItem(MenuId::transportPlaySelLayers, "Play selection (selected layers)");
-    menu.addItem(MenuId::transportLoopSelLayers, "Loop selection (selected layers)");
+    menu.addItem(MenuId::fileExportSelWavFull, "Export Selection WAV...");
 
-    juce::PopupMenu previewRipple;
-    previewRipple.addItem(MenuId::previewRippleFocused, "Focused layer", hasFocusedTrack);
-    previewRipple.addItem(MenuId::previewRippleSelected, "Selected layers");
-    previewRipple.addItem(MenuId::previewRippleAll, "All layers and markers");
-    menu.addSubMenu("Preview closing selection", previewRipple);
-
-    menu.addSeparator();
-    menu.addItem(MenuId::fileExportSelWavFull, "Export selection WAV (full mix)");
-    menu.addItem(MenuId::fileExportSelWavLayers, "Export selection WAV (selected layers)");
-    menu.addItem(MenuId::editZoomToSelection, "Zoom to selection");
-    menu.addItem(MenuId::editRememberSelection, "Remember selection");
-
-    menu.showMenuAsync(
+    showStudioPopupMenu(
+        menu,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), captured, revision, capturedTrack,
@@ -1059,20 +1017,8 @@ void Studio::showClipContextMenu(const juce::MouseEvent& event) {
                                     range,
                                 true, hits[i] == chosen);
         }
-        menu.addSubMenu("Select overlapping clip", overlapping);
+        menu.addSubMenu("Select Overlapping Clip", overlapping);
         menu.addSeparator();
-    }
-
-    menu.addItem(MenuId::clipRename, "Rename clip...");
-    menu.addItem(MenuId::clipSelectTime, "Select clip time");
-    juce::PopupMenu clipTime;
-    clipTime.addItem(MenuId::clipSelectVisiblePortion, "Visible portion");
-    clipTime.addItem(MenuId::clipSelectBeforePlayhead, "Before playhead");
-    clipTime.addItem(MenuId::clipSelectAfterPlayhead, "After playhead");
-    menu.addSubMenu("Select clip portion", clipTime);
-    menu.addItem(MenuId::clipZoom, "Zoom to clip");
-    if (!timelineClipSelection.get(editGeneration).empty()) {
-        menu.addSubMenu("Selected clips", selectedClipContextMenu());
     }
 
     const double pointerFrame = xToTime(event.x) * carta::sessionRate;
@@ -1103,47 +1049,31 @@ void Studio::showClipContextMenu(const juce::MouseEvent& event) {
         menu.addSeparator();
     }
 
-    menu.addSeparator();
     menu.addItem(MenuId::clipContextSplitAtPointer,
-                 juce::String(persistentGroup ? "Split group at pointer (sample "
-                                              : "Split at pointer (sample ") +
-                     juce::String(pointerSample) + ")",
-                 canSplit);
+                 persistentGroup ? "Split Group Here" : "Split Here", canSplit);
     menu.addItem(MenuId::editSplit,
-                 persistentGroup ? "Split group at playhead" : "Split at playhead");
-    menu.addItem(MenuId::editDuplicateClip, persistentGroup ? "Duplicate group" : "Duplicate clip");
-    menu.addItem(MenuId::clipJoinNext, "Join with next clip");
-    menu.addItem(MenuId::clipMoveToSample,
-                 persistentGroup ? "Move group using clip start..." : "Move to sample...");
-    menu.addItem(MenuId::clipTrimToSamples,
-                 persistentGroup ? "Trim group using clip range..." : "Trim to sample range...");
-    menu.addItem(MenuId::clipSlip,
-                 persistentGroup ? "Slip group source audio..." : "Slip source audio...");
-
-    juce::PopupMenu trimEdge;
-    trimEdge.addItem(MenuId::clipNudgeStartEarlier, "Start earlier one sample (F5)");
-    trimEdge.addItem(MenuId::clipNudgeStartLater, "Start later one sample (F6)");
-    trimEdge.addItem(MenuId::clipNudgeEndEarlier, "End earlier one sample (F7)");
-    trimEdge.addItem(MenuId::clipNudgeEndLater, "End later one sample (F8)");
-    menu.addSubMenu(timelineClipSelection.get(editGeneration).empty()
-                        ? "Adjust clip edge"
-                        : "Adjust selected clip edges",
-                    trimEdge);
+                 persistentGroup ? "Split Group at Playhead" : "Split at Playhead");
+    menu.addItem(MenuId::editDuplicateClip, persistentGroup ? "Duplicate Group" : "Duplicate");
+    menu.addItem(MenuId::clipJoinNext, "Join with Next");
+    menu.addItem(MenuId::clipRename, "Rename...");
+    if (!timelineClipSelection.get(editGeneration).empty()) {
+        menu.addSubMenu("Selected Clips", selectedClipContextMenu());
+    }
 
     menu.addSeparator();
-    menu.addItem(MenuId::clipGainAndFades, "Gain and fades...");
-    addFadeShapeMenus(menu, true);
-    menu.addItem(MenuId::clipCrossfadeTrack, "Crossfade overlap on this track");
-    menu.addItem(MenuId::clipCrossfadeAcrossTracks, "Crossfade overlap across tracks");
+    menu.addItem(MenuId::clipGainAndFades, "Gain and Fades...");
+    menu.addItem(MenuId::clipCrossfadeTrack, "Crossfade Overlap");
     menu.addSeparator();
-    menu.addItem(MenuId::transportPlayClip, "Play clip");
-    menu.addItem(MenuId::transportLoopClip, "Loop clip");
+    menu.addItem(MenuId::transportPlayClip, "Play Clip");
+    menu.addItem(MenuId::transportLoopClip, "Loop Clip");
+    menu.addItem(MenuId::clipZoom, "Zoom to Clip");
     menu.addSeparator();
-    menu.addItem(MenuId::editDeleteClip, persistentGroup ? "Delete group" : "Delete clip");
+    menu.addItem(MenuId::editDeleteClip, persistentGroup ? "Delete Group" : "Delete Clip");
 
     const auto revision = editGeneration;
     const auto capturedClips = timelineClipSelection.get(editGeneration);
-    menu.showMenuAsync(
+    showStudioPopupMenu(
+        menu,
         juce::PopupMenu::Options().withTargetComponent(this).withTargetScreenArea(
             {event.getScreenX(), event.getScreenY(), 1, 1}),
         [safe = juce::Component::SafePointer<Studio>(this), track, chosen, revision, hits,
@@ -1400,7 +1330,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                              !importIssues.empty());
         recoveryMenu.addItem(MenuId::fileClearImportIssues, "Clear import issues",
                              !importIssues.empty());
-        m.addSubMenu("Project & Recovery", recoveryMenu);
+        m.addSubMenu("Recovery", recoveryMenu);
 
         m.addSeparator();
         m.addCommandItem(&commandManager, MenuId::fileImportAudio, "Import audio...");
@@ -1425,7 +1355,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         exportMenu.addItem(MenuId::fileExportAllMasterTracks, "Export all master tracks WAV...",
                            session.length() > 0);
         exportMenu.addItem(MenuId::fileExportManifest, "Export track manifest...");
-        m.addSubMenu("Export Special", exportMenu);
+        m.addSubMenu("Export", exportMenu);
 
         m.addSeparator();
         const bool hasPendingImports =
@@ -1444,7 +1374,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                            activeSave && !activeSave->cancelled.load());
         cancelMenu.addItem(MenuId::fileCancelPendingImports, "Cancel pending imports",
                            hasPendingImports);
-        m.addSubMenu("Cancel Background Tasks", cancelMenu, hasCancelable);
+        m.addSubMenu("Background Tasks", cancelMenu, hasCancelable);
     }
 
     if (index == MenuBarIndex::edit) {
@@ -1571,7 +1501,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                              timeSelection.hasRange());
         pasteRippleMenu.addSubMenu("Insert selection-length gap", insertRipple,
                                    timeSelection.hasRange());
-        m.addSubMenu("Paste & Ripple", pasteRippleMenu);
+        m.addSubMenu("Ripple", pasteRippleMenu);
         m.addSeparator();
 
         m.addCommandItem(&commandManager, MenuId::editSelectAll, "Select all audio");
@@ -1891,7 +1821,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                                   timelineClipSelection.get(editGeneration).size() >= 3);
         selectedClipsMenu.addSeparator();
         selectedClipsMenu.addItem(MenuId::selectedClipsClear, "Clear clip selection", hasClips);
-        m.addSubMenu("Selected clips", selectedClipsMenu, hasClips || !session.tracks.empty());
+        m.addSubMenu("Selected Clips", selectedClipsMenu, hasClips || !session.tracks.empty());
 
         juce::PopupMenu snappingMenu;
         snappingMenu.addItem(MenuId::snapOff, "Snap off", true, snapMode == 0);
@@ -1950,7 +1880,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                             !timelineClipSelection.get(editGeneration).empty());
         playSelMenu.addItem(MenuId::transportLoopSelectedClips, "Loop selected clips",
                             !timelineClipSelection.get(editGeneration).empty());
-        m.addSubMenu("Play & Loop Selection", playSelMenu);
+        m.addSubMenu("Selection Playback", playSelMenu);
 
         juce::PopupMenu loopMenu;
         loopMenu.addItem(MenuId::savedLoopSetFromSel, "Set loop region from selection",
@@ -1960,7 +1890,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                              savedLoop.end <= carta::projectEndSample(session));
         loopMenu.addItem(MenuId::savedLoopClear, "Clear loop region",
                          savedLoop.end > savedLoop.start);
-        m.addSubMenu("Saved Loop Region", loopMenu);
+        m.addSubMenu("Loop Region", loopMenu);
 
         juce::PopupMenu auditionMenu;
         auditionMenu.addItem(MenuId::auditionPlayhead, "Audition around playhead",
@@ -1994,7 +1924,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         auditionMenu.addSubMenu("Preview linear crossfade", crossfade, validSelection());
         auditionMenu.addSeparator();
         auditionMenu.addItem(MenuId::auditionSetContext, "Set audition context...");
-        m.addSubMenu("Audition & Preview", auditionMenu);
+        m.addSubMenu("Audition", auditionMenu);
 
         juce::PopupMenu seekMenu;
         seekMenu.addItem(MenuId::seekOneSampleEarlier, "Playhead one sample earlier (Left)",
@@ -2005,7 +1935,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                          session.length() > 0);
         seekMenu.addItem(MenuId::seekMasterEnd, "Playhead to master end (End)",
                          session.length() > 0);
-        m.addSubMenu("Seek Playhead", seekMenu, session.length() > 0);
+        m.addSubMenu("Seek", seekMenu, session.length() > 0);
         m.addSeparator();
 
         m.addItem(MenuId::audioSettings, "Audio output settings...");
@@ -2014,7 +1944,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         juce::PopupMenu diagMenu;
         diagMenu.addItem(MenuId::metersResetPeaks, "Reset held output peaks");
         diagMenu.addItem(MenuId::metersResetEditLockCount, "Reset edit-lock interruption count");
-        m.addSubMenu("Diagnostics & Meters", diagMenu);
+        m.addSubMenu("Meters", diagMenu);
     }
 
     if (index == MenuBarIndex::markers) {
@@ -2058,7 +1988,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         navListMenu.addItem(MenuId::markerTrackList, "Track list...", session.length() > 0);
         navListMenu.addItem(MenuId::markerList, "Marker list and repair...",
                             !session.markers.empty());
-        m.addSubMenu("Navigate & Lists", navListMenu);
+        m.addSubMenu("Navigate", navListMenu);
 
         juce::PopupMenu editShiftMenu;
         editShiftMenu.addItem(MenuId::markerNudgeLeft, "Move selected marker left one sample (F9)",
@@ -2079,7 +2009,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                               "Replace marker names with track numbers", !session.markers.empty());
         editShiftMenu.addItem(MenuId::markerDeleteInSelection, "Delete markers in time selection",
                               timeSelection.hasRange() && !session.markers.empty());
-        m.addSubMenu("Edit & Shift Markers", editShiftMenu);
+        m.addSubMenu("Shift", editShiftMenu);
 
         juce::PopupMenu genMenu;
         genMenu.addItem(MenuId::markerAddAtClipStarts, "Add markers at selected clip starts",
@@ -2090,7 +2020,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                         validSelection());
         genMenu.addItem(MenuId::markerSuggestQuietGaps, "Suggest markers from quiet gaps...",
                         session.length() > 0 && !activeLevelAnalysis);
-        m.addSubMenu("Generate Markers", genMenu);
+        m.addSubMenu("Generate", genMenu);
 
         m.addSeparator();
         juce::PopupMenu ioMenu;
@@ -2104,7 +2034,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         ioMenu.addSeparator();
         ioMenu.addItem(MenuId::markerCancelExchange, "Cancel marker exchange",
                        activeMarkerExchange && !activeMarkerExchange->cancelled.load());
-        m.addSubMenu("Import & Export", ioMenu);
+        m.addSubMenu("Exchange", ioMenu);
     }
 
     if (index == MenuBarIndex::master) {
@@ -2125,7 +2055,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                               wavEncoding != carta::WavEncoding::float32, wavDither);
         wavFormatMenu.addItem(MenuId::wavToggleEmbedMarkers, "Embed markers in WAV", true,
                               wavEmbedMarkers);
-        m.addSubMenu("WAV Export Format", wavFormatMenu);
+        m.addSubMenu("WAV Format", wavFormatMenu);
 
         juce::PopupMenu analysisMenu;
         analysisMenu.addItem(MenuId::analyzeMasterLevels, "Analyze master levels...",
@@ -2172,7 +2102,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         waveMenu.addItem(MenuId::viewTogglePeakWarnings, "Show clip peaks over 0 dBFS", true,
                          showClipPeakWarnings);
         waveMenu.addItem(MenuId::viewToggleRms, "Show clip RMS overlay", true, showWaveformRms);
-        m.addSubMenu("Waveform Display", waveMenu);
+        m.addSubMenu("Waveform", waveMenu);
 
         juce::PopupMenu specMenu;
         juce::PopupMenu resolution;
@@ -2216,7 +2146,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         frequency.addItem(MenuId::viewSpectrumCustomRange, "Custom frequency range...", true,
                           spectrumBand == carta::SpectrumBand::custom);
         specMenu.addSubMenu("Spectrogram frequency range", frequency);
-        m.addSubMenu("Spectrogram Settings", specMenu);
+        m.addSubMenu("Spectrogram", specMenu);
         m.addSeparator();
 
         m.addItem(MenuId::viewZoomIn, "Zoom in");
@@ -2271,7 +2201,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
         navViewMenu.addSeparator();
         navViewMenu.addItem(MenuId::viewBrowseOverlaps, "Browse clip overlaps...",
                             !session.tracks.empty());
-        m.addSubMenu("Navigate & Time Units", navViewMenu);
+        m.addSubMenu("Navigation", navViewMenu);
     }
 
     if (index == MenuBarIndex::layer) {
@@ -2338,7 +2268,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                         view == carta::TrackView::combined);
         arrangeMenu.addSubMenu("Layer view", display, valid);
         addTrackWaveformZoomMenu(arrangeMenu, selectedTrack);
-        m.addSubMenu("Arrange & Appearance", arrangeMenu);
+        m.addSubMenu("Layout", arrangeMenu);
 
         juce::PopupMenu navLayerMenu;
         navLayerMenu.addItem(MenuId::layerBrowseNavigator, "Browse layers and clips... (F3)",
@@ -2362,7 +2292,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                              "Focus previous clip without seeking (Shift+F5)", valid);
         navLayerMenu.addItem(MenuId::layerFocusNextClip,
                              "Focus next clip without seeking (Shift+F6)", valid);
-        m.addSubMenu("Navigate Layers & Clips", navLayerMenu);
+        m.addSubMenu("Navigate", navLayerMenu);
 
         juce::PopupMenu routingMenu;
         const bool hasChannels =
@@ -2380,7 +2310,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                             hasChannels);
         routingMenu.addItem(MenuId::layerCombineChannel, "Combine with next channel layer",
                             valid && selectedTrack + 1 < static_cast<int>(session.tracks.size()));
-        m.addSubMenu("Channels & Routing", routingMenu);
+        m.addSubMenu("Channels", routingMenu);
 
         juce::PopupMenu renderMenu;
         renderMenu.addItem(MenuId::layerRenderSelectedTime,
@@ -2398,7 +2328,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
             MenuId::layerRenderSelectedClips, "Render selected clips to new layer...",
             (validSelection() || !timelineClipSelection.get(editGeneration).empty()) &&
                 !activeExport && pendingImports.empty());
-        m.addSubMenu("Render & Bounce", renderMenu);
+        m.addSubMenu("Bounce", renderMenu);
 
         juce::PopupMenu selSourcesMenu;
         juce::PopupMenu rows;
@@ -2447,7 +2377,7 @@ juce::PopupMenu Studio::getMenuForIndex(int index, const juce::String&) {
                                !session.tracks.empty() && !activeSourceCheck);
         selSourcesMenu.addItem(MenuId::layerCancelSourceCheck, "Cancel source check or relink",
                                activeSourceCheck && !activeSourceCheck->cancelled.load());
-        m.addSubMenu("Selection & Sources", selSourcesMenu);
+        m.addSubMenu("Sources", selSourcesMenu);
     }
 
     if (index == MenuBarIndex::help) {

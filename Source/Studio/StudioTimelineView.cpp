@@ -962,8 +962,8 @@ void Studio::paint(juce::Graphics& g) {
                     if (gx < area.getX() + labelWidth || gx >= area.getRight()) {
                         continue;
                     }
-                    g.setColour(juce::Colour(dark ? 0xff70a8ff : 0xff2563eb)
-                                    .withAlpha(focused ? 0.24f : 0.11f));
+                    const auto guidePal = carta::theme::palette(dark);
+                    g.setColour(guidePal.mdGuideLine.withAlpha(focused ? 0.28f : 0.12f));
                     for (int dy = topY; dy < botY; dy += 6) {
                         g.fillRect(gx, dy, 1, std::min(3, botY - dy));
                     }
@@ -1051,7 +1051,7 @@ void Studio::paint(juce::Graphics& g) {
 // ============================================================================
 
 juce::String Studio::getTooltip() {
-    return dragMode == kDragNone ? hoverHelpAt(getMouseXYRelative()) : juce::String();
+    return {};
 }
 
 juce::Rectangle<int> Studio::timeline() const {
@@ -2718,13 +2718,11 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
     const bool selected = clipAppearsSelected(t, index);
     const int trackZoom =
         carta::trackWaveformZoom(session.tracks[static_cast<size_t>(t)], waveformVerticalZoom);
+    const auto pal = carta::theme::palette(dark);
     if (c.lockedOnDisc) {
-        g.setColour((dark ? (selected ? juce::Colour(0xff2b5968) : juce::Colour(0xff1e414d))
-                          : (selected ? juce::Colour(0xff6b9aa8) : juce::Colour(0xff89b2bf)))
-                        .withAlpha(0.65f));
+        g.setColour((selected ? pal.onDiscClipSelectedFill : pal.onDiscClipFill).withAlpha(0.76f));
         g.fillRect(rect);
-        g.setColour(dark ? juce::Colour(0xff4dd0e1).withAlpha(0.80f)
-                         : juce::Colour(0xff00796b).withAlpha(0.85f));
+        g.setColour(pal.onDiscClipBorder.withAlpha(0.85f));
         g.fillRect(rect.getX(), rect.getY(), rect.getWidth(), 2);
     } else {
         g.setColour((dark ? (selected ? juce::Colour(0xff8b8b8b) : juce::Colour(0xff666666))
@@ -2740,8 +2738,7 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
     } else if (c.audio && c.audio->onDiscPlaceholder) {
         if (content.getHeight() > 6 && visible.getWidth() > 24) {
             const int midY = content.getCentreY();
-            g.setColour(
-                (dark ? juce::Colour(0xff4dd0e1) : juce::Colour(0xff00695c)).withAlpha(0.28f));
+            g.setColour(pal.onDiscClipBorder.withAlpha(0.28f));
             g.drawHorizontalLine(midY, static_cast<float>(visible.getX()),
                                  static_cast<float>(visible.getRight()));
 
@@ -2757,15 +2754,11 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
                 const bool hovered =
                     !isDownloading && hoveredDownloadRegionId == c.onDiscRegionId &&
                     std::abs(hoveredDownloadClipStartSample - clipStartSmp) <= 2;
-                const auto fillCol =
-                    isDownloading
-                        ? (dark ? juce::Colour(0xff1b3a3f) : juce::Colour(0xffd7f0ee))
-                        : (hovered
-                               ? (dark ? juce::Colour(0xff235258) : juce::Colour(0xffccece8))
-                               : (dark ? juce::Colour(0xff1b3c40) : juce::Colour(0xffe2f4f2)));
+                const auto fillCol = isDownloading
+                                         ? pal.onDiscPillBg
+                                         : (hovered ? pal.onDiscPillHoverBg : pal.onDiscPillBg);
                 const auto borderCol =
-                    dark ? juce::Colour(0xff4dd0e1).withAlpha(hovered ? 0.90f : 0.65f)
-                         : juce::Colour(0xff00695c).withAlpha(hovered ? 0.85f : 0.55f);
+                    pal.onDiscPillBorder.withAlpha(hovered ? 0.95f : 0.70f);
                 g.setColour(fillCol);
                 g.fillRoundedRectangle(pill.toFloat(), 4.0f);
                 if (isDownloading) {
@@ -2773,14 +2766,13 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
                         std::clamp(currentDownloadingRegionProgress(), 0.0, 1.0);
                     const int fillW = static_cast<int>(std::lround(pill.getWidth() * frac));
                     if (fillW > 0) {
-                        g.setColour((dark ? juce::Colour(0xff26a69a) : juce::Colour(0xff26a69a))
-                                        .withAlpha(0.38f));
+                        g.setColour(pal.progressFill);
                         g.fillRoundedRectangle(pill.withWidth(fillW).toFloat(), 4.0f);
                     }
                 }
                 g.setColour(borderCol);
                 g.drawRoundedRectangle(pill.toFloat().reduced(0.5f), 4.0f, 1.0f);
-                g.setColour(dark ? juce::Colour(0xffe0f7fa) : juce::Colour(0xff004d40));
+                g.setColour(pal.textPrimary);
                 g.setFont(juce::FontOptions(10.5f, juce::Font::bold));
                 juce::String pillText;
                 if (isDownloading) {
@@ -2806,16 +2798,13 @@ void Studio::drawClip(juce::Graphics& g, const carta::Clip& c, int t, int index,
                                                                          .getX() +
                                                                      8);
                 if (remaining.getWidth() >= 110 && !isDownloading) {
-                    g.setColour(
-                        (dark ? juce::Colour(0xffb2ebf2) : juce::Colour(0xff004d40))
-                            .withAlpha(0.72f));
+                    g.setColour(pal.textSecondary);
                     g.setFont(juce::FontOptions(10.0f));
                     g.drawText("On-Disc Audio", remaining.reduced(2, 0),
                                juce::Justification::centredLeft, true);
                 }
             } else if (visible.getWidth() > 54 && content.getHeight() > 14) {
-                g.setColour(
-                    (dark ? juce::Colour(0xffb2ebf2) : juce::Colour(0xff004d40)).withAlpha(0.85f));
+                g.setColour(pal.textSecondary);
                 g.setFont(juce::FontOptions(10.5f));
                 const juce::String label =
                     visible.getWidth() >= 150 ? "On-Disc Audio (UTOC loaded)" : "On-Disc";

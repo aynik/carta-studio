@@ -3079,8 +3079,8 @@ void Studio::triggerHiMdDiscToolsMenuFromUi() {
     menu.addItem(6, "Delete Selected Track...", hasTracks);
     menu.addItem(7, "Dump Selected Track...", hasTracks);
 
-    menu.showMenuAsync(juce::PopupMenu::Options(),
-                       [safe = juce::Component::SafePointer<Studio>(this), selTrack](int choice) {
+    showStudioPopupMenu(menu, juce::PopupMenu::Options().withTargetComponent(this),
+                        [safe = juce::Component::SafePointer<Studio>(this), selTrack](int choice) {
                            if (safe == nullptr || choice <= 0) {
                                return;
                            }

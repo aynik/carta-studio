@@ -8,6 +8,7 @@
  */
 
 #include "Studio/StudioDialogs.h"
+#include "Studio/StudioTheme.h"
 
 #include <array>
 
@@ -18,11 +19,11 @@ bool isDarkTheme() {
 }
 
 juce::Colour dialogBackgroundColour(bool dark) {
-    return dark ? juce::Colour(0xff252525) : juce::Colour(0xffeeeeee);
+    return carta::theme::palette(dark).dialogBg;
 }
 
 juce::Colour listForegroundColour(bool dark) {
-    return dark ? juce::Colour(0xffdddddd) : juce::Colour(0xff303030);
+    return carta::theme::palette(dark).textPrimary;
 }
 
 void paintSelectedRowBackground(juce::Graphics& g, int width, int height, bool dark,
