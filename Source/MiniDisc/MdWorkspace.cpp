@@ -1086,11 +1086,16 @@ void MdWorkspace::update(const carta::Session& session, const carta::TimeSelecti
         utocValid = true;
         utocErrorText.clear();
         budget = {};
-        hiMdTotalBytes =
-            (recordUiState.activeDeviceIsHiMd && recordUiState.hasHiMdStatus &&
-             recordUiState.hiMdStatus.fsTotalBytes > 0)
-                ? recordUiState.hiMdStatus.fsTotalBytes
-                : carta::hiMdMediumCapacityBytes(discState.medium);
+        const bool hasDeviceCap = recordUiState.activeDeviceIsHiMd && recordUiState.hasHiMdStatus &&
+                                  recordUiState.hiMdStatus.fsTotalBytes > 0;
+        if (hasDeviceCap) {
+            hiMdTotalBytes =
+                (!discState.loadedDisc.active && recordUiState.hiMdStatus.fsFreeBytes > 0)
+                    ? recordUiState.hiMdStatus.fsFreeBytes
+                    : recordUiState.hiMdStatus.fsTotalBytes;
+        } else {
+            hiMdTotalBytes = carta::hiMdMediumCapacityBytes(discState.medium);
+        }
         hiMdUsedBytes = physicalPlan.hiMdUniqueBytes +
                         (physicalPlan.uniqueAudioTrackCount > 0
                              ? static_cast<std::int64_t>(physicalPlan.uniqueAudioTrackCount) *
@@ -1683,13 +1688,22 @@ void MdWorkspace::updateRecordSummary(const RecordUiSnapshot& snapshot) {
     const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
     juce::String capSummary;
     if (carta::isHiMdMedium(discState.medium)) {
+        if (snapshot.activeDeviceIsHiMd && snapshot.hasHiMdStatus &&
+            snapshot.hiMdStatus.fsTotalBytes > 0) {
+            hiMdTotalBytes =
+                (!discState.loadedDisc.active && snapshot.hiMdStatus.fsFreeBytes > 0)
+                    ? snapshot.hiMdStatus.fsFreeBytes
+                    : snapshot.hiMdStatus.fsTotalBytes;
+        }
         const std::int64_t capBytes =
             hiMdTotalBytes > 0 ? hiMdTotalBytes : carta::hiMdMediumCapacityBytes(discState.medium);
-        const int pct =
-            capBytes > 0
-                ? static_cast<int>(std::llround((static_cast<double>(hiMdUsedBytes) * 100.0) /
-                                                static_cast<double>(capBytes)))
-                : 0;
+        int pct = capBytes > 0
+                      ? static_cast<int>(std::llround((static_cast<double>(hiMdUsedBytes) * 100.0) /
+                                                      static_cast<double>(capBytes)))
+                      : 0;
+        if (hiMdUsedBytes > capBytes && pct <= 100) {
+            pct = 101;
+        }
         capSummary = formatMegabytes(hiMdUsedBytes) + " / " + formatMegabytes(capBytes) + " (" +
                      juce::String(pct) + "%)";
     } else {
@@ -2415,11 +2429,13 @@ void MdWorkspace::refreshPlanSummaryLabels() {
     if (carta::isHiMdMedium(discState.medium)) {
         const std::int64_t capBytes =
             hiMdTotalBytes > 0 ? hiMdTotalBytes : carta::hiMdMediumCapacityBytes(discState.medium);
-        const int pct =
-            capBytes > 0
-                ? static_cast<int>(std::llround((static_cast<double>(hiMdUsedBytes) * 100.0) /
-                                                static_cast<double>(capBytes)))
-                : 0;
+        int pct = capBytes > 0
+                      ? static_cast<int>(std::llround((static_cast<double>(hiMdUsedBytes) * 100.0) /
+                                                      static_cast<double>(capBytes)))
+                      : 0;
+        if (hiMdUsedBytes > capBytes && pct <= 100) {
+            pct = 101;
+        }
         const auto dot = juce::String::fromUTF8(" \xc2\xb7 ");
         const juce::String uniqPart =
             physicalPlan.aliasedTrackCount > 0

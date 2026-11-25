@@ -3763,8 +3763,12 @@ bool packageNameValid(const juce::String& name) {
 
 // Validate paths before invoking the normal loader so an untrusted package
 // cannot cause it to open a source outside the private extraction directory.
+// Also reconciles Unicode normalization differences (e.g. macOS NFD vs NFC
+// filenames in Media/) when a verified package entry matches by SHA-256.
 bool packageProjectPathsValid(const juce::File& project, const std::set<juce::String>& names,
-                              juce::String& error) {
+                              const std::map<juce::String, juce::String>& hashToMediaName,
+                              bool& projectRewritten, juce::String& error) {
+    projectRewritten = false;
     const auto size = project.getSize();
     if (size <= 0 || size > maxProjectBytes) {
         error = "Invalid package project size.";
@@ -3794,12 +3798,12 @@ bool packageProjectPathsValid(const juce::File& project, const std::set<juce::St
     juce::int64 pkgVersion = 0;
     integerValue(root["version"], pkgVersion);
 
-    for (const auto& track : *root["tracks"].getArray()) {
+    for (auto& track : *root["tracks"].getArray()) {
         if (!track.isObject() || !track["clips"].isArray()) {
             error = "Invalid package track.";
             return false;
         }
-        for (const auto& clip : *track["clips"].getArray()) {
+        for (auto& clip : *track["clips"].getArray()) {
             if (pkgVersion >= 26 && clip.isObject() &&
                 clip.getDynamicObject()->hasProperty("onDiscPlaceholder") &&
                 clip["onDiscPlaceholder"].isBool() &&
@@ -3811,10 +3815,28 @@ bool packageProjectPathsValid(const juce::File& project, const std::set<juce::St
             if (!clip.isObject() || !clip["source"].isString() ||
                 !clip["sourceSha256"].isString() || hash.length() != 64 ||
                 !hash.containsOnly("0123456789abcdef") || !name.startsWith("Media/") ||
-                !packageNameValid(name) || !names.count(name)) {
+                !packageNameValid(name)) {
                 error = "Package project refers to missing, unverified or external media.";
                 return false;
             }
+            if (!names.count(name)) {
+                const auto it = hashToMediaName.find(hash);
+                if (it == hashToMediaName.end()) {
+                    error = "Package project refers to missing, unverified or external media.";
+                    return false;
+                }
+                clip.getDynamicObject()->setProperty("source", it->second);
+                projectRewritten = true;
+            }
+        }
+    }
+    if (projectRewritten) {
+        auto temp = prepareCheckedText(
+            project,
+            juce::JSON::toString(root, juce::JSON::FormatOptions{}.withMaxDecimalPlaces(24)));
+        if (!temp || !commitTemporary(*temp, project, false)) {
+            error = "Could not normalize package project media paths.";
+            return false;
         }
     }
     return true;
@@ -4042,6 +4064,7 @@ bool loadNativePackage(Session& result, int& master, juce::AudioFormatManager& f
 
     std::set<juce::String> names;
     std::set<juce::String> foldedNames;
+    std::map<juce::String, juce::String> hashToMediaName;
     std::vector<std::pair<juce::File, FileObservation>> extracted;
     std::vector<char> buffer(1024u * 1024u);
 
@@ -4124,6 +4147,9 @@ bool loadNativePackage(Session& result, int& master, juce::AudioFormatManager& f
             error = "Package entry checksum does not match: " + name;
             return false;
         }
+        if (name.startsWith("Media/") && !hashToMediaName.count(expected)) {
+            hashToMediaName.emplace(expected, name);
+        }
 
         extracted.emplace_back(file, FileObservation(file));
         if (!extracted.back().second.isValid()) {
@@ -4147,8 +4173,17 @@ bool loadNativePackage(Session& result, int& master, juce::AudioFormatManager& f
     }
 
     const auto project = scratch->directory.getChildFile("Project.carta");
-    if (!packageProjectPathsValid(project, names, error)) {
+    bool projectRewritten = false;
+    if (!packageProjectPathsValid(project, names, hashToMediaName, projectRewritten, error)) {
         return false;
+    }
+    if (projectRewritten) {
+        for (auto& entry : extracted) {
+            if (entry.first == project) {
+                entry.second = FileObservation(project);
+                break;
+            }
+        }
     }
 
     Session next;

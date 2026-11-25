@@ -787,6 +787,10 @@ void testHiMdAuthoringAndSessionV27() {
         carta::effectiveTrackCodec(hiDisc, hiDisc.tracks[2]), hiDisc.tracks[2].totalSamples());
     check(bHiLp > 0 && bHiSp > bHiLp && bPcm > bHiSp,
           "estimateHiMdTrackBytes scales monotonically Hi-LP < Hi-SP < PCM");
+    // Hi-SP fits 10 whole 1488-byte frames per 16,384-byte block (14,880 B payload/block).
+    // 10 * 2048 = 20,480 samples -> 10 + 2 flush = 12 frames -> ceil(12 / 10) = 2 blocks = 32,768 B.
+    check(carta::estimateHiMdTrackBytes(carta::MdCodecMode::hiSp, 20480) == 32768,
+          "estimateHiMdTrackBytes matches exact Hi-SP 10-frames-per-16KiB-block packing");
 
     carta::MdPhysicalPlan hiPlan;
     check(carta::planMdPhysicalAudio(hiDisc, hiPlan, err) && hiPlan.maxEndSample == 132300 &&

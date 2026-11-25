@@ -2460,6 +2460,10 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
     juce::var res;
     if (!invokeHiMdUnlocked({"commit-batch", resolvedId, manifestPath, confirmArg}, cliArgs,
                             useMockSess, /*allowElevationPrompt=*/true, &win, res, error)) {
+        if (containsCaseInsensitive(error, "allocate more links")) {
+            error = "Hi-MD disc ran out of free space while writing audio (FAT16 cluster "
+                    "allocator full). Reduce track duration or use a lower-bitrate codec.";
+        }
         return false;
     }
 
@@ -2589,6 +2593,10 @@ bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confir
     juce::var res;
     if (!invokeHiMdUnlocked({"commit-batch", resolvedId, manifestPath, confirmArg}, cliArgs,
                             useMockSess, /*allowElevationPrompt=*/true, &win, res, error)) {
+        if (containsCaseInsensitive(error, "allocate more links")) {
+            error = "Hi-MD disc ran out of free space while writing audio (FAT16 cluster "
+                    "allocator full). Reduce track duration or use a lower-bitrate codec.";
+        }
         return false;
     }
 

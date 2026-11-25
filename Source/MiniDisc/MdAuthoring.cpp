@@ -306,44 +306,48 @@ std::int64_t estimateHiMdTrackBytes(MdCodecMode mode, std::int64_t samples) noex
     if (samples <= 0) {
         return 0;
     }
-    std::int64_t rawBytes = 0;
+    // Match `himd-js` / `ATDATA01.HMA` exact block geometry: each 16,384-byte block holds at most
+    // `floor(maxBytesInBlock / bytesPerFrame)` whole frames (frames never span blocks). For Hi-SP
+    // (1488 B/frame), that is 10 frames/block (14,880 B payload per 16,384 B block, ~10.1% framing
+    // overhead), which must be accounted for accurately so preflight never overflows FAT16.
+    constexpr std::int64_t kHiMdBlockBytes = 16384LL;
+    constexpr std::int64_t kHiMdAudioBytesAtrac = 16319LL;
+    constexpr std::int64_t kHiMdAudioBytesPcm = 16320LL;
+    std::int64_t frames = 0;
+    std::int64_t bytesPerFrame = 0;
+    std::int64_t maxBytesInBlock = kHiMdAudioBytesAtrac;
     switch (mode) {
-    case MdCodecMode::hiSp: {
-        const std::int64_t frames = ((samples + 2047) / 2048) + 2;
-        rawBytes = frames * 1488LL;
+    case MdCodecMode::hiSp:
+        frames = ((samples + 2047) / 2048) + 2;
+        bytesPerFrame = 1488LL;
         break;
-    }
-    case MdCodecMode::hiLp: {
-        const std::int64_t frames = ((samples + 2047) / 2048) + 2;
-        rawBytes = frames * 376LL;
+    case MdCodecMode::hiLp:
+        frames = ((samples + 2047) / 2048) + 2;
+        bytesPerFrame = 376LL;
         break;
-    }
-    case MdCodecMode::lp2: {
-        const std::int64_t frames = ((samples + 1023) / 1024) + 3;
-        rawBytes = frames * 384LL;
+    case MdCodecMode::lp2:
+        frames = ((samples + 1023) / 1024) + 3;
+        bytesPerFrame = 384LL;
         break;
-    }
-    case MdCodecMode::lp4: {
-        const std::int64_t frames = ((samples + 1023) / 1024) + 3;
-        rawBytes = frames * 192LL;
+    case MdCodecMode::lp4:
+        frames = ((samples + 1023) / 1024) + 3;
+        bytesPerFrame = 192LL;
         break;
-    }
     case MdCodecMode::pcm:
-        rawBytes = samples * 4LL;
+        frames = (samples * 4LL + 63LL) / 64LL;
+        bytesPerFrame = 64LL;
+        maxBytesInBlock = kHiMdAudioBytesPcm;
         break;
     case MdCodecMode::spStereo:
     case MdCodecMode::spMono:
         return 0;
     }
-    if (rawBytes <= 0) {
+    if (frames <= 0 || bytesPerFrame <= 0) {
         return 0;
     }
-    constexpr std::int64_t kHiMdPayloadPerBlock = 16320LL;
-    constexpr std::int64_t kHiMdBlockBytes = 16384LL;
-    constexpr std::int64_t kFatClusterBytes = 32768LL;
-    const std::int64_t blocks = (rawBytes + kHiMdPayloadPerBlock - 1) / kHiMdPayloadPerBlock;
-    const std::int64_t atdataBytes = blocks * kHiMdBlockBytes;
-    return ((atdataBytes + kFatClusterBytes - 1) / kFatClusterBytes) * kFatClusterBytes;
+    const std::int64_t framesPerBlock = std::max<std::int64_t>(1, maxBytesInBlock / bytesPerFrame);
+    const std::int64_t blocks = (frames + framesPerBlock - 1) / framesPerBlock;
+    return blocks * kHiMdBlockBytes;
 }
 
 int mdTotalClusters(MdMedium medium) noexcept {
