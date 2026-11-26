@@ -2840,12 +2840,40 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
   }
 
   const audioUploads = Array.isArray(manifest.audioUploads) ? manifest.audioUploads : [];
+  const slicedSlots = Array.isArray(manifest.slicedSlots) ? manifest.slicedSlots : [];
   const playOrder = Array.isArray(manifest.playOrder) ? manifest.playOrder : [];
   const slotMetadata = Array.isArray(manifest.slotMetadata) ? manifest.slotMetadata : [];
   const groups = Array.isArray(manifest.groups) ? manifest.groups : null;
 
   if (playOrder.length > 2047) {
     throw new HiMDError('Hi-MD PlayOrder exceeds maximum of 2047 tracks');
+  }
+
+  const sliceById = {};
+  const slicePlans = [];
+  for (let i = 0; i < slicedSlots.length; i++) {
+    const sl = slicedSlots[i];
+    if (!sl || typeof sl.id !== 'string' || sl.id.length === 0 || sliceById[sl.id]) {
+      throw new HiMDError('Invalid or duplicate slicedSlot id at index ' + i);
+    }
+    const sourceSlot = sl.sourceSlot | 0;
+    const startFrame = typeof sl.startFrame === 'number' ? Math.max(0, Math.floor(sl.startFrame)) : 0;
+    const endFrame = typeof sl.endFrame === 'number' ? Math.floor(sl.endFrame) : -1;
+    if (sourceSlot < 1 || sourceSlot > 2047 || (endFrame >= 0 && endFrame <= startFrame)) {
+      throw new HiMDError('Invalid slicedSlot range for ' + sl.id);
+    }
+    const sp = {
+      id: sl.id,
+      sourceSlot,
+      startFrame,
+      endFrame,
+      title: typeof sl.title === 'string' ? sl.title : '',
+      artist: typeof sl.artist === 'string' ? sl.artist : '',
+      album: typeof sl.album === 'string' ? sl.album : '',
+      durationSeconds: typeof sl.durationSeconds === 'number' ? sl.durationSeconds : 0,
+    };
+    sliceById[sp.id] = sp;
+    slicePlans.push(sp);
   }
 
   const uploadById = {};
@@ -2951,11 +2979,23 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
     }
 
     const keptSlotSet = {};
+    const slicedSourceSlotSet = {};
+    for (let i = 0; i < slicePlans.length; i++) {
+      const srcSlot = slicePlans[i].sourceSlot;
+      if (!oldSlotSet[srcSlot] || himd.getTrack(srcSlot).firstFragment === 0) {
+        throw new HiMDError('slicedSlot references missing on-disc TrackInfo slot: ' + srcSlot);
+      }
+      slicedSourceSlotSet[srcSlot] = true;
+    }
     for (let i = 0; i < playOrder.length; i++) {
       const entry = playOrder[i];
       if (entry && typeof entry.uploadId === 'string' && entry.uploadId.length > 0) {
         if (!uploadById[entry.uploadId]) {
           throw new HiMDError('PlayOrder references unknown uploadId: ' + entry.uploadId);
+        }
+      } else if (entry && typeof entry.sliceId === 'string' && entry.sliceId.length > 0) {
+        if (!sliceById[entry.sliceId]) {
+          throw new HiMDError('PlayOrder references unknown sliceId: ' + entry.sliceId);
         }
       } else if (entry && typeof entry.existingSlot === 'number') {
         const slot = entry.existingSlot | 0;
@@ -2977,21 +3017,33 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
 
     const slotsToFree = [];
     const slotsToFreeSet = {};
+    const replacedSlicedSourceSlots = [];
     if (manifest.freeUnreferencedSlots !== false) {
       for (let i = 0; i < oldCount; i++) {
         const s = oldPlayOrder[i];
-        if (s >= 1 && !keptSlotSet[s] && !slotsToFreeSet[s]) {
+        if (s >= 1 && !keptSlotSet[s] && !slicedSourceSlotSet[s] && !slotsToFreeSet[s]) {
           slotsToFreeSet[s] = true;
           slotsToFree.push(s);
         }
       }
     }
-
-    if (countFreeTrackSlots(himd) + slotsToFree.length < uploadPlans.length) {
-      throw new HiMDError('Not enough free Hi-MD TrackInfo slots for batch upload');
+    const slicedSrcKeysAll = Object.keys(slicedSourceSlotSet);
+    for (let i = 0; i < slicedSrcKeysAll.length; i++) {
+      const s = Number(slicedSrcKeysAll[i]) | 0;
+      if (!keptSlotSet[s]) {
+        replacedSlicedSourceSlots.push(s);
+      }
     }
 
-    const needsSecureSession = uploadPlans.length > 0 || slotsToFree.length > 0;
+    if (
+      countFreeTrackSlots(himd) + slotsToFree.length + replacedSlicedSourceSlots.length <
+      uploadPlans.length + slicePlans.length
+    ) {
+      throw new HiMDError('Not enough free Hi-MD TrackInfo slots for batch operation');
+    }
+
+    const needsSecureSession =
+      uploadPlans.length > 0 || slotsToFree.length > 0 || slicePlans.length > 0;
     let session = null;
     if (needsSecureSession) {
       session = new HiMDSecureSession(himd, fs.driver);
@@ -2999,6 +3051,23 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
     }
 
     if (slotsToFree.length > 0) {
+      // Collect block ranges still referenced by kept or sliced-source tracks so freeing
+      // one half of a previously in-place-split track never corrupts the surviving half.
+      const protectedRanges = [];
+      const protectSlot = (slot) => {
+        let f = himd.getTrack(slot).firstFragment;
+        const seenF = {};
+        while (f !== 0 && !seenF[f]) {
+          seenF[f] = true;
+          const fo = himd.getFragment(f);
+          protectedRanges.push({ firstBlock: fo.firstBlock, lastBlock: fo.lastBlock });
+          f = fo.nextFragment;
+        }
+      };
+      const keptKeysPre = Object.keys(keptSlotSet);
+      for (let k = 0; k < keptKeysPre.length; k++) protectSlot(Number(keptKeysPre[k]) | 0);
+      for (let k = 0; k < slicedSrcKeysAll.length; k++) protectSlot(Number(slicedSrcKeysAll[k]) | 0);
+
       const blocksToFree = [];
       const zeroMac = new Uint8Array(8).fill(0);
       for (let i = 0; i < slotsToFree.length; i++) {
@@ -3017,7 +3086,18 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
             length--;
           }
           if (length > 0) {
-            blocksToFree.push({ firstBlock, length });
+            const lastB = firstBlock + length - 1;
+            let overlapsProtected = false;
+            for (let p = 0; p < protectedRanges.length; p++) {
+              if (firstBlock <= protectedRanges[p].lastBlock &&
+                  lastB >= protectedRanges[p].firstBlock) {
+                overlapsProtected = true;
+                break;
+              }
+            }
+            if (!overlapsProtected) {
+              blocksToFree.push({ firstBlock, length });
+            }
           }
           const nextFrag = fragObj.nextFragment;
           himd.removeFragment(frag);
@@ -3030,10 +3110,16 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
         session.allMacs.set(zeroMac, (slot - 1) * 8);
       }
       if (blocksToFree.length > 0) {
+        const shiftSlots = [];
         const keptKeys = Object.keys(keptSlotSet);
+        for (let k = 0; k < keptKeys.length; k++) shiftSlots.push(Number(keptKeys[k]) | 0);
+        for (let k = 0; k < slicedSrcKeysAll.length; k++) {
+          const s = Number(slicedSrcKeysAll[k]) | 0;
+          if (!keptSlotSet[s]) shiftSlots.push(s);
+        }
         const visitedFrags = {};
-        for (let k = 0; k < keptKeys.length; k++) {
-          const slot = Number(keptKeys[k]) | 0;
+        for (let k = 0; k < shiftSlots.length; k++) {
+          const slot = shiftSlots[k];
           let frag = himd.getTrack(slot).firstFragment;
           while (frag !== 0 && !visitedFrags[frag]) {
             visitedFrags[frag] = true;
@@ -3061,6 +3147,156 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
           });
         }
         await himd.filesystem.freeFileRegions(himd.getDatanumDependentName('ATDATA'), fileRegions);
+      }
+    }
+
+    // In-place zero-reencoding Hi-MD track slicing (TRKIDX01.HMA + MCLIST01.HMA only).
+    const sliceIdToSlot = {};
+    if (slicePlans.length > 0) {
+      const sourceSnapshots = {};
+      for (let i = 0; i < slicedSrcKeysAll.length; i++) {
+        const srcSlot = Number(slicedSrcKeysAll[i]) | 0;
+        const origTrack = himd.getTrack(srcSlot);
+        const fpb = getFramesPerBlock(origTrack);
+        const origFrags = [];
+        let f = origTrack.firstFragment;
+        let totalFrames = 0;
+        let guard = 0;
+        while (f !== 0 && guard < 4096) {
+          guard++;
+          const fo = himd.getFragment(f);
+          const fragFrames = (fo.lastBlock - fo.firstBlock) * fpb + (fo.lastFrame - fo.firstFrame + 1);
+          origFrags.push({
+            firstBlock: fo.firstBlock,
+            lastBlock: fo.lastBlock,
+            firstFrame: fo.firstFrame,
+            lastFrame: fo.lastFrame,
+            key: fo.key.slice(),
+            fragmentType: fo.fragmentType,
+            fragStart: totalFrames,
+            fragEnd: totalFrames + fragFrames,
+          });
+          totalFrames += fragFrames;
+          f = fo.nextFragment;
+        }
+        if (origFrags.length === 0 || totalFrames <= 0) {
+          throw new HiMDError('Source Hi-MD TrackInfo slot ' + srcSlot + ' has no audio fragments');
+        }
+        const trackKey = createTrackKey(origTrack.ekbNumber, origTrack.key);
+        sourceSnapshots[srcSlot] = { origTrack, fpb, origFrags, totalFrames, trackKey };
+      }
+
+      // Free replaced source TrackInfo slots and their old FragmentInfo entries (NOT ATDATA blocks).
+      const zeroMac = new Uint8Array(8).fill(0);
+      for (let i = 0; i < replacedSlicedSourceSlots.length; i++) {
+        const srcSlot = replacedSlicedSourceSlots[i];
+        const trk = himd.getTrack(srcSlot);
+        let frag = trk.firstFragment;
+        while (frag !== 0) {
+          const fo = himd.getFragment(frag);
+          const nextFrag = fo.nextFragment;
+          himd.removeFragment(frag);
+          frag = nextFrag;
+        }
+        if (trk.albumIndex) himd.removeString(trk.albumIndex);
+        if (trk.artistIndex) himd.removeString(trk.artistIndex);
+        if (trk.titleIndex) himd.removeString(trk.titleIndex);
+        himd.removeTrack(srcSlot);
+        session.allMacs.set(zeroMac, (srcSlot - 1) * 8);
+      }
+
+      for (let i = 0; i < slicePlans.length; i++) {
+        const sp = slicePlans[i];
+        const snap = sourceSnapshots[sp.sourceSlot];
+        const origTrack = snap.origTrack;
+        const fpb = snap.fpb;
+        const totalFrames = snap.totalFrames;
+        const sStart = Math.max(0, Math.min(sp.startFrame, totalFrames - 1));
+        const sEnd =
+          sp.endFrame < 0 ? totalFrames : Math.max(sStart + 1, Math.min(sp.endFrame, totalFrames));
+
+        const slicedFragDefs = [];
+        for (let k = 0; k < snap.origFrags.length; k++) {
+          const of = snap.origFrags[k];
+          const ovStart = Math.max(sStart, of.fragStart);
+          const ovEnd = Math.min(sEnd, of.fragEnd);
+          if (ovEnd <= ovStart) continue;
+          const localStart = ovStart - of.fragStart;
+          const localLast = ovEnd - 1 - of.fragStart;
+          const absStart = of.firstFrame + localStart;
+          const absLast = of.firstFrame + localLast;
+          slicedFragDefs.push({
+            firstBlock: of.firstBlock + Math.floor(absStart / fpb),
+            lastBlock: of.firstBlock + Math.floor(absLast / fpb),
+            firstFrame: absStart % fpb,
+            lastFrame: absLast % fpb,
+            key: of.key.slice(),
+            nextFragment: 0,
+            fragmentType: of.fragmentType,
+          });
+        }
+        if (slicedFragDefs.length === 0) {
+          throw new HiMDError('Sliced Hi-MD range produced zero fragments for ' + sp.id);
+        }
+        let nextFragId = 0;
+        for (let k = slicedFragDefs.length - 1; k >= 0; k--) {
+          slicedFragDefs[k].nextFragment = nextFragId;
+          nextFragId = himd.addFragment(slicedFragDefs[k]);
+        }
+        const firstFragId = nextFragId;
+
+        const newSlot = himd.getNextFreeTrackSlot();
+        if (newSlot <= 0) {
+          throw new HiMDError('Hi-MD TrackInfo freelist exhausted while slicing');
+        }
+        const estSeconds =
+          sp.durationSeconds > 0
+            ? Math.round(sp.durationSeconds)
+            : Math.round(
+                getSeconds(
+                  { codecId: origTrack.codecId, codecInfo: origTrack.codecInfo },
+                  sEnd - sStart
+                )
+              );
+        const newTrack = {
+          albumIndex: 0,
+          artistIndex: 0,
+          titleIndex: 0,
+          trackNumber: newSlot,
+          firstFragment: firstFragId,
+          ekbNumber: origTrack.ekbNumber,
+          cc: origTrack.cc,
+          cn: origTrack.cn,
+          ct: origTrack.ct,
+          dest: origTrack.dest,
+          lt: origTrack.lt,
+          xcc: origTrack.xcc,
+          key: origTrack.key.slice(),
+          mac: new Uint8Array(8),
+          contentId: origTrack.contentId.slice(),
+          licenseEndTime: origTrack.licenseEndTime,
+          licenseStartTime: origTrack.licenseStartTime,
+          seconds: Math.max(0, Math.min(65535, estSeconds)),
+          recordingTime: origTrack.recordingTime,
+          trackInAlbum: 0,
+          codecId: origTrack.codecId,
+          codecInfo: origTrack.codecInfo.slice(),
+        };
+        if (sp.title.length > 0) {
+          newTrack.titleIndex = himd.addString(sp.title, HiMDStringType.TITLE);
+        }
+        if (sp.artist.length > 0) {
+          newTrack.artistIndex = himd.addString(sp.artist, HiMDStringType.ARTIST);
+        }
+        if (sp.album.length > 0) {
+          newTrack.albumIndex = himd.addString(sp.album, HiMDStringType.ALBUM);
+        }
+        newTrack.mac = session.createTrackMac(newTrack, snap.trackKey);
+        const allocatedSlot = himd.addTrack(newTrack);
+        if (allocatedSlot !== newSlot) {
+          throw new HiMDError('Unexpected TrackInfo slot allocation mismatch while slicing');
+        }
+        sliceIdToSlot[sp.id] = allocatedSlot;
       }
     }
 
@@ -3241,9 +3477,13 @@ export async function himdCommitBatch(deviceId, manifestFilePath) {
     const finalSlots = [];
     for (let i = 0; i < playOrder.length; i++) {
       const entry = playOrder[i];
-      finalSlots.push(
-        entry.uploadId ? uploadIdToSlot[entry.uploadId] : (entry.existingSlot | 0)
-      );
+      if (entry.uploadId) {
+        finalSlots.push(uploadIdToSlot[entry.uploadId]);
+      } else if (entry.sliceId) {
+        finalSlots.push(sliceIdToSlot[entry.sliceId]);
+      } else {
+        finalSlots.push(entry.existingSlot | 0);
+      }
     }
     for (let i = 0; i < finalSlots.length; i++) {
       himd.writeTrackIndexToTrackSlot(i, finalSlots[i]);

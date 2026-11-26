@@ -1681,12 +1681,93 @@ bool isHiMdTrackPreservedInPlace(const MdDisc& disc, const MdTrack& track, int* 
     return true;
 }
 
+bool isHiMdTrackInPlaceSlice(const MdDisc& disc, const MdTrack& track, int* outSlot,
+                             std::int64_t* outStartFrame, std::int64_t* outEndFrame) {
+    if (outSlot) {
+        *outSlot = 0;
+    }
+    if (outStartFrame) {
+        *outStartFrame = 0;
+    }
+    if (outEndFrame) {
+        *outEndFrame = -1;
+    }
+    if (!disc.loadedDisc.active || track.parts.size() != 1u) {
+        return false;
+    }
+    const auto& part = track.parts.front();
+    if (part.endSample <= part.startSample) {
+        return false;
+    }
+    const int rIdx = findMdOnDiscRegionForPart(disc.loadedDisc, part);
+    if (rIdx < 0 || rIdx >= static_cast<int>(disc.loadedDisc.regions.size())) {
+        return false;
+    }
+    const auto& reg = disc.loadedDisc.regions[static_cast<std::size_t>(rIdx)];
+    if (reg.hiMdSlot <= 0 || effectiveTrackCodec(disc, track) != reg.codec) {
+        return false;
+    }
+    // Must be a strict sub-range (full-range tracks use `isHiMdTrackPreservedInPlace`).
+    if (part.startSample == reg.timelineStartSample && part.endSample == reg.timelineEndSample) {
+        return false;
+    }
+    if (part.startSample < reg.timelineStartSample || part.endSample > reg.timelineEndSample) {
+        return false;
+    }
+    std::int64_t samplesPerFrame = 0;
+    switch (reg.codec) {
+    case MdCodecMode::hiSp:
+    case MdCodecMode::hiLp:
+        samplesPerFrame = 2048LL;
+        break;
+    case MdCodecMode::lp2:
+    case MdCodecMode::lp4:
+        samplesPerFrame = 1024LL;
+        break;
+    case MdCodecMode::pcm:
+        samplesPerFrame = 16LL; // 64 bytes per PCM frame / 4 bytes per stereo 16-bit sample
+        break;
+    case MdCodecMode::spStereo:
+    case MdCodecMode::spMono:
+        return false;
+    }
+    const std::int64_t relStart = part.startSample - reg.timelineStartSample;
+    const std::int64_t relEnd = part.endSample - reg.timelineStartSample;
+    const std::int64_t startFrame = std::max<std::int64_t>(0, relStart / samplesPerFrame);
+    const std::int64_t endFrame =
+        (part.endSample == reg.timelineEndSample)
+            ? -1LL
+            : std::max<std::int64_t>(startFrame + 1,
+                                     (relEnd + samplesPerFrame - 1) / samplesPerFrame);
+    if (outSlot) {
+        *outSlot = reg.hiMdSlot;
+    }
+    if (outStartFrame) {
+        *outStartFrame = startFrame;
+    }
+    if (outEndFrame) {
+        *outEndFrame = endFrame;
+    }
+    return true;
+}
+
 namespace {
 
 struct HiMdBatchUploadManifestItem {
     std::string id;
     std::string codecSpec;
     std::string filePath;
+    std::string title;
+    std::string artist;
+    std::string album;
+    double durationSeconds = 0.0;
+};
+
+struct HiMdBatchSliceManifestItem {
+    std::string id;
+    int sourceSlot = 0;
+    std::int64_t startFrame = 0;
+    std::int64_t endFrame = -1;
     std::string title;
     std::string artist;
     std::string album;
@@ -1702,12 +1783,14 @@ struct HiMdBatchSlotMetaItem {
 
 struct HiMdBatchPlayOrderEntry {
     std::string uploadId;
+    std::string sliceId;
     int existingSlot = 0;
 };
 
 bool writeTempHiMdBatchManifest(const std::string& expectedDiscId, bool requireEmpty,
                                 const std::string& discTitle,
                                 const std::vector<HiMdBatchUploadManifestItem>& uploads,
+                                const std::vector<HiMdBatchSliceManifestItem>& slices,
                                 const std::vector<HiMdBatchSlotMetaItem>& slotMetadata,
                                 const std::vector<HiMdBatchPlayOrderEntry>& playOrder,
                                 const std::vector<MdGroup>& groups, std::int64_t stamp,
@@ -1735,6 +1818,21 @@ bool writeTempHiMdBatchManifest(const std::string& expectedDiscId, bool requireE
     }
     root->setProperty("audioUploads", juce::var(uploadsArr));
 
+    juce::Array<juce::var> slicesArr;
+    for (const auto& sl : slices) {
+        auto* slo = new juce::DynamicObject();
+        slo->setProperty("id", juce::String::fromUTF8(sl.id.c_str()));
+        slo->setProperty("sourceSlot", sl.sourceSlot);
+        slo->setProperty("startFrame", static_cast<juce::int64>(sl.startFrame));
+        slo->setProperty("endFrame", static_cast<juce::int64>(sl.endFrame));
+        slo->setProperty("title", juce::String::fromUTF8(sl.title.c_str()));
+        slo->setProperty("artist", juce::String::fromUTF8(sl.artist.c_str()));
+        slo->setProperty("album", juce::String::fromUTF8(sl.album.c_str()));
+        slo->setProperty("durationSeconds", sl.durationSeconds);
+        slicesArr.add(juce::var(slo));
+    }
+    root->setProperty("slicedSlots", juce::var(slicesArr));
+
     juce::Array<juce::var> slotMetaArr;
     for (const auto& sm : slotMetadata) {
         auto* so = new juce::DynamicObject();
@@ -1751,6 +1849,8 @@ bool writeTempHiMdBatchManifest(const std::string& expectedDiscId, bool requireE
         auto* poo = new juce::DynamicObject();
         if (!po.uploadId.empty()) {
             poo->setProperty("uploadId", juce::String::fromUTF8(po.uploadId.c_str()));
+        } else if (!po.sliceId.empty()) {
+            poo->setProperty("sliceId", juce::String::fromUTF8(po.sliceId.c_str()));
         } else {
             poo->setProperty("existingSlot", po.existingSlot);
         }
@@ -1993,7 +2093,8 @@ HiMdPreflightReport preflightHiMdRecording(const MdDisc& disc,
             return report;
         }
         int preservedSlot = 0;
-        if (isHiMdTrackPreservedInPlace(disc, tr, &preservedSlot)) {
+        if (isHiMdTrackPreservedInPlace(disc, tr, &preservedSlot) ||
+            isHiMdTrackInPlaceSlice(disc, tr, &preservedSlot)) {
             ++report.preservedOnDiscTracks;
             preservedSlots.insert(preservedSlot);
         } else {
@@ -2158,6 +2259,8 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
 
     std::vector<UniqueNewItem> uniqueNewItems;
     std::map<std::string, std::size_t> newItemIndexByKey;
+    std::vector<HiMdBatchSliceManifestItem> sliceItems;
+    std::map<std::string, std::string> sliceIdByKey;
     std::map<int, HiMdBatchSlotMetaItem> keptSlotMetaMap;
     std::vector<HiMdBatchPlayOrderEntry> playOrderEntries;
     playOrderEntries.reserve(disc.tracks.size());
@@ -2180,6 +2283,32 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
             }
             HiMdBatchPlayOrderEntry po;
             po.existingSlot = preservedSlot;
+            playOrderEntries.push_back(std::move(po));
+            poKeyByTrack.emplace_back();
+            continue;
+        }
+
+        std::int64_t sliceStartFrame = 0;
+        std::int64_t sliceEndFrame = -1;
+        if (isHiMdTrackInPlaceSlice(disc, trk, &preservedSlot, &sliceStartFrame, &sliceEndFrame)) {
+            const std::string key = effectiveMdAudioId(trk);
+            auto it = sliceIdByKey.find(key);
+            if (it == sliceIdByKey.end()) {
+                HiMdBatchSliceManifestItem sl;
+                sl.id = "s" + std::to_string(sliceItems.size());
+                sl.sourceSlot = preservedSlot;
+                sl.startFrame = sliceStartFrame;
+                sl.endFrame = sliceEndFrame;
+                sl.title = preferredTrackTitle(trk);
+                sl.artist = trk.artist;
+                sl.album = trk.album;
+                sl.durationSeconds =
+                    static_cast<double>(trk.totalSamples()) / static_cast<double>(kMdSampleRate);
+                it = sliceIdByKey.emplace(key, sl.id).first;
+                sliceItems.push_back(std::move(sl));
+            }
+            HiMdBatchPlayOrderEntry po;
+            po.sliceId = it->second;
             playOrderEntries.push_back(std::move(po));
             poKeyByTrack.emplace_back();
             continue;
@@ -2435,7 +2564,7 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
     juce::File manifestFile;
     std::unique_ptr<TempFileRemover> manifestCleanup;
     if (!writeTempHiMdBatchManifest(expectedDiscId, !disc.loadedDisc.active, discTitle, uploadItems,
-                                    slotMetaItems, playOrderEntries, disc.groups, stamp,
+                                    sliceItems, slotMetaItems, playOrderEntries, disc.groups, stamp,
                                     manifestFile, manifestCleanup, error)) {
         return false;
     }
@@ -2504,35 +2633,53 @@ bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confir
     }
 
     std::map<int, HiMdBatchSlotMetaItem> keptSlotMetaMap;
+    std::vector<HiMdBatchSliceManifestItem> sliceItems;
+    std::map<std::string, std::string> sliceIdByKey;
     std::vector<HiMdBatchPlayOrderEntry> playOrderEntries;
     playOrderEntries.reserve(disc.tracks.size());
 
     for (std::size_t idx = 0; idx < disc.tracks.size(); ++idx) {
         const auto& trk = disc.tracks[idx];
         int slot = 0;
-        if (!isHiMdTrackPreservedInPlace(disc, trk, &slot)) {
-            if (mdTrackUsesOnDiscAudio(disc, trk)) {
-                error = "Track " + std::to_string(idx + 1) +
-                        " is split, trimmed, or re-encoded from its original on-disc Hi-MD track; "
-                        "use Record Hi-MD (after downloading its audio) instead of Write Index "
-                        "Only.";
-            } else {
-                error = "Hi-MD Write Index Only cannot upload new local audio on track " +
-                        std::to_string(idx + 1) + "; use Record Hi-MD instead.";
+        std::int64_t sliceStartFrame = 0;
+        std::int64_t sliceEndFrame = -1;
+        if (isHiMdTrackPreservedInPlace(disc, trk, &slot)) {
+            if (!keptSlotMetaMap.count(slot)) {
+                HiMdBatchSlotMetaItem sm;
+                sm.slot = slot;
+                sm.title = preferredTrackTitle(trk);
+                sm.artist = trk.artist;
+                sm.album = trk.album;
+                keptSlotMetaMap.emplace(slot, std::move(sm));
             }
+            HiMdBatchPlayOrderEntry po;
+            po.existingSlot = slot;
+            playOrderEntries.push_back(std::move(po));
+        } else if (isHiMdTrackInPlaceSlice(disc, trk, &slot, &sliceStartFrame, &sliceEndFrame)) {
+            const std::string key = effectiveMdAudioId(trk);
+            auto it = sliceIdByKey.find(key);
+            if (it == sliceIdByKey.end()) {
+                HiMdBatchSliceManifestItem sl;
+                sl.id = "s" + std::to_string(sliceItems.size());
+                sl.sourceSlot = slot;
+                sl.startFrame = sliceStartFrame;
+                sl.endFrame = sliceEndFrame;
+                sl.title = preferredTrackTitle(trk);
+                sl.artist = trk.artist;
+                sl.album = trk.album;
+                sl.durationSeconds =
+                    static_cast<double>(trk.totalSamples()) / static_cast<double>(kMdSampleRate);
+                it = sliceIdByKey.emplace(key, sl.id).first;
+                sliceItems.push_back(std::move(sl));
+            }
+            HiMdBatchPlayOrderEntry po;
+            po.sliceId = it->second;
+            playOrderEntries.push_back(std::move(po));
+        } else {
+            error = "Hi-MD Write Index Only cannot upload new or re-encoded audio on track " +
+                    std::to_string(idx + 1) + "; use Record Hi-MD instead.";
             return false;
         }
-        if (!keptSlotMetaMap.count(slot)) {
-            HiMdBatchSlotMetaItem sm;
-            sm.slot = slot;
-            sm.title = preferredTrackTitle(trk);
-            sm.artist = trk.artist;
-            sm.album = trk.album;
-            keptSlotMetaMap.emplace(slot, std::move(sm));
-        }
-        HiMdBatchPlayOrderEntry po;
-        po.existingSlot = slot;
-        playOrderEntries.push_back(std::move(po));
     }
 
     ScopedHiMdProgress progressScope;
@@ -2567,7 +2714,7 @@ bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confir
     const auto stamp = juce::Time::getHighResolutionTicks();
     juce::File manifestFile;
     std::unique_ptr<TempFileRemover> manifestCleanup;
-    if (!writeTempHiMdBatchManifest(expectedDiscId, false, discTitle, {}, slotMetaItems,
+    if (!writeTempHiMdBatchManifest(expectedDiscId, false, discTitle, {}, sliceItems, slotMetaItems,
                                     playOrderEntries, disc.groups, stamp, manifestFile,
                                     manifestCleanup, error)) {
         return false;

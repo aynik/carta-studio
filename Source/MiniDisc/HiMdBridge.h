@@ -235,6 +235,15 @@ bool wipeHiMdDisc(const std::string& deviceId, bool reformat, bool confirmHardwa
  */
 bool isHiMdTrackPreservedInPlace(const MdDisc& disc, const MdTrack& track, int* outSlot = nullptr);
 
+/**
+ * Returns true when `track` is a split or trimmed sub-range of a single loaded on-disc Hi-MD
+ * region with the same codec, which can be sliced losslessly in-place in `TRKIDX01.HMA` without
+ * re-encoding or rewriting `ATDATA01.HMA`.
+ */
+bool isHiMdTrackInPlaceSlice(const MdDisc& disc, const MdTrack& track, int* outSlot = nullptr,
+                             std::int64_t* outStartFrame = nullptr,
+                             std::int64_t* outEndFrame = nullptr);
+
 /** Probes `deviceId` and populates `outDisc` (`loadedDisc.active = true`, tracks, metadata, groups). */
 bool loadHiMdDiscIntoSession(const std::string& deviceId, MdDisc& outDisc,
                              HiMdDeviceStatus* outStatus, std::string& error);

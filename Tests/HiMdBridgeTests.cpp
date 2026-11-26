@@ -1336,52 +1336,19 @@ int main() {
                 sess15.mdDisc.tracks[2].halfWidthTitle = "Track C";
 
                 const auto pre15 = carta::preflightHiMdRecording(sess15.mdDisc, &st15);
-                REQUIRE(pre15.valid && pre15.preservedOnDiscTracks == 0 &&
-                            pre15.newUniqueAudioTracks == 3,
-                        "15 preflight must classify 3 split tracks as 3 new uploads, 0 preserved: " +
+                REQUIRE(pre15.valid && pre15.preservedOnDiscTracks == 3 &&
+                            pre15.newUniqueAudioTracks == 0 && pre15.requiredBytes == 0,
+                        "15 preflight must classify 3 in-place split tracks as 3 preserved, 0 new: " +
                             pre15.error);
 
-                carta::HiMdRecordResult idxFail{};
-                REQUIRE(!carta::writeHiMdIndex(sess15.mdDisc, "mock:mz-rh1", true, idxFail, err),
-                        "15 writeHiMdIndex must reject split on-disc Hi-MD tracks");
-
-                carta::HiMdRecordResult phFail{};
-                REQUIRE(!carta::recordHiMdDisc(sess15, sess15.mdDisc, "mock:mz-rh1", true, phFail,
-                                               err),
-                        "15 recordHiMdDisc must reject split tracks whose audio is not downloaded");
-
-                // Now download & apply PCM audio onto the timeline, then Record Hi-MD.
-                const juce::File tmp15 =
-                    juce::File::getSpecialLocation(juce::File::tempDirectory)
-                        .getChildFile("carta_himd_15_" +
-                                      juce::String(juce::Time::getHighResolutionTicks()) + ".raw");
-                REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", 0, tmp15.getFullPathName().toStdString(),
-                                             /*rawAudio=*/true, err),
-                        "15 dumpHiMdTrack failed: " + err);
-                juce::MemoryBlock raw15;
-                REQUIRE(tmp15.loadFileAsData(raw15) && raw15.getSize() > 0,
-                        "15 dumped Hi-MD track must be non-empty");
-                tmp15.deleteFile();
-
-                std::vector<float> dec15L, dec15R;
-                int dec15Ch = 0;
-                REQUIRE(carta::decodeRawAtracPayload(
-                            carta::mdCodecModeToString(r15.codec),
-                            static_cast<const std::uint8_t*>(raw15.getData()), raw15.getSize(),
-                            dec15L, dec15R, dec15Ch, err),
-                        "15 decodeRawAtracPayload failed: " + err);
-                std::shared_ptr<carta::Audio> decoded15;
-                REQUIRE(carta::createDecodedOnDiscAudioSource(
-                            "Full Album", dec15L.data(), dec15R.data(), 2,
-                            static_cast<int>(dec15L.size()), static_cast<int>(rLen), decoded15, err),
-                        "15 createDecodedOnDiscAudioSource failed: " + err);
-                REQUIRE(carta::applyDownloadedOnDiscRegionAudio(sess15, r15.id, decoded15),
-                        "15 applyDownloadedOnDiscRegionAudio failed");
-
+                // In-place split must succeed via writeHiMdIndex WITHOUT downloading audio or
+                // rewriting ATDATA01.HMA (zero re-encoding, zero blocks written)!
                 carta::HiMdRecordResult splitRec{};
-                REQUIRE(carta::recordHiMdDisc(sess15, sess15.mdDisc, "mock:mz-rh1", true, splitRec,
-                                              err),
-                        "15 recordHiMdDisc for split tracks failed: " + err);
+                REQUIRE(carta::writeHiMdIndex(sess15.mdDisc, "mock:mz-rh1", true, splitRec, err),
+                        "15 in-place writeHiMdIndex split failed: " + err);
+                REQUIRE(splitRec.blocksWritten == 0 && splitRec.uploadedBytes == 0 &&
+                            splitRec.icvUpdated,
+                        "15 in-place split must write 0 audio blocks and update ICV");
 
                 carta::HiMdDeviceStatus after15{};
                 REQUIRE(carta::probeHiMdDevice("mock:mz-rh1", after15, err),
@@ -1390,7 +1357,35 @@ int main() {
                             after15.tracks[0].title == "Track A" &&
                             after15.tracks[1].title == "Track B" &&
                             after15.tracks[2].title == "Track C",
-                        "15 Hi-MD device must have 3 distinct split tracks with distinct titles");
+                        "15 Hi-MD device must have 3 distinct in-place split tracks with distinct "
+                        "titles");
+
+                // Also verify each sliced track can be dumped and decoded cleanly!
+                for (int ti = 0; ti < 3; ++ti) {
+                    const juce::File tmpSlice =
+                        juce::File::getSpecialLocation(juce::File::tempDirectory)
+                            .getChildFile("carta_himd_15_sl_" + juce::String(ti) + "_" +
+                                          juce::String(juce::Time::getHighResolutionTicks()) +
+                                          ".raw");
+                    REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", ti,
+                                                 tmpSlice.getFullPathName().toStdString(),
+                                                 /*rawAudio=*/true, err),
+                            "15 dumpHiMdTrack sliced track " + std::to_string(ti) +
+                                " failed: " + err);
+                    juce::MemoryBlock rawSl;
+                    REQUIRE(tmpSlice.loadFileAsData(rawSl) && rawSl.getSize() > 0,
+                            "15 sliced track raw dump must be non-empty");
+                    tmpSlice.deleteFile();
+                    std::vector<float> slL, slR;
+                    int slCh = 0;
+                    REQUIRE(carta::decodeRawAtracPayload(
+                                carta::mdCodecModeToString(r15.codec),
+                                static_cast<const std::uint8_t*>(rawSl.getData()), rawSl.getSize(),
+                                slL, slR, slCh, err),
+                            "15 decodeRawAtracPayload on sliced track failed: " + err);
+                    REQUIRE(slCh == 2 && slL.size() >= 44100u,
+                            "15 sliced track decoded PCM must be ~2s");
+                }
             }
         }
     }

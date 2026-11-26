@@ -3061,7 +3061,8 @@ void Studio::triggerHiMdDiscToolsMenuFromUi() {
                          carta::isHiMdMedium(session.mdDisc.medium);
     if (canWriteIndex) {
         for (const auto& tr : session.mdDisc.tracks) {
-            if (!carta::isHiMdTrackPreservedInPlace(session.mdDisc, tr)) {
+            if (!carta::isHiMdTrackPreservedInPlace(session.mdDisc, tr) &&
+                !carta::isHiMdTrackInPlaceSlice(session.mdDisc, tr)) {
                 canWriteIndex = false;
                 break;
             }
