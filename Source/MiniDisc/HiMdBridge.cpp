@@ -5,6 +5,7 @@
  */
 
 #include "HiMdBridge.h"
+#include "IO/DiagnosticLog.h"
 #include "NativeCodecs.h"
 
 #include <juce_core/juce_core.h>
@@ -1323,49 +1324,70 @@ bool invokeHiMdUnlocked(const std::vector<std::string>& sessionFields,
                         const std::vector<std::string>& cliArgs, bool preferMockSession,
                         bool allowElevationPrompt, const HelperProgressWindow* window,
                         juce::var& outResult, std::string& error) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string op = !sessionFields.empty() ? sessionFields[0] : std::string("cmd");
+    const std::string dev = sessionFields.size() >= 2 ? sessionFields[1] : std::string();
+    auto finishLog = [&](bool ok) {
+        if (!dev.empty() && isHiMdMockDeviceId(dev)) {
+            return ok;
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        if (ok) {
+            logDiagnostic("himd", op + (dev.empty() ? "" : " " + dev) + " -> ok (" +
+                                      std::to_string(ms) + " ms)");
+        } else {
+            logDiagnostic("himd", op + (dev.empty() ? "" : " " + dev) + " -> FAIL (" +
+                                      std::to_string(ms) + " ms): " + error);
+        }
+        return ok;
+    };
+
     std::string helperPath;
     if (!locateHiMdHelperUnlocked(helperPath, error)) {
-        return false;
+        return finishLog(false);
     }
 
     const bool isListOp = !sessionFields.empty() && sessionFields[0] == "list";
     if (preferMockSession) {
         if (persistentElevatedSession().isRunning() && persistentElevatedSession().isMockMode()) {
-            return persistentElevatedSession().send(sessionFields, window, outResult, error);
+            return finishLog(
+                persistentElevatedSession().send(sessionFields, window, outResult, error));
         }
         if (!persistentMockSession().ensureStarted(helperPath, error)) {
-            return false;
+            return finishLog(false);
         }
-        return persistentMockSession().send(sessionFields, window, outResult, error);
+        return finishLog(persistentMockSession().send(sessionFields, window, outResult, error));
     }
 
     if (isListOp) {
-        return runOneShotHelper(helperPath, cliArgs, window, outResult, error);
+        return finishLog(runOneShotHelper(helperPath, cliArgs, window, outResult, error));
     }
 
     if (persistentElevatedSession().isRunning()) {
         if (persistentElevatedSession().send(sessionFields, window, outResult, error)) {
-            return true;
+            return finishLog(true);
         }
         // Only fall through to re-establish if the transport itself disconnected.
         if (persistentElevatedSession().isRunning()) {
-            return false;
+            return finishLog(false);
         }
     }
 
     if (runOneShotHelper(helperPath, cliArgs, window, outResult, error)) {
-        return true;
+        return finishLog(true);
     }
 
     if (!isHiMdPermissionError(error)) {
-        return false;
+        return finishLog(false);
     }
 
     const auto mode = readElevationMode();
     if (mode == HiMdElevationMode::Off ||
         (mode == HiMdElevationMode::Auto &&
          (!allowElevationPrompt || !isHiMdElevationPromptEnabled()))) {
-        return false;
+        return finishLog(false);
     }
 
     if (window != nullptr) {
@@ -1378,12 +1400,12 @@ bool invokeHiMdUnlocked(const std::vector<std::string>& sessionFields,
         if (!elevErr.empty()) {
             error = elevErr;
         }
-        return false;
+        return finishLog(false);
     }
     if (window != nullptr) {
         setHiMdProgress(window->operation, window->fallbackPhase, window->baseProgress);
     }
-    return persistentElevatedSession().send(sessionFields, window, outResult, error);
+    return finishLog(persistentElevatedSession().send(sessionFields, window, outResult, error));
 }
 
 bool requireWriteConfirmationUnlocked(const std::string& resolvedId, bool confirmHardware,
@@ -1536,6 +1558,17 @@ bool probeHiMdDeviceUnlocked(const std::string& resolvedId, HiMdDeviceStatus& ou
                       }
                       return a.groupIndex < b.groupIndex;
                   });
+    }
+
+    if (!isHiMdMockDeviceId(resolvedId)) {
+        logDiagnostic("himd-probe",
+                      out.deviceName + " [" + out.deviceId + "] inq=" + out.inquiryPid + "/" +
+                          out.inquiryRev + " datanum=" + std::to_string(out.datanum) +
+                          " tracks=" + std::to_string(out.trackCount) +
+                          " fsUsed=" + std::to_string(out.fsUsedBytes) +
+                          " fsFree=" + std::to_string(out.fsFreeBytes) +
+                          " fsTotal=" + std::to_string(out.fsTotalBytes) +
+                          " devSize=" + std::to_string(out.deviceSize));
     }
 
     error.clear();
@@ -2590,6 +2623,30 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
         cliArgs.emplace_back("--confirm-hardware");
     }
 
+    if (!useMockSess) {
+        std::ostringstream oss;
+        oss << "recordHiMdDisc commit: device=" << resolvedId
+            << " wipe=" << (!disc.loadedDisc.active ? 1 : 0)
+            << " preserved=" << slotMetaItems.size() << " slices=" << sliceItems.size()
+            << " uploads=" << uploadItems.size() << " playOrder=" << playOrderEntries.size()
+            << " groups=" << disc.groups.size();
+        if (!sliceItems.empty()) {
+            oss << " sliceRanges=[";
+            for (std::size_t si = 0; si < sliceItems.size() && si < 16u; ++si) {
+                if (si > 0) {
+                    oss << ",";
+                }
+                oss << sliceItems[si].id << ":slot" << sliceItems[si].sourceSlot << ":"
+                    << sliceItems[si].startFrame << ".." << sliceItems[si].endFrame;
+            }
+            if (sliceItems.size() > 16u) {
+                oss << ",...+" << (sliceItems.size() - 16u);
+            }
+            oss << "]";
+        }
+        logDiagnostic("himd", oss.str());
+    }
+
     juce::var res;
     if (!invokeHiMdUnlocked({"commit-batch", resolvedId, manifestPath, confirmArg}, cliArgs,
                             useMockSess, /*allowElevationPrompt=*/true, &win, res, error)) {
@@ -2604,6 +2661,17 @@ bool recordHiMdDisc(const Session& session, const MdDisc& disc, const std::strin
                               gaplessRunCount, outResult);
     if (outResult.uploadedBytes == 0 && totalEncodedBytes > 0) {
         outResult.uploadedBytes = totalEncodedBytes;
+    }
+    if (!useMockSess) {
+        logDiagnostic("himd",
+                      "recordHiMdDisc ok: tracks=" + std::to_string(outResult.uploadedTracks) +
+                          " uniqueUploaded=" +
+                          std::to_string(outResult.uniqueAudioTracksUploaded) +
+                          " freed=" + std::to_string(outResult.freedAudioSlots) +
+                          " blocksWritten=" + std::to_string(outResult.blocksWritten) +
+                          " bytesWritten=" + std::to_string(outResult.uploadedBytes) +
+                          " datanum=" + std::to_string(outResult.datanum) +
+                          " icvUpdated=" + std::to_string(outResult.icvUpdated ? 1 : 0));
     }
     setHiMdProgress("record", "Hi-MD recording complete.", 1.0, outResult.uploadedBytes,
                     outResult.uploadedBytes);
@@ -2741,6 +2809,28 @@ bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confir
         cliArgs.emplace_back("--confirm-hardware");
     }
 
+    if (!useMockSess) {
+        std::ostringstream oss;
+        oss << "writeHiMdIndex commit: device=" << resolvedId
+            << " preserved=" << slotMetaItems.size() << " slices=" << sliceItems.size()
+            << " playOrder=" << playOrderEntries.size() << " groups=" << disc.groups.size();
+        if (!sliceItems.empty()) {
+            oss << " sliceRanges=[";
+            for (std::size_t si = 0; si < sliceItems.size() && si < 16u; ++si) {
+                if (si > 0) {
+                    oss << ",";
+                }
+                oss << sliceItems[si].id << ":slot" << sliceItems[si].sourceSlot << ":"
+                    << sliceItems[si].startFrame << ".." << sliceItems[si].endFrame;
+            }
+            if (sliceItems.size() > 16u) {
+                oss << ",...+" << (sliceItems.size() - 16u);
+            }
+            oss << "]";
+        }
+        logDiagnostic("himd", oss.str());
+    }
+
     juce::var res;
     if (!invokeHiMdUnlocked({"commit-batch", resolvedId, manifestPath, confirmArg}, cliArgs,
                             useMockSess, /*allowElevationPrompt=*/true, &win, res, error)) {
@@ -2752,6 +2842,14 @@ bool writeHiMdIndex(const MdDisc& disc, const std::string& deviceId, bool confir
     }
 
     populateBatchRecordResult(res, discTitle, static_cast<int>(slotMetaItems.size()), 0, outResult);
+    if (!useMockSess) {
+        logDiagnostic("himd",
+                      "writeHiMdIndex ok: tracks=" + std::to_string(outResult.uploadedTracks) +
+                          " freed=" + std::to_string(outResult.freedAudioSlots) +
+                          " blocksWritten=" + std::to_string(outResult.blocksWritten) +
+                          " datanum=" + std::to_string(outResult.datanum) +
+                          " icvUpdated=" + std::to_string(outResult.icvUpdated ? 1 : 0));
+    }
     setHiMdProgress("write-index", "Hi-MD index update complete.", 1.0);
     error.clear();
     return true;
