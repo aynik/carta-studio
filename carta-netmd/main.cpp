@@ -640,7 +640,7 @@ int runSessionLoop(bool enableMock) {
 }
 
 void printUsage() {
-    std::cerr << "carta-netmd 0.6.3 (GPL-2.0) - Standalone NetMD USB helper\n"
+    std::cerr << "carta-netmd 0.6.4 (GPL-2.0) - Standalone NetMD USB helper\n"
               << "Built with netmd-js & netmd-exploits (GPL-2.0) and libusb-1.0 (LGPL-2.1).\n"
               << "Usage:\n"
               << "  carta-netmd list\n"
@@ -666,7 +666,7 @@ int main(int argc, char** argv) {
 
     const std::string cmd = argv[1];
     if (cmd == "--version" || cmd == "-v") {
-        std::cout << "carta-netmd 0.6.3 (GPL-2.0)\n";
+        std::cout << "carta-netmd 0.6.4 (GPL-2.0)\n";
         return 0;
     }
     if (cmd == "--help" || cmd == "-h") {

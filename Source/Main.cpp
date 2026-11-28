@@ -18,7 +18,7 @@
 class CartaStudioApplication final : public juce::JUCEApplication {
   public:
     const juce::String getApplicationName() override { return "Carta Studio"; }
-    const juce::String getApplicationVersion() override { return "0.6.3"; }
+    const juce::String getApplicationVersion() override { return "0.6.4"; }
 
     /**
      * @brief Creates the main window (hidden when `--headless`), starts IPC, and queues CLI files.
