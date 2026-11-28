@@ -1733,12 +1733,16 @@ bool isHiMdTrackInPlaceSlice(const MdDisc& disc, const MdTrack& track, int* outS
     }
     const std::int64_t relStart = part.startSample - reg.timelineStartSample;
     const std::int64_t relEnd = part.endSample - reg.timelineStartSample;
-    const std::int64_t startFrame = std::max<std::int64_t>(0, relStart / samplesPerFrame);
+    // Use identical nearest-frame rounding for both boundaries so adjacent slices at a shared
+    // split sample strictly partition [0, totalFrames) with zero frame overlap and zero gap.
+    const auto roundToFrame = [samplesPerFrame](std::int64_t relSamples) -> std::int64_t {
+        return std::max<std::int64_t>(0, (relSamples + samplesPerFrame / 2) / samplesPerFrame);
+    };
+    const std::int64_t startFrame = roundToFrame(relStart);
     const std::int64_t endFrame =
         (part.endSample == reg.timelineEndSample)
             ? -1LL
-            : std::max<std::int64_t>(startFrame + 1,
-                                     (relEnd + samplesPerFrame - 1) / samplesPerFrame);
+            : std::max<std::int64_t>(startFrame + 1, roundToFrame(relEnd));
     if (outSlot) {
         *outSlot = reg.hiMdSlot;
     }

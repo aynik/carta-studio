@@ -1341,6 +1341,39 @@ int main() {
                         "15 preflight must classify 3 in-place split tracks as 3 preserved, 0 new: " +
                             pre15.error);
 
+                // Verify adjacent in-place slices partition frame indices strictly with zero
+                // overlap even when split points are not multiples of 2048 samples.
+                int slSlot0 = 0, slSlot1 = 0, slSlot2 = 0;
+                std::int64_t sf0 = 0, ef0 = 0, sf1 = 0, ef1 = 0, sf2 = 0, ef2 = 0;
+                REQUIRE(carta::isHiMdTrackInPlaceSlice(sess15.mdDisc, sess15.mdDisc.tracks[0],
+                                                       &slSlot0, &sf0, &ef0) &&
+                            carta::isHiMdTrackInPlaceSlice(sess15.mdDisc, sess15.mdDisc.tracks[1],
+                                                           &slSlot1, &sf1, &ef1) &&
+                            carta::isHiMdTrackInPlaceSlice(sess15.mdDisc, sess15.mdDisc.tracks[2],
+                                                           &slSlot2, &sf2, &ef2),
+                        "15 all 3 split tracks must classify as in-place slices");
+                REQUIRE(sf0 == 0 && ef0 > sf0 && sf1 == ef0 && ef1 > sf1 && sf2 == ef1 &&
+                            ef2 == -1,
+                        "15 adjacent in-place slices must partition frames with zero overlap");
+
+                // Dump the original track's raw byte length before splitting so we can confirm
+                // the 3 split tracks sum to the exact same frame count.
+                std::size_t origRawBytes15 = 0;
+                {
+                    const juce::File tmpOrig =
+                        juce::File::getSpecialLocation(juce::File::tempDirectory)
+                            .getChildFile("carta_himd_15_orig_" +
+                                          juce::String(juce::Time::getHighResolutionTicks()) +
+                                          ".raw");
+                    REQUIRE(carta::dumpHiMdTrack("mock:mz-rh1", 0,
+                                                 tmpOrig.getFullPathName().toStdString(),
+                                                 /*rawAudio=*/true, err),
+                            "15 dumpHiMdTrack original track failed: " + err);
+                    origRawBytes15 = static_cast<std::size_t>(tmpOrig.getSize());
+                    tmpOrig.deleteFile();
+                    REQUIRE(origRawBytes15 > 0u, "15 original raw dump must be non-empty");
+                }
+
                 // In-place split must succeed via writeHiMdIndex WITHOUT downloading audio or
                 // rewriting ATDATA01.HMA (zero re-encoding, zero blocks written)!
                 carta::HiMdRecordResult splitRec{};
@@ -1360,7 +1393,9 @@ int main() {
                         "15 Hi-MD device must have 3 distinct in-place split tracks with distinct "
                         "titles");
 
-                // Also verify each sliced track can be dumped and decoded cleanly!
+                // Also verify each sliced track can be dumped and decoded cleanly, and that the
+                // total raw frame bytes across all 3 slices equal the original track exactly!
+                std::size_t sumSlicedRawBytes15 = 0;
                 for (int ti = 0; ti < 3; ++ti) {
                     const juce::File tmpSlice =
                         juce::File::getSpecialLocation(juce::File::tempDirectory)
@@ -1375,6 +1410,7 @@ int main() {
                     juce::MemoryBlock rawSl;
                     REQUIRE(tmpSlice.loadFileAsData(rawSl) && rawSl.getSize() > 0,
                             "15 sliced track raw dump must be non-empty");
+                    sumSlicedRawBytes15 += rawSl.getSize();
                     tmpSlice.deleteFile();
                     std::vector<float> slL, slR;
                     int slCh = 0;
@@ -1386,6 +1422,8 @@ int main() {
                     REQUIRE(slCh == 2 && slL.size() >= 44100u,
                             "15 sliced track decoded PCM must be ~2s");
                 }
+                REQUIRE(sumSlicedRawBytes15 == origRawBytes15,
+                        "15 sliced tracks raw byte sum must equal original track (no overlap/gap)");
             }
         }
     }
